@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -101,6 +101,7 @@ fn xray_handshake_timeout_for_policy(
 pub(super) struct DataPlaneState {
     pub(super) inbound_manager: Arc<InboundManager>,
     pub(super) routing_publication: Arc<RwLock<Arc<RoutingPublication>>>,
+    pub(super) routing_updates: Arc<Mutex<()>>,
     pub(super) policy: Arc<RwLock<PolicyConfig>>,
     pub(super) resolver: Arc<dyn Resolver>,
     pub(super) user_domain_access: UserDomainAccessStore,
@@ -570,6 +571,82 @@ impl DataPlaneRuntime {
         observation: OutboundObservation,
     ) {
         self.0.record_passive_outbound_observation(tag, observation);
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) fn ensure_reverse_portal(&self, tag: &str) -> std::io::Result<()> {
+        let _update = self
+            .0
+            .routing_updates
+            .lock()
+            .expect("runtime routing update lock poisoned");
+        let current = self.0.routing_publication();
+        if let Some(existing) = current
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+        {
+            if existing.protocol != "vless-reverse" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "VLESS Reverse portal tag {tag} conflicts with outbound protocol {}",
+                        existing.protocol
+                    ),
+                ));
+            }
+            self.0.reverse_portals.ensure_tag(tag);
+            return Ok(());
+        }
+
+        let mut outbounds = current.outbounds.as_ref().clone();
+        outbounds.push(OutboundSummary {
+            tag: tag.to_string(),
+            protocol: "vless-reverse".to_string(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
+        });
+        self.0.reverse_portals.ensure_tag(tag);
+        *self
+            .0
+            .routing_publication
+            .write()
+            .expect("runtime routing publication lock poisoned") =
+            Arc::new(RoutingPublication::new(
+                Arc::clone(&current.routing),
+                Arc::new(outbounds),
+            ));
+        Ok(())
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) fn remove_reverse_portal(&self, tag: &str) -> bool {
+        let _update = self
+            .0
+            .routing_updates
+            .lock()
+            .expect("runtime routing update lock poisoned");
+        let removed_portal = self.0.reverse_portals.remove_tag(tag);
+        let current = self.0.routing_publication();
+        let mut outbounds = current.outbounds.as_ref().clone();
+        let Some(index) = outbounds.iter().position(|outbound| outbound.tag == tag)
+        else {
+            return removed_portal;
+        };
+        outbounds.remove(index);
+        current.routing.remove_observation(tag);
+        *self
+            .0
+            .routing_publication
+            .write()
+            .expect("runtime routing publication lock poisoned") =
+            Arc::new(RoutingPublication::new(
+                Arc::clone(&current.routing),
+                Arc::new(outbounds),
+            ));
+        true
     }
 
     #[cfg(feature = "vless-reverse")]

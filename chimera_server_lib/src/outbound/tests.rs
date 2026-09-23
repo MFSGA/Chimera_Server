@@ -938,6 +938,8 @@ fn static_vless_reverse_preserves_bridge_startup_plan() {
             "address": "127.0.0.1",
             "port": 1234,
             "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "email": "bridge@example.test",
+            "level": 7,
             "encryption": "none",
             "reverse": {"tag": "reverse-in"}
         }
@@ -950,6 +952,12 @@ fn static_vless_reverse_preserves_bridge_startup_plan() {
         .expect("decode Reverse Bridge startup plan");
     assert_eq!(bridge.server.to_string(), "127.0.0.1:1234");
     assert_eq!(bridge.reverse_tag, "reverse-in");
+    assert_eq!(bridge.routing_user, "bridge@example.test");
+    assert_eq!(
+        bridge.policy_identity,
+        "3ac9b383-75a1-431c-8184-106c80eb2273"
+    );
+    assert_eq!(bridge.user_level, 7);
 }
 
 #[cfg(all(feature = "vless-reverse", feature = "tls"))]

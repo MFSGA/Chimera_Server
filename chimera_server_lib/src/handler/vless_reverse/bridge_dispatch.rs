@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::{
-    io::{ReadBuf, copy_bidirectional, duplex},
+    io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional, duplex},
     sync::mpsc,
 };
 use tokio_util::sync::PollSender;
@@ -18,25 +18,159 @@ use crate::{
     async_stream::{
         AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage,
         AsyncShutdownMessage, AsyncStream, AsyncTargetedMessageStream,
-        AsyncWriteSourcedMessage,
+        AsyncWriteSourcedMessage, RawTcpRelayState,
     },
     beginning::udp::run_multi_directional_udp,
-    config::server_config::InboundSniffingConfig,
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     runtime::DataPlaneRuntime,
     session::sniff::{build_sniffed_route_plan, sniff_stream_protocol},
-    traffic::TrafficContext,
+    traffic::{
+        ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
+        record_transfer_ref, register_connection,
+    },
 };
 
 use super::{
     bridge_worker::{
-        BridgeTcpDispatcher, BridgeUdpRequest, BridgeUdpResponse, BridgeUdpSession,
+        BridgeDispatchContext, BridgeTcpDispatcher, BridgeUdpRequest,
+        BridgeUdpResponse, BridgeUdpSession,
     },
     session_stream::ReverseSessionStream,
 };
 
 const UDP_CHANNEL_CAPACITY: usize = 16;
 const SNIFFING_RELAY_CAPACITY: usize = 16 * 1024;
+
+struct BridgeTrafficStream {
+    inner: Box<dyn AsyncStream>,
+    context: TrafficContext,
+    _connection_guard: ConnectionGuard,
+}
+
+impl BridgeTrafficStream {
+    fn new(inner: Box<dyn AsyncStream>, context: TrafficContext) -> Self {
+        let connection_guard = register_connection(Some(&context));
+        Self {
+            inner,
+            context,
+            _connection_guard: connection_guard,
+        }
+    }
+}
+
+impl AsyncRead for BridgeTrafficStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut *self.inner).poll_read(cx, buffer);
+        if let Poll::Ready(Ok(())) = &result {
+            let size = buffer.filled().len().saturating_sub(before) as u64;
+            if size != 0 {
+                record_transfer_ref(Some(&self.context), 0, size);
+            }
+        }
+        result
+    }
+}
+
+impl AsyncWrite for BridgeTrafficStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut *self.inner).poll_write(cx, buffer);
+        if let Poll::Ready(Ok(size)) = result {
+            if size != 0 {
+                record_transfer_ref(Some(&self.context), size as u64, 0);
+            }
+            Poll::Ready(Ok(size))
+        } else {
+            result
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncPing for BridgeTrafficStream {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<bool>> {
+        Pin::new(&mut *self.inner).poll_write_ping(cx)
+    }
+}
+
+impl AsyncStream for BridgeTrafficStream {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        self.inner.raw_tcp_relay_state()
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inner.raw_tcp_fd()
+    }
+}
+
+fn reverse_traffic_context(
+    runtime: &DataPlaneRuntime,
+    reverse_tag: &str,
+    source: Option<SocketAddr>,
+    context: &BridgeDispatchContext,
+) -> TrafficContext {
+    let mut traffic_context = TrafficContext::new("vless-reverse")
+        .with_inbound_tag(reverse_tag)
+        .with_user_level(context.user_level);
+    if !context.routing_user.is_empty() {
+        traffic_context =
+            traffic_context.with_identity(context.routing_user.clone());
+    }
+    if !context.policy_identity.is_empty() {
+        traffic_context =
+            traffic_context.with_policy_identity(context.policy_identity.clone());
+    }
+    if let Some(source) = source {
+        traffic_context = traffic_context.with_client_ip(source.ip());
+    }
+    runtime.apply_traffic_stats_policy(&mut traffic_context);
+    traffic_context
+}
+
+fn reverse_routing_metadata(
+    local: Option<SocketAddr>,
+    context: &BridgeDispatchContext,
+) -> InboundRoutingMetadata {
+    InboundRoutingMetadata {
+        local_addr: local,
+        policy_identities: if context.policy_identity.is_empty() {
+            Vec::new()
+        } else {
+            vec![context.policy_identity.clone()]
+        },
+        inbound_protocol: Some("vless-reverse".to_string()),
+        ..InboundRoutingMetadata::default()
+    }
+}
 
 struct BridgeTargetedUdpStream {
     requests: mpsc::Receiver<BridgeUdpRequest>,
@@ -152,25 +286,23 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
         target: NetLocation,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
-        sniffing: Option<InboundSniffingConfig>,
+        context: BridgeDispatchContext,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let source =
+        let routing_source =
             source.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
         let resolver = self.resolver();
+        let traffic_context =
+            reverse_traffic_context(self, reverse_tag, source, &context);
 
-        let Some(sniffing) = sniffing else {
-            let metadata = InboundRoutingMetadata {
-                local_addr: local,
-                inbound_protocol: Some("vless-reverse".to_string()),
-                ..InboundRoutingMetadata::default()
-            };
+        let Some(sniffing) = context.sniffing.clone() else {
+            let metadata = reverse_routing_metadata(local, &context);
             let connection = connect_tcp_outbound_with_routing_metadata(
                 &resolver,
                 &target,
                 self,
                 reverse_tag,
-                "",
-                source,
+                &context.routing_user,
+                routing_source,
                 metadata,
             )
             .await?
@@ -181,7 +313,16 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
                 )
             })?;
 
-            return Ok(connection.stream);
+            let traffic_context = connection
+                .outbound_tag
+                .as_ref()
+                .map_or(traffic_context.clone(), |tag| {
+                    traffic_context.clone().with_outbound_tag(tag.clone())
+                });
+            return Ok(Box::new(BridgeTrafficStream::new(
+                connection.stream,
+                traffic_context,
+            )));
         };
 
         let (mux_side, route_side) = duplex(SNIFFING_RELAY_CAPACITY);
@@ -192,7 +333,7 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
             let logical_stream: Box<dyn AsyncStream> =
                 Box::new(ReverseSessionStream::new(route_side));
             let result = async {
-                let (mut sniffed_stream, sniffed_metadata) =
+                let (sniffed_stream, sniffed_metadata) =
                     sniff_stream_protocol(logical_stream, Some(&sniffing)).await?;
                 let mut route_plan = build_sniffed_route_plan(
                     Some(&sniffing),
@@ -200,16 +341,19 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
                     &original_target,
                     local,
                 );
+                let base_metadata = reverse_routing_metadata(local, &context);
                 route_plan.routing_metadata.inbound_protocol =
-                    Some("vless-reverse".to_string());
+                    base_metadata.inbound_protocol;
+                route_plan.routing_metadata.policy_identities =
+                    base_metadata.policy_identities;
 
                 let connection = connect_tcp_outbound_with_routing_metadata(
                     &resolver,
                     &route_plan.outbound_target,
                     &runtime,
                     &reverse_tag,
-                    "",
-                    source,
+                    &context.routing_user,
+                    routing_source,
                     route_plan.routing_metadata,
                 )
                 .await?
@@ -222,7 +366,24 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
                         ),
                     )
                 })?;
-                let mut remote = connection.stream;
+                let traffic_context = connection
+                    .outbound_tag
+                    .as_ref()
+                    .map_or(traffic_context.clone(), |tag| {
+                        traffic_context.clone().with_outbound_tag(tag.clone())
+                    });
+                let _connection_guard =
+                    register_connection(Some(&traffic_context));
+                let mut sniffed_stream = MeteredStream::new(
+                    sniffed_stream,
+                    Some(traffic_context.clone()),
+                    TrafficDirection::Upload,
+                );
+                let mut remote = MeteredStream::new(
+                    connection.stream,
+                    Some(traffic_context),
+                    TrafficDirection::Download,
+                );
                 copy_bidirectional(&mut sniffed_stream, &mut remote).await?;
                 Ok::<(), std::io::Error>(())
             }
@@ -251,6 +412,7 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
         reverse_tag: &str,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
+        context: BridgeDispatchContext,
     ) -> std::io::Result<BridgeUdpSession> {
         let peer =
             source.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
@@ -265,7 +427,7 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
         let resolver = self.resolver();
         let runtime = self.clone();
         let traffic_context =
-            TrafficContext::new("vless-reverse").with_inbound_tag(reverse_tag);
+            reverse_traffic_context(self, reverse_tag, source, &context);
         if !self.spawn_inbound_connection(async move {
             let _ = run_multi_directional_udp(
                 Box::new(stream),
@@ -287,5 +449,97 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
             requests: request_sender,
             responses: response_receiver,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        runtime::RuntimeState,
+        traffic::{active_connections, snapshot},
+    };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+
+    #[test]
+    fn reverse_traffic_context_preserves_xray_user_and_policy_identity() {
+        let runtime = RuntimeState::new(Vec::new(), Vec::new()).data_plane();
+        let source: SocketAddr = "192.0.2.44:51000".parse().unwrap();
+        let bridge = BridgeDispatchContext {
+            sniffing: None,
+            routing_user: "bridge@example.test".to_string(),
+            policy_identity: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+            user_level: 7,
+        };
+
+        let context =
+            reverse_traffic_context(&runtime, "bridge-in", Some(source), &bridge);
+
+        assert_eq!(context.protocol, "vless-reverse");
+        assert_eq!(context.identity.as_deref(), Some("bridge@example.test"));
+        assert_eq!(
+            context.policy_identities,
+            vec!["3ac9b383-75a1-431c-8184-106c80eb2273".to_string()]
+        );
+        assert_eq!(context.inbound_tag.as_deref(), Some("bridge-in"));
+        assert_eq!(context.client_ip, Some(source.ip()));
+        assert_eq!(context.user_level, 7);
+    }
+
+    #[cfg(feature = "traffic")]
+    #[tokio::test]
+    async fn bridge_traffic_stream_records_bytes_and_active_lifecycle() {
+        let inbound_tag = "reverse-bridge-traffic-wrapper-test";
+        let identity = "reverse-bridge-traffic@example.test";
+        let before = snapshot()
+            .per_inbound
+            .get(inbound_tag)
+            .cloned()
+            .unwrap_or_default();
+
+        let (inner, mut peer) = duplex(128);
+        let context = TrafficContext::new("vless-reverse")
+            .with_identity(identity)
+            .with_inbound_tag(inbound_tag)
+            .with_outbound_tag("direct")
+            .with_client_ip("192.0.2.45".parse().unwrap());
+        let mut stream = BridgeTrafficStream::new(
+            Box::new(ReverseSessionStream::new(inner)),
+            context,
+        );
+
+        assert!(active_connections().iter().any(|entry| {
+            entry.inbound_tag.as_deref() == Some(inbound_tag)
+                && entry.identity.as_deref() == Some(identity)
+                && entry.client_ip == Some("192.0.2.45".parse().unwrap())
+        }));
+
+        stream.write_all(b"upload").await.unwrap();
+        let mut upload = [0u8; 6];
+        peer.read_exact(&mut upload).await.unwrap();
+        assert_eq!(&upload, b"upload");
+
+        peer.write_all(b"download").await.unwrap();
+        let mut download = [0u8; 8];
+        stream.read_exact(&mut download).await.unwrap();
+        assert_eq!(&download, b"download");
+
+        drop(stream);
+        assert!(
+            !active_connections()
+                .iter()
+                .any(|entry| entry.inbound_tag.as_deref() == Some(inbound_tag))
+        );
+
+        let after = snapshot()
+            .per_inbound
+            .get(inbound_tag)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(after.upload_bytes.saturating_sub(before.upload_bytes), 6);
+        assert_eq!(
+            after.download_bytes.saturating_sub(before.download_bytes),
+            8
+        );
     }
 }

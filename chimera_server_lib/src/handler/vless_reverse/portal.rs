@@ -62,6 +62,34 @@ impl ReversePortalRegistry {
         }
     }
 
+    pub(crate) fn ensure_tag(&self, tag: &str) {
+        self.entries
+            .lock()
+            .expect("Reverse portal registry lock poisoned")
+            .entry(tag.to_string())
+            .or_insert_with(|| {
+                Arc::new(PortalEntry {
+                    picker: MuxClientPicker::default(),
+                })
+            });
+    }
+
+    pub(crate) fn remove_tag(&self, tag: &str) -> bool {
+        self.entries
+            .lock()
+            .expect("Reverse portal registry lock poisoned")
+            .remove(tag)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_tag(&self, tag: &str) -> bool {
+        self.entries
+            .lock()
+            .expect("Reverse portal registry lock poisoned")
+            .contains_key(tag)
+    }
+
     pub(crate) async fn attach_physical(
         &self,
         tag: &str,

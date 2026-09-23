@@ -583,6 +583,7 @@ where
                 context.client_ip = Some(peer_addr.ip());
                 runtime.apply_traffic_stats_policy(context);
             }
+            runtime.ensure_reverse_portal(&reverse_tag)?;
             let _connection_guard = register_connection(traffic_context.as_ref());
             if let Some(data) = connection_success_response {
                 stream.write_all(&data).await?;

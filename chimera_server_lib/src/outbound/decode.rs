@@ -92,7 +92,8 @@ pub(super) fn decode_socks_outbound(
 pub(super) fn decode_vless_outbound(
     outbound: &OutboundSummary,
 ) -> std::io::Result<VlessOutboundEndpoint> {
-    let (server, account) = decode_vless_server_and_account(outbound)?;
+    let (server, _user_level, _routing_user, account) =
+        decode_vless_server_and_account(outbound)?;
 
     if let Some(reverse) = account.reverse.as_ref() {
         #[cfg(not(feature = "vless-reverse"))]
@@ -129,7 +130,8 @@ pub(super) fn decode_vless_outbound(
 pub(crate) fn maybe_decode_vless_reverse_bridge(
     outbound: &OutboundSummary,
 ) -> std::io::Result<Option<VlessReverseBridgeEndpoint>> {
-    let (server, account) = decode_vless_server_and_account(outbound)?;
+    let (server, user_level, routing_user, account) =
+        decode_vless_server_and_account(outbound)?;
     let Some(reverse) = account.reverse.as_ref() else {
         return Ok(None);
     };
@@ -149,6 +151,9 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
         user_id,
         flow: account.flow,
         reverse_tag: reverse.tag.clone(),
+        routing_user,
+        policy_identity: account.id.clone(),
+        user_level,
         sniffing,
     }))
 }
@@ -360,7 +365,7 @@ pub(crate) fn decode_vless_reverse_bridge(
 
 fn decode_vless_server_and_account(
     outbound: &OutboundSummary,
-) -> std::io::Result<(NetLocation, VlessAccountPayload)> {
+) -> std::io::Result<(NetLocation, u32, String, VlessAccountPayload)> {
     let message_type = outbound
         .proxy_settings_type
         .as_deref()
@@ -410,10 +415,21 @@ fn decode_vless_server_and_account(
             format!("VLESS outbound {} has invalid server address", outbound.tag),
         )
     })?;
-    let account = server.user.and_then(|user| user.account).ok_or_else(|| {
+    let user = server.user.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("VLESS outbound {} requires exactly one user", outbound.tag),
+        )
+    })?;
+    let user_level = user.level;
+    let routing_user = user.email;
+    let account = user.account.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "VLESS outbound {} user is missing its account",
+                outbound.tag
+            ),
         )
     })?;
     let account_type = account.r#type.trim_start_matches('.');
@@ -435,7 +451,12 @@ fn decode_vless_server_and_account(
                 format!("invalid VLESS outbound {} account: {error}", outbound.tag),
             )
         })?;
-    Ok((NetLocation::new(address, port), account))
+    Ok((
+        NetLocation::new(address, port),
+        user_level,
+        routing_user,
+        account,
+    ))
 }
 
 fn validate_vless_outbound_account(

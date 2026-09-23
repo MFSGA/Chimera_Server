@@ -907,6 +907,122 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test]
+    async fn runtime_vless_reverse_user_update_changes_command_authorization() {
+        let user_id = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let handler = plain_vless_handler(
+            "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "original-user",
+        );
+        let runtime = RuntimeState::new(
+            vec![ServerConfig {
+                tag: "vless-test".into(),
+                bind_location: BindLocation::Address(NetLocation::new(
+                    Address::Ipv4(Ipv4Addr::LOCALHOST),
+                    0,
+                )),
+                protocol: ServerProxyConfig::Vless {
+                    users: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                transport: Transport::Tcp,
+                quic_settings: None,
+                sniffing: None,
+                tcp_socket_policy: None,
+            }],
+            Vec::new(),
+        );
+
+        runtime
+            .alter_inbound_users(
+                "vless-test",
+                |_| -> Result<ServerConfig, ()> {
+                    panic!("managed VLESS update must not rebuild the config")
+                },
+                |users| {
+                    users.push(VlessUser {
+                        user_id: user_id.into(),
+                        user_label: "dynamic-reverse-user".into(),
+                        user_level: 7,
+                        flow: String::new(),
+                        reverse: Some(VlessReverseConfig {
+                            tag: "dynamic-reverse-out".into(),
+                        }),
+                    });
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("add dynamic Reverse user");
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(user_id, COMMAND_RVS))
+            .await
+            .expect("write dynamic Reverse request");
+        let result = handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(server)),
+                TcpServerConnectionContext {
+                    handshake_runtime: Some(
+                        runtime.data_plane().inbound_handshake_runtime(),
+                    ),
+                    ..TcpServerConnectionContext::default()
+                },
+            )
+            .await
+            .expect("dynamically added Reverse user must authorize command 0x04");
+        let TcpServerSetupResult::ReversePortal {
+            reverse_tag,
+            traffic_context,
+            ..
+        } = result
+        else {
+            panic!("dynamic Reverse user must produce ReversePortal");
+        };
+        assert_eq!(reverse_tag, "dynamic-reverse-out");
+        let context = traffic_context.expect("dynamic Reverse traffic context");
+        assert_eq!(context.identity.as_deref(), Some("dynamic-reverse-user"));
+        assert_eq!(context.user_level, 7);
+
+        runtime
+            .alter_inbound_users(
+                "vless-test",
+                |_| -> Result<ServerConfig, ()> {
+                    panic!("managed VLESS update must not rebuild the config")
+                },
+                |users| {
+                    users.retain(|user| user.user_id != user_id);
+                    Ok(true)
+                },
+            )
+            .await
+            .expect("remove dynamic Reverse user");
+
+        let (mut client, server) = duplex(1024);
+        client
+            .write_all(&build_plain_vless_request(user_id, COMMAND_RVS))
+            .await
+            .expect("write removed Reverse request");
+        let error = match handler
+            .setup_server_stream_with_context(
+                Box::new(TestStream(server)),
+                TcpServerConnectionContext {
+                    handshake_runtime: Some(
+                        runtime.data_plane().inbound_handshake_runtime(),
+                    ),
+                    ..TcpServerConnectionContext::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("removed Reverse user must stop authenticating"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
     #[tokio::test]
     async fn handshake_uses_xray_level_zero_policy() {
         let user_id = "3ac9b383-75a1-431c-8184-106c80eb2273";

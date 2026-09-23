@@ -169,6 +169,7 @@ impl RuntimeState {
         let (routing_events, _) = broadcast::channel(256);
         let routing = Arc::new(RoutingState::default());
         let outbounds = Arc::new(outbounds);
+        let routing_updates = Arc::new(Mutex::new(()));
         #[cfg(feature = "vless-reverse")]
         let reverse_portals =
             crate::handler::vless_reverse::portal::ReversePortalRegistry::new(
@@ -182,6 +183,7 @@ impl RuntimeState {
             routing_publication: Arc::new(RwLock::new(Arc::new(
                 RoutingPublication::new(routing, outbounds),
             ))),
+            routing_updates: routing_updates.clone(),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             resolver,
             user_domain_access: UserDomainAccessStore::default(),
@@ -193,7 +195,7 @@ impl RuntimeState {
         }));
         Self {
             data_plane,
-            routing_updates: Arc::new(Mutex::new(())),
+            routing_updates,
             lifecycle: Arc::new(AtomicU8::new(
                 RuntimeLifecycleState::Starting as u8,
             )),
@@ -471,6 +473,11 @@ impl RuntimeState {
     #[cfg(feature = "vless")]
     pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
         self.data_plane.0.inbound_manager.vless_users_snapshot(tag)
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) fn remove_reverse_portal(&self, tag: &str) -> bool {
+        self.data_plane.remove_reverse_portal(tag)
     }
 
     #[cfg(feature = "vless")]

@@ -322,6 +322,9 @@ mod tests {
             ],
             flow: String::new(),
             reverse_tag: "bridge-in".to_string(),
+            routing_user: String::new(),
+            policy_identity: "11111111-1111-1111-1111-111111111111".to_string(),
+            user_level: 0,
             sniffing: None,
         };
         let expected_user = endpoint.user_id;

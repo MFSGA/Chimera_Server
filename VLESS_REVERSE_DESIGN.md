@@ -1,6 +1,6 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；Batch G 的普通 Reverse UDP RAW 已完成双向固定 Xray 互操作；Batch H 已接入 Bridge outbound Reverse HTTP/TLS sniffing、routeOnly 与 domain/IP exclusions，动态管理与更广 transport/security 仍待完成
+- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；Batch G 的普通 Reverse UDP RAW 已完成双向固定 Xray 互操作；Batch H 已接入 Bridge outbound Reverse HTTP/TLS sniffing、routeOnly 与 domain/IP exclusions；Batch I 已接入 VLESS Reverse AddUser/RemoveUser 的热更新、首次 RVS 懒发布和删除撤销，更多可观测性与 transport/security 仍待完成
 - 更新日期：2026-09-23
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -552,13 +552,15 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - Bridge outbound `reverse.sniffing` 已使用固定 Xray `SniffingConfig` protobuf shape（enabled、destinationOverride、domainsExcluded、ipsExcluded、metadataOnly、routeOnly），静态 JSON 不再丢字段或使用私有 wire。
 - Bridge logical TCP session 在启用 sniffing 时复用共享 sniffer：先读取并回放首包，再基于 HTTP Host / TLS SNI 构造 routing metadata 和目标覆盖；未启用 sniffing 时保持原有直连路径。
 - 固定 Xray-core `v26.9.9` Portal -> Chimera Bridge RAW 互操作已验证 HTTP Host、TLS SNI、routeOnly、domain exclusion 和 IP exclusion。`metadataOnly` 与 FakeDNS override 当前仍明确 fail closed；QUIC override 维持与现有 inbound sniffer 一致的兼容 no-op。
-- Reverse Mux NEW 的 source/local metadata 已继续传播进 Bridge routing。routing user、policy identity、traffic context 以及 PROXY protocol 使用方的 Reverse 专项验证仍待完成。
+- Reverse Mux NEW 的 source/local metadata 已继续传播进 Bridge routing。Bridge outbound user 的 email/level 会按固定 Xray 的虚拟 inbound 语义进入 routing/traffic context，VLESS UUID 作为 Chimera user-domain policy identity 保留；无 sniffing TCP、sniffing TCP 和 targeted UDP 均应用同一份 context。固定 Xray-core `v26.9.9` RAW 互操作已用 `user` routing rule 验证 email 传播；UUID policy identity、level、client IP、TCP 双向 traffic 计量和 active-connection guard 已有本地回归。PROXY protocol 使用方的 Reverse 专项验证仍待完成。
 
 ### I. 动态管理与可观测性
 
-- AddUser/RemoveUser 对 Reverse 授权和 worker 的生效语义对齐固定 Xray 基线。
-- 增加安全的 tag、worker/session count、重连和失败原因指标。
-- 日志不得包含 UUID、认证 payload、private key 或完整配置。
+- VLESS `AddUser` 已支持带 `reverse.tag` 的动态用户，并复用 live user store 热更新：不会重启 listener，也不会在 AddUser 时提前发布 Reverse route。新增用户可立即认证 command `0x04`。
+- 首次已认证 RVS 按固定 Xray `GetReverse` 语义懒创建 Portal tag，并原子发布 `vless-reverse` 虚拟 outbound；若同 tag 已被普通 outbound 占用则明确失败。routing publication 的动态更新与现有 AddOutbound/RemoveOutbound 共用同一 update mutex。
+- `RemoveUser(email)` 按固定 Xray 顺序撤掉该用户 reverse tag 的 routing/registry mapping，再从 live validator 删除用户；mapping 删除不会主动关闭已持有引用的物理 worker lease。VLESS UserManager email 唯一性与 RemoveUser 已改为 Xray 的大小写不敏感语义，空 email 不参与唯一性。
+- 当前这些动态语义有 gRPC/handler/registry 本地回归，固定 Xray 源码基线已逐项复核；尚未增加网络 API -> 动态 Reverse 的真实 Xray 互操作 fixture。共享 reverse tag 的多用户边界、动态 tag 与普通 outbound 冲突后的 RemoveUser 破坏性语义仍需专项覆盖。
+- 可观测性下一步增加安全的 tag、worker/session count、重连和失败原因指标；日志不得包含 UUID、认证 payload、private key 或完整配置。
 
 ### J. 真实互操作与文档收口
 

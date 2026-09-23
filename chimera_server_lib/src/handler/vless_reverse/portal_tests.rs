@@ -97,3 +97,50 @@ async fn public_tcp_open_emits_reverse_source_and_local_metadata() {
     );
     assert_eq!(frame.payload.as_ref(), b"x");
 }
+
+#[tokio::test]
+async fn removing_registry_tag_does_not_close_existing_xray_style_worker() {
+    let registry = ReversePortalRegistry::new(Vec::<String>::new());
+    registry.ensure_tag("dynamic-reverse");
+    assert!(registry.contains_tag("dynamic-reverse"));
+
+    let (physical, mut peer) = duplex(4096);
+    let lease = registry
+        .attach_physical(
+            "dynamic-reverse",
+            Box::new(ReverseSessionStream::new(physical)),
+        )
+        .await
+        .expect("attach lazily-created Reverse worker");
+    let _control = read_frame_with_source_and_local(&mut peer, true)
+        .await
+        .expect("consume initial control frame");
+
+    assert!(registry.remove_tag("dynamic-reverse"));
+    assert!(!registry.contains_tag("dynamic-reverse"));
+    let unavailable = registry
+        .open_tcp(
+            "dynamic-reverse",
+            NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 80),
+            "192.0.2.10:50000".parse().unwrap(),
+            None,
+        )
+        .expect_err("removed Reverse mapping must stop new routed opens");
+    assert_eq!(unavailable.kind(), std::io::ErrorKind::NotFound);
+
+    let direct_worker_session = lease.worker.open_tcp_session(
+        Destination {
+            network: TargetNetwork::Tcp,
+            location: NetLocation::new(
+                Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                80,
+            ),
+        },
+        None,
+        None,
+    );
+    assert!(
+        direct_worker_session.is_ok(),
+        "Xray RemoveHandler does not close an already-referenced Reverse worker"
+    );
+}

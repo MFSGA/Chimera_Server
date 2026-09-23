@@ -62,6 +62,14 @@ pub(crate) struct BridgeUdpSession {
     pub(crate) responses: mpsc::Receiver<BridgeUdpResponse>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct BridgeDispatchContext {
+    pub(crate) sniffing: Option<InboundSniffingConfig>,
+    pub(crate) routing_user: String,
+    pub(crate) policy_identity: String,
+    pub(crate) user_level: u32,
+}
+
 type SessionRoutes = Arc<Mutex<HashMap<u16, mpsc::Sender<InboundEvent>>>>;
 
 #[async_trait]
@@ -72,7 +80,7 @@ pub(crate) trait BridgeTcpDispatcher: Send + Sync {
         target: NetLocation,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
-        sniffing: Option<InboundSniffingConfig>,
+        context: BridgeDispatchContext,
     ) -> std::io::Result<Box<dyn AsyncStream>>;
 
     async fn open_udp(
@@ -80,6 +88,7 @@ pub(crate) trait BridgeTcpDispatcher: Send + Sync {
         reverse_tag: &str,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
+        context: BridgeDispatchContext,
     ) -> std::io::Result<BridgeUdpSession>;
 }
 
@@ -97,14 +106,19 @@ impl MuxServerWorker {
         reverse_tag: String,
         dispatcher: Arc<dyn BridgeTcpDispatcher>,
     ) -> Self {
-        Self::new_with_sniffing(physical, reverse_tag, dispatcher, None)
+        Self::new_with_context(
+            physical,
+            reverse_tag,
+            dispatcher,
+            BridgeDispatchContext::default(),
+        )
     }
 
-    pub(crate) fn new_with_sniffing(
+    pub(crate) fn new_with_context(
         physical: Box<dyn AsyncStream>,
         reverse_tag: String,
         dispatcher: Arc<dyn BridgeTcpDispatcher>,
-        sniffing: Option<InboundSniffingConfig>,
+        context: BridgeDispatchContext,
     ) -> Self {
         let control = Arc::new(BridgeControlState::new());
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -124,7 +138,7 @@ impl MuxServerWorker {
             cancellation.clone(),
             tasks.clone(),
             session_count.clone(),
-            sniffing,
+            context,
         ));
         let writer_task = tokio::spawn(run_physical_writer(
             writer,
@@ -201,7 +215,7 @@ async fn run_physical_reader<R>(
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
-    sniffing: Option<InboundSniffingConfig>,
+    context: BridgeDispatchContext,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -248,7 +262,7 @@ async fn run_physical_reader<R>(
                     cancellation.clone(),
                     tasks.clone(),
                     session_count.clone(),
-                    sniffing.clone(),
+                    context.clone(),
                 )
                 .await
             }
@@ -283,7 +297,7 @@ async fn handle_new_tcp(
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
-    sniffing: Option<InboundSniffingConfig>,
+    context: BridgeDispatchContext,
 ) -> std::io::Result<()> {
     let target = frame.metadata.target.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -307,6 +321,7 @@ async fn handle_new_tcp(
             cancellation,
             tasks,
             session_count,
+            context,
         )
         .await;
     }
@@ -335,13 +350,7 @@ async fn handle_new_tcp(
         .as_ref()
         .and_then(destination_socket_addr);
     let stream = dispatcher
-        .open_tcp(
-            reverse_tag,
-            target.location.clone(),
-            source,
-            local,
-            sniffing,
-        )
+        .open_tcp(reverse_tag, target.location.clone(), source, local, context)
         .await?;
 
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_FRAME_CAPACITY);
@@ -376,6 +385,7 @@ async fn handle_new_udp(
     cancellation: CancellationToken,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
+    context: BridgeDispatchContext,
 ) -> std::io::Result<()> {
     let target = frame.metadata.target.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -407,7 +417,9 @@ async fn handle_new_udp(
         .local
         .as_ref()
         .and_then(destination_socket_addr);
-    let session = dispatcher.open_udp(reverse_tag, source, local).await?;
+    let session = dispatcher
+        .open_udp(reverse_tag, source, local, context)
+        .await?;
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_FRAME_CAPACITY);
     sessions
         .lock()

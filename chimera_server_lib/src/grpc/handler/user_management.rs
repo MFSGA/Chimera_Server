@@ -46,10 +46,12 @@ impl HandlerServiceImpl {
         users: &mut Vec<VlessUser>,
         user: &proto::xray::common::protocol::User,
     ) -> Result<(), Status> {
+        let has_email = !user.email.trim().is_empty();
         let user = self.parse_vless_user(user)?;
-        if users
-            .iter()
-            .any(|existing| existing.user_label == user.user_label)
+        if has_email
+            && users.iter().any(|existing| {
+                existing.user_label.eq_ignore_ascii_case(&user.user_label)
+            })
         {
             return Err(Status::already_exists(format!(
                 "VLESS user {} already exists",
@@ -66,11 +68,17 @@ impl HandlerServiceImpl {
         users: &mut Vec<VlessUser>,
         email: &str,
     ) -> Result<(), Status> {
-        let before = users.len();
-        users.retain(|user| user.user_label != email);
-        if before == users.len() {
+        let Some(index) = users
+            .iter()
+            .position(|user| user.user_label.eq_ignore_ascii_case(email))
+        else {
             return Err(Status::not_found(format!("VLESS user {email} not found")));
+        };
+        #[cfg(feature = "vless-reverse")]
+        if let Some(reverse) = users[index].reverse.as_ref() {
+            self.runtime.remove_reverse_portal(&reverse.tag);
         }
+        users.remove(index);
         Ok(())
     }
 

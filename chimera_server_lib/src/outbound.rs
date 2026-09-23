@@ -98,6 +98,9 @@ pub(crate) struct VlessReverseBridgeEndpoint {
     pub(crate) user_id: [u8; 16],
     pub(crate) flow: String,
     pub(crate) reverse_tag: String,
+    pub(crate) routing_user: String,
+    pub(crate) policy_identity: String,
+    pub(crate) user_level: u32,
     pub(crate) sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
 }
 

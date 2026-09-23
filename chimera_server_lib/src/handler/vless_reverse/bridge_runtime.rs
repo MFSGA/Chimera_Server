@@ -10,7 +10,9 @@ use crate::{
     runtime::{DataPlaneRuntime, OutboundSummary},
 };
 
-use super::bridge_worker::{BridgeTcpDispatcher, MuxServerWorker};
+use super::bridge_worker::{
+    BridgeDispatchContext, BridgeTcpDispatcher, MuxServerWorker,
+};
 
 const XRAY_BRIDGE_MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const XRAY_BRIDGE_MAX_AVERAGE_CONNECTIONS: usize = 16;
@@ -83,11 +85,16 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
             .await
             {
                 Ok(physical) => {
-                    workers.push(MuxServerWorker::new_with_sniffing(
+                    workers.push(MuxServerWorker::new_with_context(
                         physical,
                         plan.endpoint.reverse_tag.clone(),
                         dispatcher.clone(),
-                        plan.endpoint.sniffing.clone(),
+                        BridgeDispatchContext {
+                            sniffing: plan.endpoint.sniffing.clone(),
+                            routing_user: plan.endpoint.routing_user.clone(),
+                            policy_identity: plan.endpoint.policy_identity.clone(),
+                            user_level: plan.endpoint.user_level,
+                        },
                     ));
                 }
                 Err(error) => {

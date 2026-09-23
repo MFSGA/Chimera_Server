@@ -24,8 +24,8 @@ use crate::{
 };
 
 use super::{
-    BridgeTcpDispatcher, BridgeUdpResponse, BridgeUdpSession, MuxServerWorker,
-    idle_snapshot_is_unchanged,
+    BridgeDispatchContext, BridgeTcpDispatcher, BridgeUdpResponse, BridgeUdpSession,
+    MuxServerWorker, idle_snapshot_is_unchanged,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +34,9 @@ struct DispatchCall {
     target: NetLocation,
     source: Option<SocketAddr>,
     local: Option<SocketAddr>,
+    routing_user: String,
+    policy_identity: String,
+    user_level: u32,
 }
 
 struct FakeDispatcher {
@@ -65,7 +68,7 @@ impl BridgeTcpDispatcher for FakeDispatcher {
         target: NetLocation,
         source: Option<SocketAddr>,
         local: Option<SocketAddr>,
-        _sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
+        context: BridgeDispatchContext,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
         self.calls
             .lock()
@@ -75,6 +78,9 @@ impl BridgeTcpDispatcher for FakeDispatcher {
                 target,
                 source,
                 local,
+                routing_user: context.routing_user,
+                policy_identity: context.policy_identity,
+                user_level: context.user_level,
             });
         let stream = self
             .stream
@@ -90,6 +96,7 @@ impl BridgeTcpDispatcher for FakeDispatcher {
         _reverse_tag: &str,
         _source: Option<SocketAddr>,
         _local: Option<SocketAddr>,
+        _context: BridgeDispatchContext,
     ) -> std::io::Result<BridgeUdpSession> {
         let (requests, mut request_rx) =
             tokio::sync::mpsc::channel::<super::BridgeUdpRequest>(16);
@@ -131,10 +138,16 @@ async fn mux_server_routes_tcp_with_reverse_context_and_round_trips_frames() {
     let (physical, mut portal) = duplex(16 * 1024);
     let (local, mut local_peer) = duplex(16 * 1024);
     let dispatcher = Arc::new(FakeDispatcher::new(local));
-    let worker = MuxServerWorker::new(
+    let worker = MuxServerWorker::new_with_context(
         Box::new(ReverseSessionStream::new(physical)),
         "bridge-in".to_string(),
         dispatcher.clone(),
+        BridgeDispatchContext {
+            sniffing: None,
+            routing_user: "bridge@example.test".to_string(),
+            policy_identity: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+            user_level: 7,
+        },
     );
 
     assert!(worker.is_active(), "Xray Bridge workers start ACTIVE");
@@ -185,6 +198,9 @@ async fn mux_server_routes_tcp_with_reverse_context_and_round_trips_frames() {
             target: target.location,
             source: Some(source),
             local: Some(local_addr),
+            routing_user: "bridge@example.test".to_string(),
+            policy_identity: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
+            user_level: 7,
         }]
     );
 

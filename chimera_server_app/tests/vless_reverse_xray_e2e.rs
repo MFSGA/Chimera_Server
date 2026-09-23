@@ -54,17 +54,25 @@ fn xray_bridge_round_trips_public_dokodemo_tcp_over_tls_vless_reverse() {
 
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_raw_vless_reverse() {
-    run_chimera_bridge_interop(ReverseSecurity::Raw);
+    run_chimera_bridge_interop(ReverseSecurity::Raw, None);
+}
+
+#[test]
+fn chimera_bridge_preserves_reverse_routing_user_over_raw_vless_reverse() {
+    run_chimera_bridge_interop(
+        ReverseSecurity::Raw,
+        Some("reverse-routing@example.test"),
+    );
 }
 
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_tls_vless_reverse() {
-    run_chimera_bridge_interop(ReverseSecurity::Tls);
+    run_chimera_bridge_interop(ReverseSecurity::Tls, None);
 }
 
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_websocket_vless_reverse() {
-    run_chimera_bridge_interop(ReverseSecurity::Websocket);
+    run_chimera_bridge_interop(ReverseSecurity::Websocket, None);
 }
 
 #[test]
@@ -519,7 +527,10 @@ fn run_reverse_udp_interop() {
     xray.assert_running();
 }
 
-fn run_chimera_bridge_interop(security: ReverseSecurity) {
+fn run_chimera_bridge_interop(
+    security: ReverseSecurity,
+    routing_user: Option<&str>,
+) {
     let workspace = workspace_root();
     let xray = xray_binary(&workspace);
     if !xray.is_file() {
@@ -531,9 +542,15 @@ fn run_chimera_bridge_interop(security: ReverseSecurity) {
     }
 
     let _serial = serial_xray_guard();
+    let case_suffix = if routing_user.is_some() {
+        "-routing-user"
+    } else {
+        ""
+    };
     let work_dir = create_test_dir(&format!(
-        "vless-reverse-chimera-bridge-{}",
-        security.name()
+        "vless-reverse-chimera-bridge-{}{}",
+        security.name(),
+        case_suffix
     ));
     let (echo_addr, echoed_bytes) = start_observed_echo_server();
     let reverse_port = free_localhost_port();
@@ -587,6 +604,47 @@ fn run_chimera_bridge_interop(security: ReverseSecurity) {
             }),
         ),
     };
+
+    let reverse_bridge_outbound = json!({
+        "tag": "reverse-bridge",
+        "protocol": "vless",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": reverse_port,
+            "id": TEST_UUID,
+            "email": routing_user.unwrap_or(""),
+            "encryption": "none",
+            "reverse": {"tag": "bridge-in"}
+        },
+        "streamSettings": chimera_stream
+    });
+    let (mut chimera_outbounds, chimera_routing_rules) =
+        if let Some(routing_user) = routing_user {
+            (
+                vec![
+                    json!({"tag": "default-block", "protocol": "blackhole"}),
+                    json!({"tag": "direct", "protocol": "freedom"}),
+                ],
+                vec![json!({
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "user": [routing_user],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                })],
+            )
+        } else {
+            (
+                vec![json!({"tag": "direct", "protocol": "freedom"})],
+                vec![json!({
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                })],
+            )
+        };
+    chimera_outbounds.insert(0, reverse_bridge_outbound);
 
     write_json(
         &xray_config,
@@ -642,31 +700,9 @@ fn run_chimera_bridge_interop(security: ReverseSecurity) {
         json!({
             "log": {"loglevel": "debug"},
             "inbounds": [],
-            "outbounds": [
-                {
-                    "tag": "reverse-bridge",
-                    "protocol": "vless",
-                    "settings": {
-                        "address": "127.0.0.1",
-                        "port": reverse_port,
-                        "id": TEST_UUID,
-                        "encryption": "none",
-                        "reverse": {"tag": "bridge-in"}
-                    },
-                    "streamSettings": chimera_stream
-                },
-                {
-                    "tag": "direct",
-                    "protocol": "freedom"
-                }
-            ],
+            "outbounds": chimera_outbounds,
             "routing": {
-                "rules": [{
-                    "type": "field",
-                    "inboundTag": ["bridge-in"],
-                    "network": "tcp",
-                    "outboundTag": "direct"
-                }]
+                "rules": chimera_routing_rules
             }
         }),
     );

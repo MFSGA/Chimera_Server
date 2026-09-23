@@ -1053,6 +1053,61 @@ async fn handler_alter_vless_users_does_not_restart_listener() {
 }
 
 #[cfg(feature = "vless")]
+#[test]
+fn handler_vless_user_manager_matches_xray_email_case_rules() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let mut users = Vec::new();
+    let make_user = |id: &str, email: &str| proto::xray::common::protocol::User {
+        level: 0,
+        email: email.to_string(),
+        account: Some(proto::xray::common::serial::TypedMessage {
+            r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+            value: VlessAccountPayload {
+                id: id.to_string(),
+                flow: String::new(),
+            }
+            .encode_to_vec(),
+        }),
+    };
+
+    service
+        .add_vless_user(
+            &mut users,
+            &make_user("3ac9b383-75a1-431c-8184-106c80eb2273", "Case@Example.com"),
+        )
+        .expect("first VLESS email should be accepted");
+    let duplicate = service
+        .add_vless_user(
+            &mut users,
+            &make_user("9199ca5b-1850-4ae6-a4fa-fd6384073692", "case@example.com"),
+        )
+        .expect_err("Xray VLESS email uniqueness is case-insensitive");
+    assert_eq!(duplicate.code(), Code::AlreadyExists);
+
+    service
+        .add_vless_user(
+            &mut users,
+            &make_user("e041e73e-a0a0-49f5-9754-6401aa621fb7", ""),
+        )
+        .expect("Xray permits VLESS users with empty email");
+    service
+        .add_vless_user(
+            &mut users,
+            &make_user("61f00c0d-8d5f-4c13-bd3e-fabc5aaaca8c", ""),
+        )
+        .expect("empty email is not a unique-key collision in Xray");
+
+    service
+        .remove_vless_user(&mut users, "CASE@EXAMPLE.COM")
+        .expect("Xray VLESS RemoveUser matches email case-insensitively");
+    assert!(
+        users
+            .iter()
+            .all(|user| !user.user_label.eq_ignore_ascii_case("case@example.com"))
+    );
+}
+
+#[cfg(feature = "vless")]
 #[tokio::test]
 async fn handler_vless_vision_mode_change_does_not_restart_listener() {
     let occupied = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1116,6 +1171,217 @@ async fn handler_vless_vision_mode_change_does_not_restart_listener() {
         panic!("expected VLESS inbound");
     };
     assert_eq!(users[0].flow, "xtls-rprx-vision");
+    assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
+}
+
+#[cfg(feature = "vless-reverse")]
+#[tokio::test]
+async fn handler_dynamic_vless_reverse_lazily_publishes_and_removes_route() {
+    let inbound_tag = unique_tag("dynamic-reverse-inbound");
+    let reverse_tag = unique_tag("dynamic-reverse-route");
+    let email = unique_tag("dynamic-reverse-user");
+    let second_email = unique_tag("dynamic-reverse-user");
+    let runtime = RuntimeState::new(
+        vec![ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                free_localhost_port(),
+            )),
+            protocol: ServerProxyConfig::Vless {
+                users: Vec::new(),
+                fallbacks: Vec::new(),
+            },
+            transport: Transport::Tcp,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        }],
+        vec![OutboundSummary {
+            tag: "direct".to_string(),
+            protocol: "freedom".to_string(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
+        }],
+    );
+    let placeholder_task = tokio::spawn(std::future::pending::<()>());
+    let abort_handle = placeholder_task.abort_handle();
+    runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
+    let service = HandlerServiceImpl::new(runtime.clone());
+
+    let conflict = runtime
+        .data_plane()
+        .ensure_reverse_portal("direct")
+        .expect_err("dynamic Reverse tag must not replace a normal outbound");
+    assert_eq!(conflict.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        runtime
+            .outbounds()
+            .iter()
+            .any(|outbound| outbound.tag == "direct"
+                && outbound.protocol == "freedom")
+    );
+
+    let add_operation = proto::xray::app::proxyman::command::AddUserOperation {
+        user: Some(proto::xray::common::protocol::User {
+            level: 7,
+            email: email.clone(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                value: VlessAccountWirePayload {
+                    id: "9199ca5b-1850-4ae6-a4fa-fd6384073692".to_string(),
+                    flow: String::new(),
+                    reverse: Some(VlessReversePayload {
+                        tag: reverse_tag.clone(),
+                        sniffing: None,
+                    }),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    service
+        .alter_inbound(Request::new(
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                    value: add_operation.encode_to_vec(),
+                }),
+            },
+        ))
+        .await
+        .expect("dynamic Reverse AddUser should update the live validator");
+
+    assert!(!abort_handle.is_finished());
+    assert!(
+        !runtime
+            .outbounds()
+            .iter()
+            .any(|outbound| outbound.tag == reverse_tag),
+        "Xray AddUser does not create the Reverse outbound before command 0x04"
+    );
+    let current = runtime.inbound_by_tag(&inbound_tag).unwrap();
+    let ServerProxyConfig::Vless { users, .. } = current.protocol else {
+        panic!("expected VLESS inbound");
+    };
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].user_label, email);
+    assert_eq!(
+        users[0]
+            .reverse
+            .as_ref()
+            .map(|reverse| reverse.tag.as_str()),
+        Some(reverse_tag.as_str())
+    );
+
+    runtime
+        .data_plane()
+        .ensure_reverse_portal(&reverse_tag)
+        .expect("first authorized Reverse command should publish its route");
+    assert!(runtime.outbounds().iter().any(|outbound| {
+        outbound.tag == reverse_tag && outbound.protocol == "vless-reverse"
+    }));
+
+    let add_second = proto::xray::app::proxyman::command::AddUserOperation {
+        user: Some(proto::xray::common::protocol::User {
+            level: 0,
+            email: second_email.clone(),
+            account: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_VLESS_ACCOUNT.to_string(),
+                value: VlessAccountWirePayload {
+                    id: "61f00c0d-8d5f-4c13-bd3e-fabc5aaaca8c".to_string(),
+                    flow: String::new(),
+                    reverse: Some(VlessReversePayload {
+                        tag: reverse_tag.clone(),
+                        sniffing: None,
+                    }),
+                }
+                .encode_to_vec(),
+            }),
+        }),
+    };
+    service
+        .alter_inbound(Request::new(
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                    value: add_second.encode_to_vec(),
+                }),
+            },
+        ))
+        .await
+        .expect("second Reverse user may share the same Xray route tag");
+
+    let remove_operation =
+        proto::xray::app::proxyman::command::RemoveUserOperation {
+            email: email.clone(),
+        };
+    service
+        .alter_inbound(Request::new(
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                    value: remove_operation.encode_to_vec(),
+                }),
+            },
+        ))
+        .await
+        .expect("dynamic Reverse RemoveUser should update the live validator");
+
+    assert!(!abort_handle.is_finished());
+    assert!(
+        !runtime
+            .outbounds()
+            .iter()
+            .any(|outbound| outbound.tag == reverse_tag),
+        "Xray RemoveUser removes the Reverse outbound mapping"
+    );
+    let current = runtime.inbound_by_tag(&inbound_tag).unwrap();
+    let ServerProxyConfig::Vless { users, .. } = current.protocol else {
+        panic!("expected VLESS inbound");
+    };
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].user_label, second_email);
+
+    runtime
+        .data_plane()
+        .ensure_reverse_portal(&reverse_tag)
+        .expect("surviving shared-tag user should lazily recreate the route");
+    assert!(runtime.outbounds().iter().any(|outbound| {
+        outbound.tag == reverse_tag && outbound.protocol == "vless-reverse"
+    }));
+
+    let remove_second = proto::xray::app::proxyman::command::RemoveUserOperation {
+        email: second_email,
+    };
+    service
+        .alter_inbound(Request::new(
+            proto::xray::app::proxyman::command::AlterInboundRequest {
+                tag: inbound_tag.clone(),
+                operation: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                    value: remove_second.encode_to_vec(),
+                }),
+            },
+        ))
+        .await
+        .expect("remove surviving shared-tag Reverse user");
+    assert!(
+        !runtime
+            .outbounds()
+            .iter()
+            .any(|outbound| outbound.tag == reverse_tag)
+    );
+    let current = runtime.inbound_by_tag(&inbound_tag).unwrap();
+    let ServerProxyConfig::Vless { users, .. } = current.protocol else {
+        panic!("expected VLESS inbound");
+    };
+    assert!(users.is_empty());
     assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
 }
 
