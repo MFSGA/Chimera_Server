@@ -30,6 +30,7 @@ enum ReverseSecurity {
     Raw,
     Tls,
     Websocket,
+    XhttpTls,
 }
 
 impl ReverseSecurity {
@@ -38,6 +39,7 @@ impl ReverseSecurity {
             Self::Raw => "raw",
             Self::Tls => "tls",
             Self::Websocket => "websocket",
+            Self::XhttpTls => "xhttp-tls",
         }
     }
 }
@@ -78,6 +80,16 @@ fn chimera_bridge_round_trips_public_xray_portal_over_tls_vless_reverse() {
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_websocket_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Websocket, None);
+}
+
+#[test]
+fn chimera_bridge_round_trips_public_xray_portal_over_xhttp_tls_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTls, None);
+}
+
+#[test]
+fn xray_bridge_round_trips_public_chimera_portal_over_xhttp_tls_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTls);
 }
 
 #[test]
@@ -751,6 +763,44 @@ fn run_chimera_bridge_interop(
                 "wsSettings": {"path": "/reverse"}
             }),
         ),
+        ReverseSecurity::XhttpTls => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            (
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "path": "/reverse-xhttp/",
+                        "mode": "stream-up",
+                        "xPaddingBytes": 1
+                    }
+                }),
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "disableSystemRoot": true,
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "usage": "verify"
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "path": "/reverse-xhttp/",
+                        "mode": "stream-up",
+                        "xPaddingBytes": 1
+                    }
+                }),
+            )
+        }
     };
 
     let reverse_bridge_outbound = json!({
@@ -959,6 +1009,41 @@ fn run_reverse_interop(security: ReverseSecurity) {
         }
         ReverseSecurity::Websocket => {
             unreachable!("Portal-side WebSocket is not exercised here")
+        }
+        ReverseSecurity::XhttpTls => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+            (
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    },
+                    "xhttpSettings": {
+                        "path": "/reverse-xhttp/",
+                        "mode": "stream-up",
+                        "xPaddingBytes": 1
+                    }
+                }),
+                json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    },
+                    "xhttpSettings": {
+                        "path": "/reverse-xhttp/",
+                        "mode": "stream-up",
+                        "xPaddingBytes": 1
+                    }
+                }),
+            )
         }
     };
 

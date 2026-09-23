@@ -14,6 +14,7 @@ mod protocol;
 mod routing;
 mod static_config;
 mod wire;
+mod xhttp_transport;
 
 #[cfg(all(test, feature = "vless-reverse"))]
 use decode::decode_vless_reverse_bridge;
@@ -45,6 +46,7 @@ use protocol::{
     TcpProtocolHandshake, TrojanCommand, build_trojan_request, socks5_connect,
     trojan_connect, vless_tcp_connect,
 };
+use xhttp_transport::connect_xhttp_stream_up_h2;
 
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 pub(crate) use routing::connection_routing_input;
@@ -125,6 +127,10 @@ enum OutboundTransport {
         tls: Option<OutboundTlsClientSettings>,
         settings: OutboundHttpUpgradeClientSettings,
     },
+    Xhttp {
+        tls: OutboundTlsClientSettings,
+        settings: OutboundXhttpClientSettings,
+    },
     #[cfg(feature = "grpc_transport")]
     Grpc {
         tls: Option<OutboundTlsClientSettings>,
@@ -149,6 +155,17 @@ struct OutboundHttpUpgradeClientSettings {
     path: String,
     headers: HashMap<String, String>,
     ed: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutboundXhttpClientSettings {
+    host: String,
+    path: String,
+    headers: HashMap<String, String>,
+    padding_from: i32,
+    padding_to: i32,
+    no_grpc_header: bool,
+    uplink_http_method: String,
 }
 
 #[cfg(feature = "grpc_transport")]
@@ -233,6 +250,19 @@ pub(crate) fn prepare_vless_reverse_bridge(
             }
             #[cfg(feature = "ws")]
             Ok(Some(endpoint))
+        }
+        OutboundTransport::Xhttp { .. } => {
+            #[cfg(feature = "tls")]
+            {
+                Ok(Some(endpoint))
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge XHTTP stream-up requires the tls feature",
+                ))
+            }
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -332,6 +362,33 @@ pub(crate) async fn connect_vless_reverse_bridge(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "VLESS Reverse Bridge WebSocket requires the ws feature",
+                ));
+            }
+        }
+        OutboundTransport::Xhttp { tls, settings } => {
+            #[cfg(feature = "tls")]
+            {
+                let tls_server_name = (!tls.server_name.trim().is_empty())
+                    .then_some(tls.server_name.trim().to_string());
+                let base_stream =
+                    connect_tls_transport(raw_stream, &tls, &endpoint.server)
+                        .await?;
+                Box::new(
+                    connect_xhttp_stream_up_h2(
+                        Box::new(base_stream),
+                        &settings,
+                        &endpoint.server,
+                        tls_server_name.as_deref(),
+                    )
+                    .await?,
+                )
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (raw_stream, tls, settings);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge XHTTP stream-up requires the tls feature",
                 ));
             }
         }
@@ -745,6 +802,58 @@ async fn connect_planned_tcp_outbound(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "HTTPUpgrade outbound requires the httpupgrade feature",
+                ));
+            }
+        }
+        OutboundTransport::Xhttp { tls, settings } => {
+            let server = transport_server.as_ref().ok_or_else(|| {
+                std::io::Error::other(
+                    "XHTTP outbound is missing its server identity",
+                )
+            })?;
+            #[cfg(feature = "tls")]
+            {
+                let tls_server_name = (!tls.server_name.trim().is_empty())
+                    .then_some(tls.server_name.trim().to_string());
+                let base_stream =
+                    match connect_tls_transport(raw_stream, &tls, server).await {
+                        Ok(stream) => Box::new(stream) as Box<dyn AsyncStream>,
+                        Err(error) => {
+                            record(tcp_connect_observation(
+                                false,
+                                elapsed_millis(started),
+                                attempted_at,
+                                error.to_string(),
+                            ));
+                            return Err(error);
+                        }
+                    };
+                match connect_xhttp_stream_up_h2(
+                    base_stream,
+                    &settings,
+                    server,
+                    tls_server_name.as_deref(),
+                )
+                .await
+                {
+                    Ok(stream) => Box::new(stream),
+                    Err(error) => {
+                        record(tcp_connect_observation(
+                            false,
+                            elapsed_millis(started),
+                            attempted_at,
+                            error.to_string(),
+                        ));
+                        return Err(error);
+                    }
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (raw_stream, tls, settings, server);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP outbound currently requires the tls feature",
                 ));
             }
         }

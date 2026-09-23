@@ -234,6 +234,59 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn plan_accepts_xhttp_stream_up_over_tls() {
+        let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": "localhost",
+                "disableSystemRoot": true,
+                "certificates": [{
+                    "certificate": ["-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"],
+                    "usage": "verify"
+                }]
+            },
+            "xhttpSettings": {
+                "path": "/reverse-xhttp/",
+                "mode": "stream-up",
+                "xPaddingBytes": 1
+            }
+        }));
+        let plans = prepare_reverse_bridge_plans(&[outbound])
+            .expect("XHTTP/TLS Reverse Bridge should be supported");
+        assert_eq!(plans.len(), 1);
+    }
+
+    #[test]
+    fn plan_rejects_xhttp_non_stream_up_modes() {
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "tag": "reverse",
+            "protocol": "vless",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 443,
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "encryption": "none",
+                "reverse": {"tag": "bridge-in"}
+            },
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "none",
+                "xhttpSettings": {
+                    "path": "/reverse-xhttp/",
+                    "mode": "packet-up"
+                }
+            }
+        }))
+        .expect("parse unsupported XHTTP Reverse Bridge outbound");
+        let error = compile_static_outbound(&item).expect_err(
+            "packet-up must fail closed in the first XHTTP Reverse batch",
+        );
+        assert!(error.contains("only stream-up is supported"), "{error}");
+    }
+
     #[cfg(feature = "ws")]
     #[test]
     fn plan_accepts_websocket_without_early_data() {

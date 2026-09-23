@@ -752,6 +752,162 @@ pub(super) fn decode_sender_transport(
                 },
             })
         }
+        "xhttp" | "splithttp" => {
+            if reality.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "REALITY outbound with XHTTP transport is not implemented yet",
+                ));
+            }
+            let mut tls = tls.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP outbound currently requires TLS/H2",
+                )
+            })?;
+            if tls.alpn.is_empty() {
+                tls.alpn.push("h2".to_string());
+            }
+            let transport = stream
+                .transport_settings
+                .iter()
+                .find(|transport| {
+                    matches!(
+                        transport.protocol_name.trim().to_ascii_lowercase().as_str(),
+                        "xhttp" | "splithttp"
+                    )
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "XHTTP outbound is missing transport settings",
+                    )
+                })?;
+            let settings = transport.settings.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP outbound transport settings are empty",
+                )
+            })?;
+            let settings_type = settings.r#type.trim_start_matches('.');
+            if settings_type != TYPE_TRANSPORT_XHTTP_CONFIG
+                && settings_type != TYPE_TRANSPORT_XHTTP_CONFIG_V2RAY
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "unsupported XHTTP outbound settings type {}",
+                        settings.r#type
+                    ),
+                ));
+            }
+            let settings = XhttpConfigPayload::decode(settings.value.as_slice())
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid outbound XHTTP settings: {error}"),
+                    )
+                })?;
+            let mode = settings.mode.trim().to_ascii_lowercase();
+            if mode != "stream-up" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "XHTTP outbound mode {mode:?} is not implemented yet; only stream-up is supported"
+                    ),
+                ));
+            }
+            if settings.download_settings.is_some() || settings.xmux.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP outbound downloadSettings/xmux is not implemented yet",
+                ));
+            }
+            if settings.x_padding_obfs_mode {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP outbound xPaddingObfsMode is not implemented yet",
+                ));
+            }
+            if !settings.session_id_placement.trim().is_empty()
+                && settings.session_id_placement.trim() != "path"
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP outbound currently supports only path sessionIDPlacement",
+                ));
+            }
+            if !settings.session_id_key.trim().is_empty()
+                || !settings.session_id_table.trim().is_empty()
+                || settings.session_id_length.is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP outbound custom session ID encoding is not implemented yet",
+                ));
+            }
+            if !settings.seq_placement.trim().is_empty()
+                || !settings.seq_key.trim().is_empty()
+                || !settings.uplink_data_placement.trim().is_empty()
+                || !settings.uplink_data_key.trim().is_empty()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "XHTTP stream-up outbound packet metadata placement is not implemented yet",
+                ));
+            }
+            if settings
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("host"))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP outbound headers can't contain Host; use host instead",
+                ));
+            }
+            let padding = settings.x_padding_bytes.unwrap_or(XhttpRangePayload {
+                from: 100,
+                to: 1000,
+            });
+            if padding.from <= 0 || padding.to <= 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP outbound xPaddingBytes must be positive",
+                ));
+            }
+            let uplink_http_method = if settings.uplink_http_method.trim().is_empty()
+            {
+                "POST".to_string()
+            } else {
+                settings.uplink_http_method.trim().to_ascii_uppercase()
+            };
+            if uplink_http_method == "GET" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP stream-up outbound uplinkHTTPMethod cannot be GET",
+                ));
+            }
+            let path = if settings.path.trim().is_empty() {
+                "/".to_string()
+            } else if settings.path.starts_with('/') {
+                settings.path
+            } else {
+                format!("/{}", settings.path)
+            };
+            Ok(OutboundTransport::Xhttp {
+                tls,
+                settings: OutboundXhttpClientSettings {
+                    host: settings.host,
+                    path,
+                    headers: settings.headers,
+                    padding_from: padding.from.min(padding.to),
+                    padding_to: padding.from.max(padding.to),
+                    no_grpc_header: settings.no_grpc_header,
+                    uplink_http_method,
+                },
+            })
+        }
         "httpupgrade" | "http-upgrade" => {
             if reality.is_some() {
                 return Err(std::io::Error::new(

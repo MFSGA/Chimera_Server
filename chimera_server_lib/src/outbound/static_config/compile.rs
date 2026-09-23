@@ -171,6 +171,21 @@ fn encode_static_sender_settings(
                 }],
             )
         }
+        "xhttp" | "splithttp" => {
+            let xhttp = encode_static_xhttp_config(
+                settings.xhttp_settings.unwrap_or_default(),
+            )?;
+            (
+                "splithttp".to_string(),
+                vec![OutboundTransportConfigPayload {
+                    protocol_name: "splithttp".to_string(),
+                    settings: Some(TypedMessagePayload {
+                        r#type: TYPE_TRANSPORT_XHTTP_CONFIG.to_string(),
+                        value: xhttp.encode_to_vec(),
+                    }),
+                }],
+            )
+        }
         #[cfg(feature = "grpc_transport")]
         "grpc" => {
             let grpc = encode_static_grpc_config(
@@ -287,6 +302,126 @@ pub(crate) fn encode_static_grpc_config(
         permit_without_stream: config.permit_without_stream,
         initial_windows_size: config.initial_windows_size,
         user_agent: config.user_agent,
+    })
+}
+
+fn encode_static_xhttp_config(
+    config: StaticOutboundXhttpSettings,
+) -> Result<XhttpConfigPayload, String> {
+    let mode = if config.mode.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        config.mode.trim().to_ascii_lowercase()
+    };
+    if mode != "stream-up" {
+        return Err(format!(
+            "XHTTP outbound mode {mode:?} is not implemented yet; only stream-up is supported"
+        ));
+    }
+    if config.download_settings.is_some() {
+        return Err("XHTTP outbound downloadSettings is not implemented yet".into());
+    }
+    if config.xmux.is_some() {
+        return Err("XHTTP outbound xmux is not implemented yet".into());
+    }
+    if config.x_padding_obfs_mode {
+        return Err("XHTTP outbound xPaddingObfsMode is not implemented yet".into());
+    }
+    if !config.seq_placement.trim().is_empty()
+        || !config.seq_key.trim().is_empty()
+        || !config.uplink_data_placement.trim().is_empty()
+        || !config.uplink_data_key.trim().is_empty()
+    {
+        return Err(
+            "XHTTP stream-up outbound does not accept packet-up sequence/data placement settings yet"
+                .into(),
+        );
+    }
+    let session_placement = config.session_id_placement.trim();
+    if !session_placement.is_empty() && session_placement != "path" {
+        return Err(
+            "XHTTP outbound currently supports only path sessionIDPlacement".into(),
+        );
+    }
+    if !config.session_id_key.trim().is_empty() {
+        return Err(
+            "XHTTP outbound sessionIDKey is not used with path placement".into(),
+        );
+    }
+    if !config.session_id_table.trim().is_empty()
+        || config.session_id_length.is_some()
+    {
+        return Err(
+            "XHTTP outbound custom session ID generator is not implemented yet"
+                .into(),
+        );
+    }
+    if config
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("host"))
+    {
+        return Err(
+            "XHTTP outbound headers can't contain Host; use host instead".into(),
+        );
+    }
+    let padding = config.x_padding_bytes.unwrap_or(StaticOutboundXhttpRange {
+        from: 100,
+        to: 1000,
+    });
+    if padding.from <= 0 || padding.to <= 0 {
+        return Err(
+            "XHTTP outbound xPaddingBytes must be positive for stream-up".into(),
+        );
+    }
+    let method = if config.uplink_http_method.trim().is_empty() {
+        "POST".to_string()
+    } else {
+        config.uplink_http_method.trim().to_ascii_uppercase()
+    };
+    if method == "GET" {
+        return Err("XHTTP stream-up outbound uplinkHTTPMethod cannot be GET".into());
+    }
+    let path = if config.path.trim().is_empty() {
+        "/".to_string()
+    } else if config.path.starts_with('/') {
+        config.path
+    } else {
+        format!("/{}", config.path)
+    };
+    Ok(XhttpConfigPayload {
+        host: config.host,
+        path,
+        mode,
+        headers: config.headers,
+        x_padding_bytes: Some(XhttpRangePayload {
+            from: padding.from,
+            to: padding.to,
+        }),
+        no_grpc_header: config.no_grpc_header,
+        no_sse_header: config.no_sse_header,
+        sc_max_each_post_bytes: None,
+        sc_min_posts_interval_ms: None,
+        sc_max_buffered_posts: 0,
+        sc_stream_up_server_secs: None,
+        xmux: None,
+        download_settings: None,
+        x_padding_obfs_mode: false,
+        x_padding_key: String::new(),
+        x_padding_header: String::new(),
+        x_padding_placement: String::new(),
+        x_padding_method: String::new(),
+        uplink_http_method: method,
+        session_id_placement: String::new(),
+        session_id_key: String::new(),
+        seq_placement: String::new(),
+        seq_key: String::new(),
+        uplink_data_placement: String::new(),
+        uplink_data_key: String::new(),
+        uplink_chunk_size: None,
+        server_max_header_bytes: 0,
+        session_id_table: String::new(),
+        session_id_length: None,
     })
 }
 

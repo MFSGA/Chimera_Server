@@ -222,6 +222,97 @@ pub(super) struct HttpUpgradeConfigPayload {
     pub(super) ed: u32,
 }
 
+pub(super) const TYPE_TRANSPORT_XHTTP_CONFIG: &str =
+    "xray.transport.internet.splithttp.Config";
+pub(super) const TYPE_TRANSPORT_XHTTP_CONFIG_V2RAY: &str =
+    "v2ray.core.transport.internet.splithttp.Config";
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct XhttpRangePayload {
+    #[prost(int32, tag = "1")]
+    pub(super) from: i32,
+    #[prost(int32, tag = "2")]
+    pub(super) to: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct XhttpXmuxPayload {
+    #[prost(message, optional, tag = "1")]
+    pub(super) max_concurrency: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "2")]
+    pub(super) max_connections: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "3")]
+    pub(super) c_max_reuse_times: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "4")]
+    pub(super) h_max_request_times: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "5")]
+    pub(super) h_max_reusable_secs: Option<XhttpRangePayload>,
+    #[prost(int64, tag = "6")]
+    pub(super) h_keep_alive_period: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct XhttpConfigPayload {
+    #[prost(string, tag = "1")]
+    pub(super) host: String,
+    #[prost(string, tag = "2")]
+    pub(super) path: String,
+    #[prost(string, tag = "3")]
+    pub(super) mode: String,
+    #[prost(map = "string, string", tag = "4")]
+    pub(super) headers: HashMap<String, String>,
+    #[prost(message, optional, tag = "5")]
+    pub(super) x_padding_bytes: Option<XhttpRangePayload>,
+    #[prost(bool, tag = "6")]
+    pub(super) no_grpc_header: bool,
+    #[prost(bool, tag = "7")]
+    pub(super) no_sse_header: bool,
+    #[prost(message, optional, tag = "8")]
+    pub(super) sc_max_each_post_bytes: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "9")]
+    pub(super) sc_min_posts_interval_ms: Option<XhttpRangePayload>,
+    #[prost(int64, tag = "10")]
+    pub(super) sc_max_buffered_posts: i64,
+    #[prost(message, optional, tag = "11")]
+    pub(super) sc_stream_up_server_secs: Option<XhttpRangePayload>,
+    #[prost(message, optional, tag = "12")]
+    pub(super) xmux: Option<XhttpXmuxPayload>,
+    #[prost(message, optional, boxed, tag = "13")]
+    pub(super) download_settings: Option<Box<OutboundStreamConfigPayload>>,
+    #[prost(bool, tag = "14")]
+    pub(super) x_padding_obfs_mode: bool,
+    #[prost(string, tag = "15")]
+    pub(super) x_padding_key: String,
+    #[prost(string, tag = "16")]
+    pub(super) x_padding_header: String,
+    #[prost(string, tag = "17")]
+    pub(super) x_padding_placement: String,
+    #[prost(string, tag = "18")]
+    pub(super) x_padding_method: String,
+    #[prost(string, tag = "19")]
+    pub(super) uplink_http_method: String,
+    #[prost(string, tag = "20")]
+    pub(super) session_id_placement: String,
+    #[prost(string, tag = "21")]
+    pub(super) session_id_key: String,
+    #[prost(string, tag = "22")]
+    pub(super) seq_placement: String,
+    #[prost(string, tag = "23")]
+    pub(super) seq_key: String,
+    #[prost(string, tag = "24")]
+    pub(super) uplink_data_placement: String,
+    #[prost(string, tag = "25")]
+    pub(super) uplink_data_key: String,
+    #[prost(message, optional, tag = "26")]
+    pub(super) uplink_chunk_size: Option<XhttpRangePayload>,
+    #[prost(int32, tag = "27")]
+    pub(super) server_max_header_bytes: i32,
+    #[prost(string, tag = "28")]
+    pub(super) session_id_table: String,
+    #[prost(message, optional, tag = "29")]
+    pub(super) session_id_length: Option<XhttpRangePayload>,
+}
+
 #[cfg(feature = "grpc_transport")]
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct GrpcConfigPayload {
