@@ -65,6 +65,11 @@ fn chimera_bridge_preserves_reverse_source_for_freedom_proxy_protocol() {
 }
 
 #[test]
+fn chimera_bridge_xhttp_forwarded_source_does_not_replace_reverse_client_source() {
+    run_chimera_bridge_xhttp_forwarded_source_interop();
+}
+
+#[test]
 fn chimera_bridge_preserves_reverse_routing_user_over_raw_vless_reverse() {
     run_chimera_bridge_interop(
         ReverseSecurity::Raw,
@@ -687,6 +692,187 @@ fn run_chimera_bridge_proxy_protocol_interop() {
     xray.assert_running();
 }
 
+fn run_chimera_bridge_xhttp_forwarded_source_interop() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse XHTTP forwarded-source interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir =
+        create_test_dir("vless-reverse-chimera-bridge-xhttp-forwarded-source");
+    let (echo_addr, captured_source) = start_proxy_protocol_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "chimera-bridge-xhttp-forwarded@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "certificates": [{
+                                "certificateFile": cert_path,
+                                "keyFile": key_path
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "host": "cdn.reverse.test",
+                            "path": "/reverse-xhttp-forwarded/",
+                            "mode": "stream-up",
+                            "xPaddingBytes": 1
+                        },
+                        "sockopt": {
+                            "trustedXForwardedFor": ["X-Trusted-CDN"]
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-proxy",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-proxy"],
+                    "network": "tcp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "disableSystemRoot": true,
+                            "certificates": [{
+                                "certificateFile": cert_path,
+                                "usage": "verify"
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "host": "cdn.reverse.test",
+                            "path": "/reverse-xhttp-forwarded/",
+                            "mode": "stream-up",
+                            "xPaddingBytes": 1,
+                            "headers": {
+                                "X-Forwarded-For": "198.51.100.77",
+                                "X-Trusted-CDN": "edge-a"
+                            }
+                        }
+                    }
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {"proxyProtocol": 1}
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    chimera.assert_running();
+
+    std::thread::sleep(Duration::from_millis(2300));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
+    xray.assert_running();
+
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    let payload = b"reverse xhttp trusted forwarded source";
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    let successful_source = loop {
+        match reverse_echo_once_with_source(public_addr, payload) {
+            Ok(source) => break source,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                panic!(
+                    "VLESS Reverse XHTTP forwarded-source worker did not become usable at {public_addr}: {error}"
+                );
+            }
+        }
+    };
+
+    assert_eq!(
+        *captured_source
+            .lock()
+            .expect("PROXY protocol capture lock poisoned"),
+        Some(successful_source),
+        "transport-level trusted XHTTP forwarded source must not replace the public Reverse logical-session source"
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
+}
+
 fn run_chimera_bridge_interop(
     security: ReverseSecurity,
     routing_user: Option<&str>,
@@ -777,8 +963,11 @@ fn run_chimera_bridge_interop(
                         }]
                     },
                     "xhttpSettings": {
-                        "path": "/reverse-xhttp/",
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp/?edge=portal",
                         "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
                         "xPaddingBytes": 1
                     }
                 }),
@@ -794,8 +983,15 @@ fn run_chimera_bridge_interop(
                         }]
                     },
                     "xhttpSettings": {
-                        "path": "/reverse-xhttp/",
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp/?edge=bridge",
                         "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
+                        "headers": {
+                            "User-Agent": "chimera-reverse-xhttp",
+                            "X-Reverse-Edge": "chimera-bridge"
+                        },
                         "xPaddingBytes": 1
                     }
                 }),
@@ -1025,8 +1221,11 @@ fn run_reverse_interop(security: ReverseSecurity) {
                         }]
                     },
                     "xhttpSettings": {
-                        "path": "/reverse-xhttp/",
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp/?edge=portal",
                         "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
                         "xPaddingBytes": 1
                     }
                 }),
@@ -1038,8 +1237,15 @@ fn run_reverse_interop(security: ReverseSecurity) {
                         "pinnedPeerCertSha256": pinned_peer_cert_sha256
                     },
                     "xhttpSettings": {
-                        "path": "/reverse-xhttp/",
+                        "host": "cdn.reverse.test",
+                        "path": "/reverse-xhttp/?edge=bridge",
                         "mode": "stream-up",
+                        "sessionIDPlacement": "header",
+                        "sessionIDKey": "X-Reverse-Session",
+                        "headers": {
+                            "User-Agent": "xray-reverse-xhttp",
+                            "X-Reverse-Edge": "xray-bridge"
+                        },
                         "xPaddingBytes": 1
                     }
                 }),

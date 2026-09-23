@@ -158,6 +158,14 @@ struct OutboundHttpUpgradeClientSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum OutboundXhttpSessionPlacement {
+    Path,
+    Query(String),
+    Header(String),
+    Cookie(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundXhttpClientSettings {
     host: String,
     path: String,
@@ -166,6 +174,7 @@ struct OutboundXhttpClientSettings {
     padding_to: i32,
     no_grpc_header: bool,
     uplink_http_method: String,
+    session_placement: OutboundXhttpSessionPlacement,
 }
 
 #[cfg(feature = "grpc_transport")]

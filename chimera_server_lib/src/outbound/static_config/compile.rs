@@ -337,17 +337,26 @@ fn encode_static_xhttp_config(
                 .into(),
         );
     }
-    let session_placement = config.session_id_placement.trim();
-    if !session_placement.is_empty() && session_placement != "path" {
-        return Err(
-            "XHTTP outbound currently supports only path sessionIDPlacement".into(),
-        );
-    }
-    if !config.session_id_key.trim().is_empty() {
-        return Err(
-            "XHTTP outbound sessionIDKey is not used with path placement".into(),
-        );
-    }
+    let session_placement = match config.session_id_placement.as_str() {
+        "" | "path" => "path",
+        "query" => "query",
+        "header" => "header",
+        "cookie" => "cookie",
+        placement => {
+            return Err(format!(
+                "unsupported XHTTP outbound sessionIDPlacement {placement:?}"
+            ));
+        }
+    };
+    let session_key = if config.session_id_key.is_empty() {
+        match session_placement {
+            "query" | "cookie" => "x_session".to_string(),
+            "header" => "X-Session".to_string(),
+            _ => String::new(),
+        }
+    } else {
+        config.session_id_key.clone()
+    };
     if !config.session_id_table.trim().is_empty()
         || config.session_id_length.is_some()
     {
@@ -412,8 +421,8 @@ fn encode_static_xhttp_config(
         x_padding_placement: String::new(),
         x_padding_method: String::new(),
         uplink_http_method: method,
-        session_id_placement: String::new(),
-        session_id_key: String::new(),
+        session_id_placement: session_placement.to_string(),
+        session_id_key: session_key,
         seq_placement: String::new(),
         seq_key: String::new(),
         uplink_data_placement: String::new(),

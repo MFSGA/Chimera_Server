@@ -436,7 +436,7 @@ Reverse 是 VLESS account/command 能力，物理连接继续使用 VLESS outbou
 | RAW/TLS | 第一阶段部署验收；Chimera 只需已有 inbound TLS，主动拨号由 Xray Bridge 完成 |
 | REALITY | Portal 侧可在现有 inbound 能力上追加验证；Chimera Bridge 方向后续单独验证 |
 | WebSocket | Chimera Bridge -> Xray Portal 已验证（无 early data） |
-| XHTTP `stream-up` + TLS/H2 | 已完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；packet-up/stream-one/xmux/downloadSettings/H3 暂不声明 |
+| XHTTP `stream-up` + TLS/H2 | 已完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；已验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header` 和 reconnect。client request-shape/config 回归另覆盖 path/query/cookie placement；显式非 `h2` ALPN 在 H1/H3 client 未实现前 fail closed；packet-up/stream-one/xmux/downloadSettings/H3 暂不声明 |
 | HTTPUpgrade / gRPC | 按现有 feature 和 connector 能力分别验证 |
 | Vision | 独立 VLESS flow 能力，不因 Reverse 自动宣称支持 |
 | ML-KEM VLESS Encryption | 独立加密能力，不因当前字段存在而静默接受 |
@@ -554,7 +554,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - Bridge outbound `reverse.sniffing` 已使用固定 Xray `SniffingConfig` protobuf shape（enabled、destinationOverride、domainsExcluded、ipsExcluded、metadataOnly、routeOnly），静态 JSON 不再丢字段或使用私有 wire。
 - Bridge logical TCP session 在启用 sniffing 时复用共享 sniffer：先读取并回放首包，再基于 HTTP Host / TLS SNI 构造 routing metadata 和目标覆盖；未启用 sniffing 时保持原有直连路径。
 - 固定 Xray-core `v26.9.9` Portal -> Chimera Bridge RAW 互操作已验证 HTTP Host、TLS SNI、routeOnly、domain exclusion 和 IP exclusion。`metadataOnly` 与 FakeDNS override 当前仍明确 fail closed；QUIC override 维持与现有 inbound sniffer 一致的兼容 no-op。
-- Reverse Mux NEW 的 source/local metadata 已继续传播进 Bridge routing。Bridge outbound user 的 email/level 会按固定 Xray 的虚拟 inbound 语义进入 routing/traffic context，VLESS UUID 作为 Chimera user-domain policy identity 保留；无 sniffing TCP、sniffing TCP 和 targeted UDP 均应用同一份 context。固定 Xray-core `v26.9.9` RAW 互操作已用 `user` routing rule 验证 email 传播，并验证 Xray Portal 的公网 source 经 Reverse Mux 到 Chimera Bridge 后被 Freedom `proxyProtocol: 1` 原样写入 PROXY v1 header；UUID policy identity、level、client IP、TCP 双向 traffic 计量和 active-connection guard 已有本地回归。Freedom `proxyProtocol` 0/1/2 的 static/gRPC wire 与 TCP v1/v2 写入也有本地回归。
+- Reverse Mux NEW 的 source/local metadata 已继续传播进 Bridge routing。Bridge outbound user 的 email/level 会按固定 Xray 的虚拟 inbound 语义进入 routing/traffic context，VLESS UUID 作为 Chimera user-domain policy identity 保留；无 sniffing TCP、sniffing TCP 和 targeted UDP 均应用同一份 context。固定 Xray-core `v26.9.9` RAW 互操作已用 `user` routing rule 验证 email 传播，并验证 Xray Portal 的公网 source 经 Reverse Mux 到 Chimera Bridge 后被 Freedom `proxyProtocol: 1` 原样写入 PROXY v1 header；XHTTP `stream-up` + TLS/H2 另验证了 transport 级 `sockopt.trustedXForwardedFor`/`X-Forwarded-For` 不会覆盖 Reverse 逻辑业务 session 的公网 source，避免 CDN transport metadata 污染后续 PROXY protocol。UUID policy identity、level、client IP、TCP 双向 traffic 计量和 active-connection guard 已有本地回归。Freedom `proxyProtocol` 0/1/2 的 static/gRPC wire 与 TCP v1/v2 写入也有本地回归。
 
 ### I. 动态管理与可观测性
 

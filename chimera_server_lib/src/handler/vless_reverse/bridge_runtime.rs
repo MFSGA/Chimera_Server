@@ -259,6 +259,59 @@ mod tests {
         assert_eq!(plans.len(), 1);
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn plan_accepts_xhttp_stream_up_session_placements() {
+        for (placement, key) in [
+            ("path", ""),
+            ("query", "reverse_session"),
+            ("header", "X-Reverse-Session"),
+            ("cookie", "reverse_session"),
+        ] {
+            let outbound =
+                reverse_outbound_with_stream_settings(serde_json::json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {"serverName": "localhost"},
+                    "xhttpSettings": {
+                        "path": "/reverse-xhttp?edge=1",
+                        "mode": "stream-up",
+                        "xPaddingBytes": 1,
+                        "sessionIDPlacement": placement,
+                        "sessionIDKey": key
+                    }
+                }));
+            let plans = prepare_reverse_bridge_plans(&[outbound])
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "XHTTP session placement {placement:?} should compile: {error}"
+                    )
+                });
+            assert_eq!(plans.len(), 1);
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn plan_rejects_xhttp_http1_alpn_until_h1_client_exists() {
+        let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": "localhost",
+                "alpn": ["http/1.1"]
+            },
+            "xhttpSettings": {
+                "path": "/reverse-xhttp/",
+                "mode": "stream-up",
+                "xPaddingBytes": 1
+            }
+        }));
+        let error = prepare_reverse_bridge_plans(&[outbound])
+            .expect_err("XHTTP HTTP/1.1 must fail closed");
+        assert!(error.to_string().contains("only TLS ALPN h2"), "{error}");
+    }
+
     #[test]
     fn plan_rejects_xhttp_non_stream_up_modes() {
         let item: OutboundItem = serde_json::from_value(serde_json::json!({

@@ -767,6 +767,14 @@ pub(super) fn decode_sender_transport(
             })?;
             if tls.alpn.is_empty() {
                 tls.alpn.push("h2".to_string());
+            } else if tls.alpn.as_slice() != ["h2"] {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "XHTTP outbound currently supports only TLS ALPN h2; configured ALPN {:?} selects an unimplemented HTTP version",
+                        tls.alpn
+                    ),
+                ));
             }
             let transport = stream
                 .transport_settings
@@ -829,21 +837,44 @@ pub(super) fn decode_sender_transport(
                     "XHTTP outbound xPaddingObfsMode is not implemented yet",
                 ));
             }
-            if !settings.session_id_placement.trim().is_empty()
-                && settings.session_id_placement.trim() != "path"
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "XHTTP outbound currently supports only path sessionIDPlacement",
-                ));
-            }
-            if !settings.session_id_key.trim().is_empty()
-                || !settings.session_id_table.trim().is_empty()
+            let session_placement = match settings.session_id_placement.as_str() {
+                "" | "path" => OutboundXhttpSessionPlacement::Path,
+                "query" => OutboundXhttpSessionPlacement::Query(
+                    if settings.session_id_key.is_empty() {
+                        "x_session".to_string()
+                    } else {
+                        settings.session_id_key.clone()
+                    },
+                ),
+                "header" => OutboundXhttpSessionPlacement::Header(
+                    if settings.session_id_key.is_empty() {
+                        "X-Session".to_string()
+                    } else {
+                        settings.session_id_key.clone()
+                    },
+                ),
+                "cookie" => OutboundXhttpSessionPlacement::Cookie(
+                    if settings.session_id_key.is_empty() {
+                        "x_session".to_string()
+                    } else {
+                        settings.session_id_key.clone()
+                    },
+                ),
+                placement => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "unsupported XHTTP outbound sessionIDPlacement {placement:?}"
+                        ),
+                    ));
+                }
+            };
+            if !settings.session_id_table.trim().is_empty()
                 || settings.session_id_length.is_some()
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "XHTTP outbound custom session ID encoding is not implemented yet",
+                    "XHTTP outbound custom session ID generator is not implemented yet",
                 ));
             }
             if !settings.seq_placement.trim().is_empty()
@@ -905,6 +936,7 @@ pub(super) fn decode_sender_transport(
                     padding_to: padding.from.max(padding.to),
                     no_grpc_header: settings.no_grpc_header,
                     uplink_http_method,
+                    session_placement,
                 },
             })
         }
