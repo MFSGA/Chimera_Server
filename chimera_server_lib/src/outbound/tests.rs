@@ -28,9 +28,9 @@ use std::convert::Infallible;
     feature = "ws"
 ))]
 use std::time::Duration;
+use tokio::io::AsyncReadExt as _;
 #[cfg(feature = "grpc_transport")]
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[cfg(feature = "trojan")]
 use super::decode::decode_sender_transport;
@@ -62,6 +62,19 @@ fn outbound(tag: &str, protocol: &str) -> OutboundSummary {
         protocol: protocol.into(),
         proxy_settings_type: None,
         proxy_settings_value: None,
+        sender_settings_type: None,
+        sender_settings_value: None,
+    }
+}
+
+fn freedom_outbound(tag: &str, proxy_protocol: u32) -> OutboundSummary {
+    OutboundSummary {
+        tag: tag.into(),
+        protocol: "freedom".into(),
+        proxy_settings_type: Some(TYPE_PROXY_FREEDOM_CONFIG.into()),
+        proxy_settings_value: Some(
+            FreedomConfigPayload { proxy_protocol }.encode_to_vec(),
+        ),
         sender_settings_type: None,
         sender_settings_value: None,
     }
@@ -776,6 +789,32 @@ fn routing_metadata_is_applied_as_value_transformation() {
     assert_eq!(
         transformed.attributes.get("x-test").map(String::as_str),
         Some("ok")
+    );
+}
+
+#[test]
+fn static_freedom_outbound_preserves_xray_proxy_protocol() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {"proxyProtocol": 2}
+    }))
+    .expect("parse static freedom outbound");
+    let outbound =
+        compile_static_outbound(&item).expect("compile freedom proxyProtocol");
+    assert_eq!(decode_freedom_proxy_protocol(&outbound).unwrap(), 2);
+
+    let invalid: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "freedom",
+        "tag": "invalid",
+        "settings": {"proxyProtocol": 3}
+    }))
+    .expect("parse invalid freedom outbound");
+    let error = compile_static_outbound(&invalid)
+        .expect_err("unsupported freedom proxyProtocol must fail closed");
+    assert!(
+        error.contains("proxyProtocol must be 0, 1, or 2"),
+        "{error}"
     );
 }
 
@@ -3416,7 +3455,10 @@ fn direct_outbound_defaults_to_implicit_freedom() {
             "tcp"
         )
         .unwrap(),
-        DirectOutboundAction::Freedom { tag: None }
+        DirectOutboundAction::Freedom {
+            tag: None,
+            proxy_protocol: 0,
+        }
     );
 }
 
@@ -3876,6 +3918,54 @@ async fn ip_on_demand_resolves_route_only_domain_with_original_ip() {
 
     assert!(connection.is_none());
     assert_eq!(counting.calls(), 1);
+}
+
+#[tokio::test]
+async fn freedom_tcp_outbound_writes_configured_proxy_protocol_v1_and_v2() {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let source: SocketAddr = "192.0.2.10:12345".parse().unwrap();
+
+    for version in [1u32, 2u32] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind PROXY protocol sink");
+        let target_addr = listener.local_addr().expect("sink address");
+        let runtime =
+            RuntimeState::new(Vec::new(), vec![freedom_outbound("direct", version)]);
+        let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+
+        let mut connection = connect_tcp_outbound(
+            &resolver,
+            &target,
+            &runtime.data_plane(),
+            "proxy-protocol-in",
+            "",
+            source,
+        )
+        .await
+        .expect("freedom proxyProtocol connection")
+        .expect("freedom route");
+        connection
+            .stream
+            .write_all(b"payload")
+            .await
+            .expect("write freedom payload");
+
+        let (mut accepted, _) = listener.accept().await.expect("accept dial");
+        let mut expected = crate::beginning::build_proxy_protocol_header(
+            version as u8,
+            source,
+            Some(target_addr),
+        )
+        .expect("build expected PROXY header");
+        expected.extend_from_slice(b"payload");
+        let mut received = vec![0u8; expected.len()];
+        accepted
+            .read_exact(&mut received)
+            .await
+            .expect("read PROXY header and payload");
+        assert_eq!(received, expected, "PROXY protocol v{version}");
+    }
 }
 
 #[tokio::test]

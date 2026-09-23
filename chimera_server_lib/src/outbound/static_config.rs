@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StaticFreedomConfig {
+    #[serde(default)]
+    proxy_protocol: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
 struct StaticSocksClientConfig {
     #[serde(default)]
     address: Option<String>,

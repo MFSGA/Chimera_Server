@@ -325,7 +325,7 @@ pub(super) async fn relay_shadowsocks_udp_packet(
             record_transfer(Some(traffic_context), request.payload.len() as u64, 0);
             Ok(())
         }
-        DirectOutboundAction::Freedom { tag } => {
+        DirectOutboundAction::Freedom { tag, .. } => {
             if let Some(tag) = tag {
                 traffic_context = traffic_context.with_outbound_tag(tag);
             }

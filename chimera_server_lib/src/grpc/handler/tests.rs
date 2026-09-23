@@ -166,12 +166,48 @@ fn build_add_outbound_request(
             sender_settings: None,
             proxy_settings: Some(proto::xray::common::serial::TypedMessage {
                 r#type: TYPE_PROXY_FREEDOM_CONFIG.to_string(),
-                value: FreedomConfigPayload {}.encode_to_vec(),
+                value: FreedomConfigPayload { proxy_protocol: 0 }.encode_to_vec(),
             }),
             expire: 0,
             comment: String::new(),
         }),
     }
+}
+
+#[test]
+fn handler_preserves_freedom_proxy_protocol() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let outbound = service
+        .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+            tag: "freedom-proxy".to_string(),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_FREEDOM_CONFIG.to_string(),
+                value: FreedomConfigPayload { proxy_protocol: 2 }.encode_to_vec(),
+            }),
+            ..proto::xray::core::OutboundHandlerConfig::default()
+        })
+        .expect("freedom proxyProtocol should be accepted");
+    let payload = FreedomConfigPayload::decode(
+        outbound
+            .proxy_settings_value
+            .as_deref()
+            .expect("freedom settings payload"),
+    )
+    .expect("decode preserved freedom settings");
+    assert_eq!(payload.proxy_protocol, 2);
+
+    let error = service
+        .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+            tag: "invalid-freedom-proxy".to_string(),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_FREEDOM_CONFIG.to_string(),
+                value: FreedomConfigPayload { proxy_protocol: 3 }.encode_to_vec(),
+            }),
+            ..proto::xray::core::OutboundHandlerConfig::default()
+        })
+        .expect_err("unsupported freedom proxyProtocol must fail closed");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("proxyProtocol must be 0, 1, or 2"));
 }
 
 #[test]

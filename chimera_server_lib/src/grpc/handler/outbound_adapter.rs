@@ -13,11 +13,16 @@ impl HandlerServiceImpl {
         })?;
         let protocol = match Self::parse_typed_message_type(proxy_settings) {
             TYPE_PROXY_FREEDOM_CONFIG | TYPE_PROXY_FREEDOM_CONFIG_V2RAY => {
-                let _ = self.decode_typed_message::<FreedomConfigPayload>(
+                let config = self.decode_typed_message::<FreedomConfigPayload>(
                     proxy_settings,
                     &[TYPE_PROXY_FREEDOM_CONFIG, TYPE_PROXY_FREEDOM_CONFIG_V2RAY],
                     "outbound proxy settings",
                 )?;
+                if config.proxy_protocol > 2 {
+                    return Err(Status::invalid_argument(
+                        "freedom outbound proxyProtocol must be 0, 1, or 2",
+                    ));
+                }
                 "freedom"
             }
             TYPE_PROXY_SOCKS_CLIENT_CONFIG
@@ -736,7 +741,7 @@ impl HandlerServiceImpl {
             _ => match outbound.protocol.as_str() {
                 "freedom" => Some(Self::typed_message(
                     TYPE_PROXY_FREEDOM_CONFIG,
-                    FreedomConfigPayload {},
+                    FreedomConfigPayload { proxy_protocol: 0 },
                 )),
                 "blackhole" => Some(Self::typed_message(
                     TYPE_PROXY_BLACKHOLE_CONFIG,

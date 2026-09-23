@@ -19,6 +19,7 @@ pub(crate) const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
 pub(crate) enum DirectOutboundAction {
     Freedom {
         tag: Option<String>,
+        proxy_protocol: u32,
     },
     Blackhole {
         tag: String,
@@ -91,6 +92,8 @@ pub(super) enum TcpRoutePlan {
     Freedom {
         target_addr: SocketAddr,
         outbound_tag: Option<String>,
+        source_addr: SocketAddr,
+        proxy_protocol: u32,
     },
     Socks {
         target: NetLocation,
@@ -159,11 +162,16 @@ pub(super) async fn plan_tcp_route(
     .await?;
     match action {
         DirectOutboundAction::Blackhole { .. } => Ok(None),
-        DirectOutboundAction::Freedom { tag } => Ok(Some(TcpRoutePlan::Freedom {
+        DirectOutboundAction::Freedom {
+            tag,
+            proxy_protocol,
+        } => Ok(Some(TcpRoutePlan::Freedom {
             target_addr: target_addr.ok_or_else(|| {
                 std::io::Error::other("TCP freedom route did not resolve target")
             })?,
             outbound_tag: tag,
+            source_addr,
+            proxy_protocol,
         })),
         DirectOutboundAction::Socks { outbound } => Ok(Some(TcpRoutePlan::Socks {
             target: remote_location.clone(),
@@ -507,12 +515,19 @@ fn classify_selected_outbound(
     network_name: &str,
 ) -> std::io::Result<DirectOutboundAction> {
     let Some(outbound) = outbound else {
-        return Ok(DirectOutboundAction::Freedom { tag: None });
+        return Ok(DirectOutboundAction::Freedom {
+            tag: None,
+            proxy_protocol: 0,
+        });
     };
     match outbound.protocol.trim().to_ascii_lowercase().as_str() {
-        "freedom" => Ok(DirectOutboundAction::Freedom {
-            tag: Some(outbound.tag),
-        }),
+        "freedom" => {
+            let proxy_protocol = super::decode_freedom_proxy_protocol(&outbound)?;
+            Ok(DirectOutboundAction::Freedom {
+                tag: Some(outbound.tag),
+                proxy_protocol,
+            })
+        }
         "blackhole" => Ok(DirectOutboundAction::Blackhole { tag: outbound.tag }),
         "socks" if network_name.eq_ignore_ascii_case("tcp") => {
             Ok(DirectOutboundAction::Socks { outbound })

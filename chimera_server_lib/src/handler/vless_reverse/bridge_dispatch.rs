@@ -456,6 +456,8 @@ impl BridgeTcpDispatcher for DataPlaneRuntime {
 mod tests {
     use super::*;
     use crate::{
+        config::def::OutboundItem,
+        outbound::compile_static_outbound,
         runtime::RuntimeState,
         traffic::{active_connections, snapshot},
     };
@@ -484,6 +486,60 @@ mod tests {
         assert_eq!(context.inbound_tag.as_deref(), Some("bridge-in"));
         assert_eq!(context.client_ip, Some(source.ip()));
         assert_eq!(context.user_level, 7);
+    }
+
+    #[tokio::test]
+    async fn reverse_source_reaches_freedom_proxy_protocol_consumer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind PROXY protocol sink");
+        let target_addr = listener.local_addr().expect("read sink address");
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "freedom",
+            "tag": "direct",
+            "settings": {"proxyProtocol": 1}
+        }))
+        .expect("parse freedom proxyProtocol outbound");
+        let outbound = compile_static_outbound(&item)
+            .expect("compile freedom proxyProtocol outbound");
+        let runtime = RuntimeState::new(Vec::new(), vec![outbound]).data_plane();
+        let source: SocketAddr = "192.0.2.44:51000".parse().unwrap();
+        let local: SocketAddr = "203.0.113.9:8443".parse().unwrap();
+
+        let mut stream = runtime
+            .open_tcp(
+                "bridge-in",
+                NetLocation::from_ip_addr(target_addr.ip(), target_addr.port()),
+                Some(source),
+                Some(local),
+                BridgeDispatchContext::default(),
+            )
+            .await
+            .expect("open Reverse Bridge TCP through freedom");
+        stream
+            .write_all(b"payload")
+            .await
+            .expect("write Reverse payload");
+
+        let (mut accepted, _) =
+            listener.accept().await.expect("accept freedom dial");
+        let expected = format!(
+            "PROXY TCP4 {} {} {} {}\r\npayload",
+            source.ip(),
+            target_addr.ip(),
+            source.port(),
+            target_addr.port()
+        );
+        let mut received = vec![0u8; expected.len()];
+        accepted
+            .read_exact(&mut received)
+            .await
+            .expect("read PROXY header and payload");
+        assert_eq!(received, expected.as_bytes());
+        assert!(
+            !String::from_utf8_lossy(&received).contains(&local.ip().to_string()),
+            "Xray freedom proxyProtocol uses inbound Source, not Reverse Local"
+        );
     }
 
     #[cfg(feature = "traffic")]

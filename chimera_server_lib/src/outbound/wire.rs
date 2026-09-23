@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use prost::Message;
 
+pub(super) const TYPE_PROXY_FREEDOM_CONFIG: &str = "xray.proxy.freedom.Config";
+pub(super) const TYPE_PROXY_FREEDOM_CONFIG_V2RAY: &str =
+    "v2ray.core.proxy.freedom.Config";
 pub(super) const TYPE_PROXY_SOCKS_CLIENT_CONFIG: &str =
     "xray.proxy.socks.ClientConfig";
 pub(super) const TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY: &str =
@@ -44,6 +47,12 @@ pub(super) const TYPE_TRANSPORT_GRPC_CONFIG: &str =
 #[cfg(feature = "grpc_transport")]
 pub(super) const TYPE_TRANSPORT_GRPC_CONFIG_V2RAY: &str =
     "v2ray.core.transport.internet.grpc.encoding.Config";
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomConfigPayload {
+    #[prost(uint32, tag = "6")]
+    pub(super) proxy_protocol: u32,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct SocksClientConfigPayload {

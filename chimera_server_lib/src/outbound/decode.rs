@@ -2,6 +2,48 @@ use prost::Message;
 
 use super::*;
 
+pub(super) fn decode_freedom_proxy_protocol(
+    outbound: &OutboundSummary,
+) -> std::io::Result<u32> {
+    let Some(message_type) = outbound.proxy_settings_type.as_deref() else {
+        return Ok(0);
+    };
+    let message_type = message_type.trim_start_matches('.');
+    if message_type != TYPE_PROXY_FREEDOM_CONFIG
+        && message_type != TYPE_PROXY_FREEDOM_CONFIG_V2RAY
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} has unexpected settings type {}",
+                outbound.tag, message_type
+            ),
+        ));
+    }
+    let Some(value) = outbound.proxy_settings_value.as_deref() else {
+        return Ok(0);
+    };
+    let config = FreedomConfigPayload::decode(value).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid freedom outbound {} settings: {error}",
+                outbound.tag
+            ),
+        )
+    })?;
+    if config.proxy_protocol > 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} proxyProtocol must be 0, 1, or 2",
+                outbound.tag
+            ),
+        ));
+    }
+    Ok(config.proxy_protocol)
+}
+
 pub(super) fn decode_socks_outbound(
     outbound: &OutboundSummary,
 ) -> std::io::Result<SocksOutboundEndpoint> {

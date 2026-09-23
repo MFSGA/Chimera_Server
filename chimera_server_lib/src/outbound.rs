@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 mod decode;
@@ -21,8 +22,8 @@ use decode::maybe_decode_vless_reverse_bridge;
 #[cfg(feature = "api")]
 pub(crate) use decode::validate_outbound_sender_settings;
 use decode::{
-    decode_outbound_transport, decode_socks_outbound, decode_trojan_outbound,
-    decode_vless_outbound,
+    decode_freedom_proxy_protocol, decode_outbound_transport, decode_socks_outbound,
+    decode_trojan_outbound, decode_vless_outbound,
 };
 use wire::*;
 
@@ -64,6 +65,7 @@ pub(crate) use static_config::{compile_static_outbound, parse_xray_uuid};
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
+    beginning::build_proxy_protocol_header,
     resolver::{Resolver, resolve_single_address},
     routing_state::OutboundObservation,
     runtime::{DataPlaneRuntime, OutboundSummary},
@@ -445,11 +447,20 @@ async fn connect_planned_tcp_outbound(
         });
     }
 
+    let freedom_proxy_protocol = match &plan {
+        TcpRoutePlan::Freedom {
+            source_addr,
+            proxy_protocol,
+            ..
+        } if *proxy_protocol != 0 => Some((*proxy_protocol, *source_addr)),
+        _ => None,
+    };
     let (target_addr, outbound_tag, transport, transport_server, handshake) =
         match plan {
             TcpRoutePlan::Freedom {
                 target_addr,
                 outbound_tag,
+                ..
             } => (
                 target_addr,
                 outbound_tag,
@@ -535,7 +546,7 @@ async fn connect_planned_tcp_outbound(
     let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let started = Instant::now();
     let attempted_at = unix_time_secs();
-    let raw_stream = match tcp_socket.connect(target_addr).await {
+    let mut raw_stream = match tcp_socket.connect(target_addr).await {
         Ok(stream) => stream,
         Err(error) => {
             record(tcp_connect_observation(
@@ -549,6 +560,14 @@ async fn connect_planned_tcp_outbound(
     };
     if let Err(error) = raw_stream.set_nodelay(true) {
         warn!("Failed to set TCP no-delay on client socket: {}", error);
+    }
+    if let Some((proxy_protocol, source_addr)) = freedom_proxy_protocol {
+        let prefix = build_proxy_protocol_header(
+            proxy_protocol as u8,
+            source_addr,
+            Some(target_addr),
+        )?;
+        raw_stream.write_all(&prefix).await?;
     }
 
     let mut stream: Box<dyn AsyncStream> = match transport {
@@ -899,10 +918,20 @@ pub(crate) async fn connect_tcp_via_outbound(
     outbound: &OutboundSummary,
 ) -> std::io::Result<TcpOutboundConnection> {
     let plan = match outbound.protocol.trim().to_ascii_lowercase().as_str() {
-        "freedom" => TcpRoutePlan::Freedom {
-            target_addr: resolve_single_address(resolver, target).await?,
-            outbound_tag: Some(outbound.tag.clone()),
-        },
+        "freedom" => {
+            let target_addr = resolve_single_address(resolver, target).await?;
+            let source_addr = if target_addr.is_ipv6() {
+                SocketAddr::from(([0u16; 8], 0))
+            } else {
+                SocketAddr::from(([0u8; 4], 0))
+            };
+            TcpRoutePlan::Freedom {
+                target_addr,
+                outbound_tag: Some(outbound.tag.clone()),
+                source_addr,
+                proxy_protocol: decode_freedom_proxy_protocol(outbound)?,
+            }
+        }
         "socks" => TcpRoutePlan::Socks {
             target: target.clone(),
             outbound: outbound.clone(),

@@ -229,7 +229,10 @@ pub(super) struct DokodemoConfigPayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub(super) struct FreedomConfigPayload {}
+pub(super) struct FreedomConfigPayload {
+    #[prost(uint32, tag = "6")]
+    pub(super) proxy_protocol: u32,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct SocksClientConfigPayload {

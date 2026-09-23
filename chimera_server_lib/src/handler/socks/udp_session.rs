@@ -125,11 +125,11 @@ pub(crate) async fn run_shared_udp_relay(
                 record_transfer(datagram_context, payload.len() as u64, 0);
                 continue;
             }
-            DirectOutboundAction::Freedom { tag: Some(tag) } => {
+            DirectOutboundAction::Freedom { tag: Some(tag), .. } => {
                 datagram_context =
                     datagram_context.map(|context| context.with_outbound_tag(tag));
             }
-            DirectOutboundAction::Freedom { tag: None } => {}
+            DirectOutboundAction::Freedom { tag: None, .. } => {}
             DirectOutboundAction::Trojan { outbound } => {
                 #[cfg(feature = "trojan")]
                 {
@@ -396,11 +396,11 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 );
                 continue;
             }
-            DirectOutboundAction::Freedom { tag: Some(tag) } => {
+            DirectOutboundAction::Freedom { tag: Some(tag), .. } => {
                 datagram_context =
                     datagram_context.map(|context| context.with_outbound_tag(tag));
             }
-            DirectOutboundAction::Freedom { tag: None } => {}
+            DirectOutboundAction::Freedom { tag: None, .. } => {}
             DirectOutboundAction::Trojan { outbound } => {
                 #[cfg(feature = "trojan")]
                 {

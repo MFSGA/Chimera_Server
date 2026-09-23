@@ -154,7 +154,7 @@ pub(crate) async fn run_bidirectional_udp(
             )
             .await
         }
-        DirectOutboundAction::Freedom { tag } => {
+        DirectOutboundAction::Freedom { tag, .. } => {
             if let Some(tag) = tag {
                 traffic_context =
                     traffic_context.map(|context| context.with_outbound_tag(tag));
@@ -350,7 +350,7 @@ pub(crate) async fn run_session_based_udp(
                             session_id, target_location, tag
                         );
                     }
-                    DirectOutboundAction::Freedom { tag } => {
+                    DirectOutboundAction::Freedom { tag, .. } => {
                         let target_addr = match routed_target_addr {
                             Some(target_addr) => target_addr,
                             None => {

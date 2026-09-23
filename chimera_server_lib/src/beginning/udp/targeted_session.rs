@@ -132,7 +132,7 @@ pub(super) async fn run_multi_directional_udp_with_tasks(
                             target_location, tag
                         );
                     }
-                    DirectOutboundAction::Freedom { tag } => {
+                    DirectOutboundAction::Freedom { tag, .. } => {
                         let target_addr = target_addr.ok_or_else(|| {
                             std::io::Error::other(
                                 "targeted UDP freedom route did not resolve target",

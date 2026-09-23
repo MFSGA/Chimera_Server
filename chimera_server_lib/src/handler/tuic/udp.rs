@@ -665,10 +665,10 @@ pub(super) async fn forward_udp_payload(
             );
             return Ok(true);
         }
-        DirectOutboundAction::Freedom { tag: Some(tag) } => {
+        DirectOutboundAction::Freedom { tag: Some(tag), .. } => {
             traffic_context = traffic_context.with_outbound_tag(tag);
         }
-        DirectOutboundAction::Freedom { tag: None } => {}
+        DirectOutboundAction::Freedom { tag: None, .. } => {}
         DirectOutboundAction::Socks { outbound }
         | DirectOutboundAction::Vless { outbound }
         | DirectOutboundAction::Trojan { outbound } => {

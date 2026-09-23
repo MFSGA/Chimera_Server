@@ -6,7 +6,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -55,6 +55,11 @@ fn xray_bridge_round_trips_public_dokodemo_tcp_over_tls_vless_reverse() {
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_raw_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Raw, None);
+}
+
+#[test]
+fn chimera_bridge_preserves_reverse_source_for_freedom_proxy_protocol() {
+    run_chimera_bridge_proxy_protocol_interop();
 }
 
 #[test]
@@ -521,6 +526,149 @@ fn run_reverse_udp_interop() {
         SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)),
         b"xray bridge through chimera reverse portal udp",
         &echoed_bytes,
+    );
+
+    chimera.assert_running();
+    xray.assert_running();
+}
+
+fn run_chimera_bridge_proxy_protocol_interop() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse PROXY protocol Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir("vless-reverse-chimera-bridge-proxy-protocol");
+    let (echo_addr, captured_source) = start_proxy_protocol_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let xray_config = work_dir.join("xray.json");
+
+    write_json(
+        &xray_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "chimera-bridge-proxy@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-proxy",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom"
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-proxy"],
+                    "network": "tcp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {"proxyProtocol": 1}
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "tcp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    chimera.assert_running();
+
+    std::thread::sleep(Duration::from_millis(2300));
+    chimera.assert_running();
+
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
+    xray.assert_running();
+
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    let payload = b"reverse proxy protocol source";
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    let successful_source = loop {
+        match reverse_echo_once_with_source(public_addr, payload) {
+            Ok(source) => break source,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                panic!(
+                    "VLESS Reverse PROXY protocol worker did not become usable at {public_addr}: {error}"
+                );
+            }
+        }
+    };
+
+    assert_eq!(
+        *captured_source
+            .lock()
+            .expect("PROXY protocol capture lock poisoned"),
+        Some(successful_source),
+        "Chimera freedom proxyProtocol must preserve the Xray Portal public source"
     );
 
     chimera.assert_running();
@@ -1065,6 +1213,90 @@ fn assert_reverse_echo_with_retry(
             .map(|error| error.to_string())
             .unwrap_or_else(|| "no connection attempt completed".to_string())
     );
+}
+
+fn start_proxy_protocol_echo_server() -> (SocketAddr, Arc<Mutex<Option<SocketAddr>>>)
+{
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind Reverse PROXY protocol echo server");
+    let address = listener
+        .local_addr()
+        .expect("Reverse PROXY protocol echo address");
+    let captured_source = Arc::new(Mutex::new(None));
+    let captured_worker = Arc::clone(&captured_source);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(32) {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let captured_source = Arc::clone(&captured_worker);
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+
+                let mut header = Vec::with_capacity(108);
+                let mut byte = [0u8; 1];
+                while header.len() < 108 {
+                    if stream.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    header.push(byte[0]);
+                    if header.ends_with(b"\r\n") {
+                        break;
+                    }
+                }
+                let Ok(header) = std::str::from_utf8(&header) else {
+                    return;
+                };
+                let fields =
+                    header.trim_end().split_whitespace().collect::<Vec<_>>();
+                if fields.len() != 6 || fields[0] != "PROXY" || fields[1] != "TCP4" {
+                    return;
+                }
+                let Ok(source_ip) = fields[2].parse::<std::net::IpAddr>() else {
+                    return;
+                };
+                let Ok(source_port) = fields[4].parse::<u16>() else {
+                    return;
+                };
+                *captured_source
+                    .lock()
+                    .expect("PROXY protocol capture lock poisoned") =
+                    Some(SocketAddr::new(source_ip, source_port));
+
+                let mut payload = [0u8; 4096];
+                if let Ok(length) = stream.read(&mut payload)
+                    && length != 0
+                {
+                    let _ = stream.write_all(&payload[..length]);
+                }
+            });
+        }
+    });
+
+    (address, captured_source)
+}
+
+fn reverse_echo_once_with_source(
+    public_addr: SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<SocketAddr> {
+    let mut stream = TcpStream::connect_timeout(&public_addr, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let source = stream.local_addr()?;
+    stream.write_all(payload)?;
+
+    let mut response = vec![0u8; payload.len()];
+    stream.read_exact(&mut response)?;
+    if response != payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Reverse PROXY protocol echo payload mismatch",
+        ));
+    }
+    Ok(source)
 }
 
 fn start_observed_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {

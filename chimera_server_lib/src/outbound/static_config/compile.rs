@@ -29,6 +29,30 @@ pub(crate) fn compile_static_outbound(
         Some(_) => None,
     };
     let (proxy_settings_type, proxy_settings_value) = match protocol.as_str() {
+        "freedom" => {
+            let config = match item.settings.as_ref() {
+                Some(settings) => settings.deserialize().map_err(|error| {
+                    format!(
+                        "invalid freedom outbound {} settings: {error}",
+                        item.tag
+                    )
+                })?,
+                None => StaticFreedomConfig::default(),
+            };
+            if config.proxy_protocol > 2 {
+                return Err(format!(
+                    "freedom outbound {} proxyProtocol must be 0, 1, or 2",
+                    item.tag
+                ));
+            }
+            let payload = FreedomConfigPayload {
+                proxy_protocol: config.proxy_protocol,
+            };
+            (
+                Some(TYPE_PROXY_FREEDOM_CONFIG.to_string()),
+                Some(payload.encode_to_vec()),
+            )
+        }
         "socks" => {
             let settings = item.settings.as_ref().ok_or_else(|| {
                 format!("socks outbound {} requires settings", item.tag)
