@@ -1665,8 +1665,7 @@ fn start_proxy_protocol_echo_server() -> (SocketAddr, Arc<Mutex<Option<SocketAdd
                 let Ok(header) = std::str::from_utf8(&header) else {
                     return;
                 };
-                let fields =
-                    header.trim_end().split_whitespace().collect::<Vec<_>>();
+                let fields = header.split_whitespace().collect::<Vec<_>>();
                 if fields.len() != 6 || fields[0] != "PROXY" || fields[1] != "TCP4" {
                     return;
                 }

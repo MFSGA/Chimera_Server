@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::TlsConnector;
 use xhttp_support::{
-    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard,
+    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard_async,
     start_chimera, start_tcp_half_close_server, start_xray, wait_for_tcp,
     workspace_root, write_json, xray_binary,
 };
@@ -43,7 +43,7 @@ async fn xhttp_tls_h2_half_close_matches_xray() {
     }
 
     install_rustls_provider();
-    let _serial = serial_xray_guard();
+    let _serial = serial_xray_guard_async().await;
     let work_dir = create_test_dir("raw-h2-half-close");
     let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let target_addr = start_tcp_half_close_server();
@@ -95,7 +95,7 @@ async fn raw_h2_half_close(
     let (mut sender, connection) = client::handshake(tls)
         .await
         .expect("complete raw XHTTP/2 handshake");
-    let connection_task = tokio::spawn(async move { connection.await });
+    let connection_task = tokio::spawn(connection);
 
     let request = Request::builder()
         .method("POST")
@@ -165,7 +165,12 @@ fn parse_uuid(value: &str) -> [u8; 16] {
         .collect::<Vec<_>>();
     assert_eq!(compact.len(), 32, "test UUID must contain 32 hex digits");
     let mut parsed = [0u8; 16];
-    for (index, pair) in compact.chunks_exact(2).enumerate() {
+    let (pairs, remainder) = compact.as_chunks::<2>();
+    assert!(
+        remainder.is_empty(),
+        "test UUID must contain complete bytes"
+    );
+    for (index, pair) in pairs.iter().enumerate() {
         parsed[index] = (hex(pair[0]) << 4) | hex(pair[1]);
     }
     parsed

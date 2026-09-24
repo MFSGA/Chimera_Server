@@ -17,9 +17,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use xhttp_support::{
     TEST_UUID, assert_socks5_echo, connect_socks5_target, create_test_dir,
-    deterministic_payload, free_localhost_port, serial_xray_guard, start_chimera,
-    start_chimera_with_env, start_tcp_echo_server, start_xray, wait_for_tcp,
-    workspace_root, write_json, xray_binary,
+    deterministic_payload, free_localhost_port, serial_xray_guard_async,
+    start_chimera, start_chimera_with_env, start_tcp_echo_server, start_xray,
+    wait_for_tcp, workspace_root, write_json, xray_binary,
 };
 
 const REALITY_PRIVATE_KEY: &str = "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI";
@@ -84,7 +84,7 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
         SecurityCase::Reality => Some(start_tls13_dest(&cert_path, &key_path).await),
         _ => None,
     };
-    let _serial = serial_xray_guard();
+    let _serial = serial_xray_guard_async().await;
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();

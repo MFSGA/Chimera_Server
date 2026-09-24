@@ -5,7 +5,7 @@ use reality_vision_support::{
     VisionClientOptions, VisionServerOptions, WRONG_REALITY_PUBLIC_KEY, WRONG_UUID,
     assert_socks5_echo, assert_socks5_proxy_fails, current_xray_version,
     serial_guard, start_tcp_echo_server, start_vision_harness, wait_for_counter,
-    wait_for_log, xray_version_with_patch_delta,
+    wait_for_log, xray_binary_path, xray_version_with_patch_delta,
 };
 
 async fn run_rejected_case(
@@ -186,8 +186,11 @@ async fn reality_plain_account_rejects_client_vision_flow() {
 
 #[test]
 fn matrix_constants_match_bundled_client_contract() {
-    let version = current_xray_version();
-    assert_eq!(version.split('.').count(), 3);
+    let workspace = reality_vision_support::workspace_root();
+    if xray_binary_path(&workspace).is_file() {
+        let version = current_xray_version();
+        assert_eq!(version.split('.').count(), 3);
+    }
     assert_eq!(TEST_UUID, "3ac9b383-75a1-431c-8184-106c80eb2273");
     assert_eq!(REALITY_SERVER_NAME, "www.apple.com");
     assert_eq!(REALITY_SHORT_ID.len(), 16);

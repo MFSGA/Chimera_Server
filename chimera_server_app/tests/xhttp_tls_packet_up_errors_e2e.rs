@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::TlsConnector;
 use xhttp_support::{
-    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard,
+    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard_async,
     start_chimera, start_xray, wait_for_tcp, workspace_root, write_json,
     xray_binary,
 };
@@ -50,7 +50,7 @@ async fn xhttp_tls_h2_packet_up_errors_match_xray_and_survive() {
     }
 
     install_rustls_provider();
-    let _serial = serial_xray_guard();
+    let _serial = serial_xray_guard_async().await;
     let work_dir = create_test_dir("tls-packet-up-errors");
     let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let chimera_port = free_localhost_port();
@@ -123,7 +123,7 @@ async fn raw_h2_packet_status(
     let (mut sender, connection) = client::handshake(tls)
         .await
         .expect("complete raw XHTTP/2 packet-up handshake");
-    let connection_task = tokio::spawn(async move { connection.await });
+    let connection_task = tokio::spawn(connection);
 
     let (padding, sequence) = match probe {
         Some(PacketProbe::InvalidSequence) => (VALID_PADDING, "NaN"),

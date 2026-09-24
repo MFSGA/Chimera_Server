@@ -8,16 +8,17 @@ use std::{
     net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use tokio::sync::{Mutex, MutexGuard};
 
 pub const TEST_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb2273";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-static XRAY_TEST_LOCK: Mutex<()> = Mutex::new(());
+static XRAY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug)]
 pub struct ChildGuard {
@@ -86,9 +87,11 @@ impl Drop for ChildGuard {
 }
 
 pub fn serial_xray_guard() -> MutexGuard<'static, ()> {
-    XRAY_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    XRAY_TEST_LOCK.blocking_lock()
+}
+
+pub async fn serial_xray_guard_async() -> MutexGuard<'static, ()> {
+    XRAY_TEST_LOCK.lock().await
 }
 
 pub fn workspace_root() -> PathBuf {

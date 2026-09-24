@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 use tokio_rustls::TlsConnector;
 use xhttp_support::{
-    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard,
+    TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard_async,
     start_chimera, start_tcp_echo_server, start_xray, wait_for_tcp, workspace_root,
     write_json, xray_binary,
 };
@@ -43,7 +43,7 @@ async fn xhttp_tls_h2_packet_up_reassembles_out_of_order_requests_like_xray() {
     }
 
     install_rustls_provider();
-    let _serial = serial_xray_guard();
+    let _serial = serial_xray_guard_async().await;
     let work_dir = create_test_dir("tls-packet-up-reassembly");
     let (cert_path, key_path) = generate_test_certificate(&work_dir);
     let target_addr = start_tcp_echo_server();
@@ -105,7 +105,7 @@ async fn send_packet(
     payload: Bytes,
 ) -> tokio::task::JoinHandle<Result<(), h2::Error>> {
     let (mut sender, connection) = connect_h2(server_addr, cert_path).await;
-    let connection_task = tokio::spawn(async move { connection.await });
+    let connection_task = tokio::spawn(connection);
     let request = Request::builder()
         .method("POST")
         .uri(format!(
@@ -136,7 +136,7 @@ async fn raw_h2_downlink(
     ready_sender: oneshot::Sender<()>,
 ) -> Vec<u8> {
     let (mut sender, connection) = connect_h2(server_addr, cert_path).await;
-    let connection_task = tokio::spawn(async move { connection.await });
+    let connection_task = tokio::spawn(connection);
     let request = Request::builder()
         .method("GET")
         .uri(format!(
@@ -293,7 +293,9 @@ fn parse_uuid(value: &str) -> [u8; 16] {
         .collect::<Vec<_>>();
     assert_eq!(compact.len(), 32);
     let mut parsed = [0u8; 16];
-    for (index, pair) in compact.chunks_exact(2).enumerate() {
+    let (pairs, remainder) = compact.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    for (index, pair) in pairs.iter().enumerate() {
         parsed[index] = (hex(pair[0]) << 4) | hex(pair[1]);
     }
     parsed

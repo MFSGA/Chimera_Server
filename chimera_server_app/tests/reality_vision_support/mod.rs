@@ -557,14 +557,14 @@ pub async fn start_xray_reference_harness(name: &str) -> XrayReferenceHarness {
 
 pub fn workspace_root() -> PathBuf {
     for ancestor in Path::new(env!("CARGO_MANIFEST_DIR")).ancestors() {
-        if ancestor.join("xray").is_file()
-            && ancestor.join("cert/cert.pem").is_file()
+        if ancestor.join("Cargo.toml").is_file()
+            && ancestor.join("chimera_server_app/Cargo.toml").is_file()
         {
             return ancestor.to_path_buf();
         }
     }
     panic!(
-        "failed to find workspace root containing xray and cert/cert.pem from {}",
+        "failed to find Chimera workspace root from {}",
         env!("CARGO_MANIFEST_DIR")
     );
 }
@@ -684,7 +684,7 @@ fn start_xray_named(
     })
 }
 
-fn xray_binary_path(workspace: &Path) -> PathBuf {
+pub fn xray_binary_path(workspace: &Path) -> PathBuf {
     env::var_os("XRAY_BIN")
         .map(PathBuf::from)
         .map(|path| {
