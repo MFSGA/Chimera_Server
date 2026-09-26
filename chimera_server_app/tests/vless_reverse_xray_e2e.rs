@@ -31,6 +31,8 @@ enum ReverseSecurity {
     Tls,
     Websocket,
     XhttpTls,
+    XhttpTlsAuto,
+    XhttpTlsPacketUp,
     XhttpTlsObfs,
 }
 
@@ -41,6 +43,8 @@ impl ReverseSecurity {
             Self::Tls => "tls",
             Self::Websocket => "websocket",
             Self::XhttpTls => "xhttp-tls",
+            Self::XhttpTlsAuto => "xhttp-tls-auto",
+            Self::XhttpTlsPacketUp => "xhttp-tls-packet-up",
             Self::XhttpTlsObfs => "xhttp-tls-obfs",
         }
     }
@@ -97,6 +101,26 @@ fn chimera_bridge_round_trips_public_xray_portal_over_xhttp_tls_vless_reverse() 
 #[test]
 fn xray_bridge_round_trips_public_chimera_portal_over_xhttp_tls_vless_reverse() {
     run_reverse_interop(ReverseSecurity::XhttpTls);
+}
+
+#[test]
+fn chimera_bridge_round_trips_xray_portal_over_xhttp_tls_packet_up_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTlsPacketUp, None);
+}
+
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_xhttp_tls_packet_up_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTlsPacketUp);
+}
+
+#[test]
+fn chimera_bridge_round_trips_xray_portal_over_xhttp_tls_auto_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTlsAuto, None);
+}
+
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_xhttp_tls_auto_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTlsAuto);
 }
 
 #[test]
@@ -961,8 +985,15 @@ fn run_chimera_bridge_interop(
                 "wsSettings": {"path": "/reverse"}
             }),
         ),
-        ReverseSecurity::XhttpTls => {
+        ReverseSecurity::XhttpTls
+        | ReverseSecurity::XhttpTlsAuto
+        | ReverseSecurity::XhttpTlsPacketUp => {
             let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            let mode = match security {
+                ReverseSecurity::XhttpTlsAuto => "auto",
+                ReverseSecurity::XhttpTlsPacketUp => "packet-up",
+                _ => "stream-up",
+            };
             (
                 json!({
                     "network": "xhttp",
@@ -977,9 +1008,14 @@ fn run_chimera_bridge_interop(
                     "xhttpSettings": {
                         "host": "cdn.reverse.test",
                         "path": "/reverse-xhttp/?edge=portal",
-                        "mode": "stream-up",
+                        "mode": mode,
                         "sessionIDPlacement": "header",
                         "sessionIDKey": "X-Reverse-Session",
+                        "seqPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "seqKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Sequence" } else { "" },
+                        "uplinkDataPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "uplinkDataKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Payload" } else { "" },
+                        "uplinkChunkSize": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { json!("64") } else { serde_json::Value::Null },
                         "xPaddingBytes": 1
                     }
                 }),
@@ -997,9 +1033,14 @@ fn run_chimera_bridge_interop(
                     "xhttpSettings": {
                         "host": "cdn.reverse.test",
                         "path": "/reverse-xhttp/?edge=bridge",
-                        "mode": "stream-up",
+                        "mode": mode,
                         "sessionIDPlacement": "header",
                         "sessionIDKey": "X-Reverse-Session",
+                        "seqPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "seqKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Sequence" } else { "" },
+                        "uplinkDataPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "uplinkDataKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Payload" } else { "" },
+                        "uplinkChunkSize": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { json!("64") } else { serde_json::Value::Null },
                         "headers": {
                             "User-Agent": "chimera-reverse-xhttp",
                             "X-Reverse-Edge": "chimera-bridge"
@@ -1276,9 +1317,16 @@ fn run_reverse_interop(security: ReverseSecurity) {
         ReverseSecurity::Websocket => {
             unreachable!("Portal-side WebSocket is not exercised here")
         }
-        ReverseSecurity::XhttpTls => {
+        ReverseSecurity::XhttpTls
+        | ReverseSecurity::XhttpTlsAuto
+        | ReverseSecurity::XhttpTlsPacketUp => {
             let (cert_path, key_path) = generate_test_certificate(&work_dir);
             let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+            let mode = match security {
+                ReverseSecurity::XhttpTlsAuto => "auto",
+                ReverseSecurity::XhttpTlsPacketUp => "packet-up",
+                _ => "stream-up",
+            };
             (
                 json!({
                     "network": "xhttp",
@@ -1293,9 +1341,14 @@ fn run_reverse_interop(security: ReverseSecurity) {
                     "xhttpSettings": {
                         "host": "cdn.reverse.test",
                         "path": "/reverse-xhttp/?edge=portal",
-                        "mode": "stream-up",
+                        "mode": mode,
                         "sessionIDPlacement": "header",
                         "sessionIDKey": "X-Reverse-Session",
+                        "seqPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "seqKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Sequence" } else { "" },
+                        "uplinkDataPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "uplinkDataKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Payload" } else { "" },
+                        "uplinkChunkSize": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { json!("64") } else { serde_json::Value::Null },
                         "xPaddingBytes": 1
                     }
                 }),
@@ -1309,9 +1362,14 @@ fn run_reverse_interop(security: ReverseSecurity) {
                     "xhttpSettings": {
                         "host": "cdn.reverse.test",
                         "path": "/reverse-xhttp/?edge=bridge",
-                        "mode": "stream-up",
+                        "mode": mode,
                         "sessionIDPlacement": "header",
                         "sessionIDKey": "X-Reverse-Session",
+                        "seqPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "seqKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Sequence" } else { "" },
+                        "uplinkDataPlacement": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "header" } else { "" },
+                        "uplinkDataKey": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { "X-Reverse-Payload" } else { "" },
+                        "uplinkChunkSize": if matches!(security, ReverseSecurity::XhttpTlsPacketUp) { json!("64") } else { serde_json::Value::Null },
                         "headers": {
                             "User-Agent": "xray-reverse-xhttp",
                             "X-Reverse-Edge": "xray-bridge"

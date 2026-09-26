@@ -2,6 +2,90 @@ use prost::Message;
 
 use super::*;
 
+fn normalize_xhttp_positive_range(
+    range: Option<XhttpRangePayload>,
+    default: (usize, usize),
+    field: &str,
+) -> std::io::Result<(usize, usize)> {
+    let Some(range) = range.filter(|range| range.to != 0) else {
+        return Ok(default);
+    };
+    if range.from <= 0 || range.to <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("XHTTP outbound {field} values must be positive"),
+        ));
+    }
+    let from = usize::try_from(range.from).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("XHTTP outbound {field} lower bound is invalid"),
+        )
+    })?;
+    let to = usize::try_from(range.to).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("XHTTP outbound {field} upper bound is invalid"),
+        )
+    })?;
+    Ok((from.min(to), from.max(to)))
+}
+
+fn normalize_xhttp_min_posts_interval(
+    range: Option<XhttpRangePayload>,
+) -> (usize, usize) {
+    let Some(range) = range.filter(|range| range.to != 0) else {
+        return (30, 30);
+    };
+    // Xray's packet sender only sleeps when the configured lower bound is
+    // positive. Negative ranges therefore disable the pacing delay.
+    if range.from <= 0 || range.to < 0 {
+        return (0, 0);
+    }
+    let from = range.from as usize;
+    let to = range.to as usize;
+    (from.min(to), from.max(to))
+}
+
+fn normalize_xhttp_uplink_chunk_size(
+    range: Option<XhttpRangePayload>,
+    placement: OutboundXhttpDataPlacement,
+    max_each_post_bytes: (usize, usize),
+) -> std::io::Result<(usize, usize)> {
+    let default = match placement {
+        OutboundXhttpDataPlacement::Header => (3_000, 4_000),
+        OutboundXhttpDataPlacement::Cookie => (2_048, 3_072),
+        OutboundXhttpDataPlacement::Auto | OutboundXhttpDataPlacement::Body => {
+            max_each_post_bytes
+        }
+    };
+    let Some(range) = range.filter(|range| range.to != 0) else {
+        return Ok(default);
+    };
+    if range.from < 64 {
+        return Ok((64, usize::try_from(range.to.max(64)).unwrap_or(64)));
+    }
+    if range.to <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "XHTTP outbound uplinkChunkSize upper bound must be positive",
+        ));
+    }
+    let from = usize::try_from(range.from).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "XHTTP outbound uplinkChunkSize lower bound is invalid",
+        )
+    })?;
+    let to = usize::try_from(range.to).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "XHTTP outbound uplinkChunkSize upper bound is invalid",
+        )
+    })?;
+    Ok((from.min(to), from.max(to)))
+}
+
 pub(super) fn decode_freedom_proxy_protocol(
     outbound: &OutboundSummary,
 ) -> std::io::Result<u32> {
@@ -816,15 +900,21 @@ pub(super) fn decode_sender_transport(
                         format!("invalid outbound XHTTP settings: {error}"),
                     )
                 })?;
-            let mode = settings.mode.trim().to_ascii_lowercase();
-            if mode != "stream-up" {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    format!(
-                        "XHTTP outbound mode {mode:?} is not implemented yet; only stream-up is supported"
-                    ),
-                ));
-            }
+            let mode = match settings.mode.trim().to_ascii_lowercase().as_str() {
+                "" | "auto" => OutboundXhttpMode::Auto,
+                "packet-up" => OutboundXhttpMode::PacketUp,
+                "stream-up" => OutboundXhttpMode::StreamUp,
+                mode => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "XHTTP outbound mode {mode:?} is not implemented yet; supported modes are auto, packet-up, and stream-up"
+                        ),
+                    ));
+                }
+            };
+            let packet_up = mode != OutboundXhttpMode::StreamUp;
+            let packet_up_explicit = mode == OutboundXhttpMode::PacketUp;
             if settings.download_settings.is_some() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
@@ -933,14 +1023,117 @@ pub(super) fn decode_sender_transport(
                     "XHTTP outbound custom session ID generator is not implemented yet",
                 ));
             }
-            if !settings.seq_placement.trim().is_empty()
-                || !settings.seq_key.trim().is_empty()
-                || !settings.uplink_data_placement.trim().is_empty()
-                || !settings.uplink_data_key.trim().is_empty()
+            if !packet_up
+                && (!settings.seq_placement.trim().is_empty()
+                    || !settings.seq_key.trim().is_empty()
+                    || !settings.uplink_data_placement.trim().is_empty()
+                    || !settings.uplink_data_key.trim().is_empty())
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "XHTTP stream-up outbound packet metadata placement is not implemented yet",
+                ));
+            }
+            let seq_placement = if packet_up {
+                let placement = match settings.seq_placement.as_str() {
+                    "" | "path" => OutboundXhttpSessionPlacement::Path,
+                    "query" => OutboundXhttpSessionPlacement::Query(
+                        if settings.seq_key.is_empty() {
+                            "x_seq".to_string()
+                        } else {
+                            settings.seq_key.clone()
+                        },
+                    ),
+                    "header" => OutboundXhttpSessionPlacement::Header(
+                        if settings.seq_key.is_empty() {
+                            "X-Seq".to_string()
+                        } else {
+                            settings.seq_key.clone()
+                        },
+                    ),
+                    "cookie" => OutboundXhttpSessionPlacement::Cookie(
+                        if settings.seq_key.is_empty() {
+                            "x_seq".to_string()
+                        } else {
+                            settings.seq_key.clone()
+                        },
+                    ),
+                    placement => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "unsupported XHTTP outbound seqPlacement {placement:?}"
+                            ),
+                        ));
+                    }
+                };
+                match &placement {
+                    OutboundXhttpSessionPlacement::Header(key)
+                    | OutboundXhttpSessionPlacement::Cookie(key)
+                        if http::header::HeaderName::from_bytes(key.as_bytes())
+                            .is_err() =>
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "invalid XHTTP outbound seqKey",
+                        ));
+                    }
+                    _ => {}
+                }
+                placement
+            } else {
+                OutboundXhttpSessionPlacement::Path
+            };
+            let uplink_data_placement = if packet_up {
+                match settings.uplink_data_placement.as_str() {
+                    "" | "body" => OutboundXhttpDataPlacement::Body,
+                    "auto" => OutboundXhttpDataPlacement::Auto,
+                    "header" => OutboundXhttpDataPlacement::Header,
+                    "cookie" => OutboundXhttpDataPlacement::Cookie,
+                    placement => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "unsupported XHTTP outbound uplinkDataPlacement {placement:?}"
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                OutboundXhttpDataPlacement::Body
+            };
+            if !packet_up_explicit
+                && matches!(
+                    uplink_data_placement,
+                    OutboundXhttpDataPlacement::Header
+                        | OutboundXhttpDataPlacement::Cookie
+                )
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "XHTTP uplinkDataPlacement header/cookie is supported only with explicit packet-up mode",
+                ));
+            }
+            let uplink_data_key = if settings.uplink_data_key.is_empty() {
+                match uplink_data_placement {
+                    OutboundXhttpDataPlacement::Cookie => "x_data".to_string(),
+                    OutboundXhttpDataPlacement::Auto
+                    | OutboundXhttpDataPlacement::Header => "X-Data".to_string(),
+                    OutboundXhttpDataPlacement::Body => String::new(),
+                }
+            } else {
+                settings.uplink_data_key.clone()
+            };
+            if matches!(
+                uplink_data_placement,
+                OutboundXhttpDataPlacement::Header
+                    | OutboundXhttpDataPlacement::Cookie
+            ) && http::header::HeaderName::from_bytes(uplink_data_key.as_bytes())
+                .is_err()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid XHTTP outbound uplinkDataKey",
                 ));
             }
             if settings
@@ -969,12 +1162,25 @@ pub(super) fn decode_sender_transport(
             } else {
                 settings.uplink_http_method.trim().to_ascii_uppercase()
             };
-            if uplink_http_method == "GET" {
+            if uplink_http_method == "GET" && !packet_up_explicit {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "XHTTP stream-up outbound uplinkHTTPMethod cannot be GET",
                 ));
             }
+            let max_each_post_bytes = normalize_xhttp_positive_range(
+                settings.sc_max_each_post_bytes,
+                (1_000_000, 1_000_000),
+                "scMaxEachPostBytes",
+            )?;
+            let min_posts_interval_ms = normalize_xhttp_min_posts_interval(
+                settings.sc_min_posts_interval_ms,
+            );
+            let uplink_chunk_size = normalize_xhttp_uplink_chunk_size(
+                settings.uplink_chunk_size,
+                uplink_data_placement,
+                max_each_post_bytes,
+            )?;
             let path = if settings.path.trim().is_empty() {
                 "/".to_string()
             } else if settings.path.starts_with('/') {
@@ -984,7 +1190,8 @@ pub(super) fn decode_sender_transport(
             };
             Ok(OutboundTransport::Xhttp {
                 tls,
-                settings: OutboundXhttpClientSettings {
+                settings: Box::new(OutboundXhttpClientSettings {
+                    mode,
                     host: settings.host,
                     path,
                     headers: settings.headers,
@@ -998,6 +1205,12 @@ pub(super) fn decode_sender_transport(
                     no_grpc_header: settings.no_grpc_header,
                     uplink_http_method,
                     session_placement,
+                    seq_placement,
+                    uplink_data_placement,
+                    uplink_data_key,
+                    max_each_post_bytes,
+                    min_posts_interval_ms,
+                    uplink_chunk_size,
                     xmux: settings.xmux.map(|xmux| OutboundXhttpXmuxSettings {
                         max_concurrency: xmux
                             .max_concurrency
@@ -1016,7 +1229,7 @@ pub(super) fn decode_sender_transport(
                             .map(|r| (r.from, r.to)),
                         h_keep_alive_period: xmux.h_keep_alive_period,
                     }),
-                },
+                }),
             })
         }
         "httpupgrade" | "http-upgrade" => {

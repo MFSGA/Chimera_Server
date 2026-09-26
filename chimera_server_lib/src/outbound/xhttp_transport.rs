@@ -6,9 +6,12 @@ use std::{
     task::{Context, Poll},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use futures::StreamExt as _;
-use http_body_util::{BodyExt as _, Empty, StreamBody, combinators::UnsyncBoxBody};
+use http_body_util::{
+    BodyExt as _, Empty, Full, StreamBody, combinators::UnsyncBoxBody,
+};
 use hyper::{
     Method, Request, Uri,
     body::Frame,
@@ -18,12 +21,19 @@ use hyper::{
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngExt as _;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf, duplex, split},
+    io::{
+        AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf,
+        duplex, split,
+    },
     task::AbortHandle,
+    time::{Duration, Instant, sleep},
 };
 use tokio_util::io::ReaderStream;
 
-use super::{OutboundXhttpClientSettings, OutboundXhttpSessionPlacement};
+use super::{
+    OutboundXhttpClientSettings, OutboundXhttpDataPlacement, OutboundXhttpMode,
+    OutboundXhttpSessionPlacement,
+};
 use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
@@ -32,6 +42,7 @@ use crate::{
 };
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
+const XHTTP_PACKET_READ_CAPACITY: usize = 64 * 1024;
 type XhttpBody = UnsyncBoxBody<Bytes, io::Error>;
 
 pub(super) struct XhttpOutboundStream {
@@ -114,7 +125,25 @@ impl AsyncPing for XhttpOutboundStream {
 
 impl AsyncStream for XhttpOutboundStream {}
 
-pub(super) async fn connect_xhttp_stream_up_h2(
+pub(super) async fn connect_xhttp_h2(
+    stream: Box<dyn AsyncStream>,
+    settings: &OutboundXhttpClientSettings,
+    server: &NetLocation,
+    tls_server_name: Option<&str>,
+) -> io::Result<XhttpOutboundStream> {
+    match settings.mode {
+        OutboundXhttpMode::StreamUp => {
+            connect_xhttp_stream_up_h2(stream, settings, server, tls_server_name)
+                .await
+        }
+        OutboundXhttpMode::Auto | OutboundXhttpMode::PacketUp => {
+            connect_xhttp_packet_up_h2(stream, settings, server, tls_server_name)
+                .await
+        }
+    }
+}
+
+async fn connect_xhttp_stream_up_h2(
     stream: Box<dyn AsyncStream>,
     settings: &OutboundXhttpClientSettings,
     server: &NetLocation,
@@ -306,13 +335,342 @@ pub(super) async fn connect_xhttp_stream_up_h2(
     })
 }
 
+async fn connect_xhttp_packet_up_h2(
+    stream: Box<dyn AsyncStream>,
+    settings: &OutboundXhttpClientSettings,
+    server: &NetLocation,
+    tls_server_name: Option<&str>,
+) -> io::Result<XhttpOutboundStream> {
+    if settings.xmux.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "XHTTP xmux runtime reuse is not implemented yet",
+        ));
+    }
+    let uplink_method = Method::from_bytes(settings.uplink_http_method.as_bytes())
+        .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid XHTTP uplinkHTTPMethod {}: {error}",
+                settings.uplink_http_method
+            ),
+        )
+    })?;
+    let authority = xhttp_authority(settings, server, tls_server_name);
+    let session_id = xhttp_session_id();
+    let downlink_padding = xhttp_padding_value(settings)?;
+    let downlink_uri =
+        xhttp_request_uri(settings, &authority, &session_id, &downlink_padding)?;
+
+    let mut builder = client_http2::Builder::new(TokioExecutor::new());
+    builder.initial_stream_window_size(1024 * 1024);
+    builder.initial_connection_window_size(1024 * 1024);
+    let (mut sender, connection) = builder
+        .handshake::<_, XhttpBody>(TokioIo::new(stream))
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP outbound HTTP/2 handshake failed: {error}"),
+            )
+        })?;
+
+    let shared_error = Arc::new(Mutex::new(None));
+    let connection_error = Arc::clone(&shared_error);
+    let connection_task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            set_xhttp_error(
+                &connection_error,
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP outbound HTTP/2 connection failed: {error}"),
+            );
+        }
+    });
+    let connection_abort = connection_task.abort_handle();
+    drop(connection_task);
+    let mut connection_guard = AbortOnDrop::new(connection_abort);
+
+    let get_body = Empty::<Bytes>::new()
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync();
+    let downlink_request = Request::builder().method(Method::GET).uri(downlink_uri);
+    let downlink_request = apply_xhttp_headers(
+        downlink_request,
+        settings,
+        &authority,
+        &downlink_padding,
+        &session_id,
+        false,
+    )?
+    .body(get_body)
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to build XHTTP downlink request: {error}"),
+        )
+    })?;
+    let downlink_response =
+        sender
+            .send_request(downlink_request)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("XHTTP downlink request failed: {error}"),
+                )
+            })?;
+    if downlink_response.status() != hyper::StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "XHTTP downlink returned HTTP status {}",
+                downlink_response.status()
+            ),
+        ));
+    }
+
+    let (app_stream, transport_stream) = duplex(XHTTP_PIPE_CAPACITY);
+    let (mut upload_read, mut download_write) = split(transport_stream);
+    let downlink_error = Arc::clone(&shared_error);
+    let downlink_task = tokio::spawn(async move {
+        let mut body = downlink_response.into_body();
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Some(data) = frame.data_ref()
+                        && download_write.write_all(data).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    set_xhttp_error(
+                        &downlink_error,
+                        io::ErrorKind::ConnectionAborted,
+                        format!("XHTTP downlink response failed: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+        let _ = download_write.shutdown().await;
+    });
+    let downlink_abort = downlink_task.abort_handle();
+    drop(downlink_task);
+
+    let uplink_settings = settings.clone();
+    let uplink_authority = authority.clone();
+    let uplink_session_id = session_id;
+    let uplink_method = uplink_method.clone();
+    let uplink_error = Arc::clone(&shared_error);
+    let uplink_task = tokio::spawn(async move {
+        if let Err(error) = run_xhttp_packet_uplink(
+            &mut sender,
+            &mut upload_read,
+            &uplink_settings,
+            uplink_method,
+            &uplink_authority,
+            &uplink_session_id,
+        )
+        .await
+        {
+            set_xhttp_error(&uplink_error, error.kind(), error.to_string());
+        }
+    });
+    let uplink_abort = uplink_task.abort_handle();
+    drop(uplink_task);
+    let connection_abort = connection_guard.disarm();
+
+    Ok(XhttpOutboundStream {
+        inner: app_stream,
+        shared_error,
+        connection_abort,
+        downlink_abort,
+        uplink_abort,
+    })
+}
+
+async fn run_xhttp_packet_uplink(
+    sender: &mut client_http2::SendRequest<XhttpBody>,
+    reader: &mut (impl AsyncRead + Unpin),
+    settings: &OutboundXhttpClientSettings,
+    method: Method,
+    authority: &str,
+    session_id: &str,
+) -> io::Result<()> {
+    let max_each_post_bytes = crate::beginning::random_xray_range(
+        settings.max_each_post_bytes.0,
+        settings.max_each_post_bytes.1,
+    );
+    let read_capacity = max_each_post_bytes.clamp(1, XHTTP_PACKET_READ_CAPACITY);
+    let mut buffer = vec![0u8; read_capacity];
+    let mut seq = 0u64;
+    let mut last_write: Option<Instant> = None;
+
+    loop {
+        let length = reader.read(&mut buffer).await?;
+        if length == 0 {
+            return Ok(());
+        }
+
+        if settings.min_posts_interval_ms.0 > 0 {
+            let minimum =
+                Duration::from_millis(crate::beginning::random_xray_range(
+                    settings.min_posts_interval_ms.0,
+                    settings.min_posts_interval_ms.1,
+                ) as u64);
+            if let Some(last_write) = last_write {
+                let elapsed = last_write.elapsed();
+                if elapsed < minimum {
+                    sleep(minimum - elapsed).await;
+                }
+            }
+        }
+
+        let padding = xhttp_padding_value(settings)?;
+        let seq_text = seq.to_string();
+        let uri = xhttp_request_uri_with_sequence(
+            settings, authority, session_id, &padding, &seq_text,
+        )?;
+        let payload = Bytes::copy_from_slice(&buffer[..length]);
+        let mut request = Request::builder().method(method.clone()).uri(uri);
+        request = apply_xhttp_packet_headers(
+            request, settings, authority, &padding, session_id, &seq_text, &payload,
+        )?;
+        let body = match settings.uplink_data_placement {
+            OutboundXhttpDataPlacement::Auto | OutboundXhttpDataPlacement::Body => {
+                Full::new(payload)
+                    .map_err(|never: Infallible| match never {})
+                    .boxed_unsync()
+            }
+            OutboundXhttpDataPlacement::Header
+            | OutboundXhttpDataPlacement::Cookie => Empty::<Bytes>::new()
+                .map_err(|never: Infallible| match never {})
+                .boxed_unsync(),
+        };
+        let request = request.body(body).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to build XHTTP packet-up request: {error}"),
+            )
+        })?;
+        let response = sender.send_request(request).await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP packet-up request failed: {error}"),
+            )
+        })?;
+        if response.status() != hyper::StatusCode::OK {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!(
+                    "XHTTP packet-up returned HTTP status {}",
+                    response.status()
+                ),
+            ));
+        }
+        response.into_body().collect().await.map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP packet-up response failed: {error}"),
+            )
+        })?;
+        last_write = Some(Instant::now());
+        seq = seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "XHTTP packet-up sequence exhausted",
+            )
+        })?;
+    }
+}
+
+struct AbortOnDrop {
+    handle: AbortHandle,
+    armed: bool,
+}
+
+impl AbortOnDrop {
+    fn new(handle: AbortHandle) -> Self {
+        Self {
+            handle,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) -> AbortHandle {
+        self.armed = false;
+        self.handle.clone()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.abort();
+        }
+    }
+}
+
 fn apply_xhttp_headers(
-    mut builder: http::request::Builder,
+    builder: http::request::Builder,
     settings: &OutboundXhttpClientSettings,
     authority: &str,
     padding: &str,
     session_id: &str,
     upload: bool,
+) -> io::Result<http::request::Builder> {
+    apply_xhttp_request_headers(
+        builder,
+        settings,
+        authority,
+        padding,
+        session_id,
+        XhttpRequestMetadata {
+            upload,
+            ..XhttpRequestMetadata::default()
+        },
+    )
+}
+
+fn apply_xhttp_packet_headers(
+    builder: http::request::Builder,
+    settings: &OutboundXhttpClientSettings,
+    authority: &str,
+    padding: &str,
+    session_id: &str,
+    sequence: &str,
+    payload: &[u8],
+) -> io::Result<http::request::Builder> {
+    apply_xhttp_request_headers(
+        builder,
+        settings,
+        authority,
+        padding,
+        session_id,
+        XhttpRequestMetadata {
+            sequence: Some(sequence),
+            packet_payload: Some(payload),
+            ..XhttpRequestMetadata::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct XhttpRequestMetadata<'a> {
+    upload: bool,
+    sequence: Option<&'a str>,
+    packet_payload: Option<&'a [u8]>,
+}
+
+fn apply_xhttp_request_headers(
+    mut builder: http::request::Builder,
+    settings: &OutboundXhttpClientSettings,
+    authority: &str,
+    padding: &str,
+    session_id: &str,
+    metadata: XhttpRequestMetadata<'_>,
 ) -> io::Result<http::request::Builder> {
     for (name, value) in &settings.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
@@ -336,6 +694,32 @@ fn apply_xhttp_headers(
             "XHTTP outbound request builder has no header map",
         )
     })?;
+
+    if let Some(payload) = metadata.packet_payload {
+        match settings.uplink_data_placement {
+            OutboundXhttpDataPlacement::Header => {
+                let encoded = URL_SAFE_NO_PAD.encode(payload);
+                for (index, chunk) in
+                    xhttp_payload_chunks(&encoded, settings.uplink_chunk_size)
+                        .enumerate()
+                {
+                    let name = format!("{}-{index}", settings.uplink_data_key);
+                    xhttp_set_header(headers, &name, chunk, "uplinkDataKey")?;
+                }
+            }
+            OutboundXhttpDataPlacement::Cookie => {
+                let encoded = URL_SAFE_NO_PAD.encode(payload);
+                for (index, chunk) in
+                    xhttp_payload_chunks(&encoded, settings.uplink_chunk_size)
+                        .enumerate()
+                {
+                    let name = format!("{}_{index}", settings.uplink_data_key);
+                    xhttp_append_cookie(headers, &name, chunk, "uplinkDataKey")?;
+                }
+            }
+            OutboundXhttpDataPlacement::Auto | OutboundXhttpDataPlacement::Body => {}
+        }
+    }
 
     if settings.padding_obfs_mode {
         match settings.padding_placement {
@@ -390,7 +774,20 @@ fn apply_xhttp_headers(
         }
     }
 
-    if upload && !settings.no_grpc_header {
+    if let Some(sequence) = metadata.sequence {
+        match &settings.seq_placement {
+            OutboundXhttpSessionPlacement::Path
+            | OutboundXhttpSessionPlacement::Query(_) => {}
+            OutboundXhttpSessionPlacement::Header(key) => {
+                xhttp_set_header(headers, key, sequence, "seqKey")?;
+            }
+            OutboundXhttpSessionPlacement::Cookie(key) => {
+                xhttp_append_cookie(headers, key, sequence, "seqKey")?;
+            }
+        }
+    }
+
+    if metadata.upload && !settings.no_grpc_header {
         headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/grpc"),
@@ -398,6 +795,24 @@ fn apply_xhttp_headers(
     }
 
     Ok(builder)
+}
+
+fn xhttp_payload_chunks(
+    encoded: &str,
+    chunk_size: (usize, usize),
+) -> impl Iterator<Item = &str> {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        if offset >= encoded.len() {
+            return None;
+        }
+        let size =
+            crate::beginning::random_xray_range(chunk_size.0, chunk_size.1).max(1);
+        let end = (offset + size).min(encoded.len());
+        let chunk = &encoded[offset..end];
+        offset = end;
+        Some(chunk)
+    })
 }
 
 fn xhttp_set_header(
@@ -474,6 +889,16 @@ fn xhttp_request_uri(
     session_id: &str,
     padding: &str,
 ) -> io::Result<Uri> {
+    xhttp_request_uri_with_sequence(settings, authority, session_id, padding, "")
+}
+
+fn xhttp_request_uri_with_sequence(
+    settings: &OutboundXhttpClientSettings,
+    authority: &str,
+    session_id: &str,
+    padding: &str,
+    sequence: &str,
+) -> io::Result<Uri> {
     let raw_query = settings.path.split_once('?').map(|(_, query)| query);
     let base_path = xhttp_normalized_base_path(settings);
     let mut query = raw_query.map(str::to_string);
@@ -488,17 +913,29 @@ fn xhttp_request_uri(
         ));
     }
 
-    let path = match &settings.session_placement {
+    let mut path = base_path;
+    match &settings.session_placement {
         OutboundXhttpSessionPlacement::Path => {
-            format!("{base_path}{session_id}")
+            xhttp_append_path_segment(&mut path, session_id)
         }
         OutboundXhttpSessionPlacement::Query(key) => {
             query = Some(xhttp_query_set(query.as_deref(), key, session_id));
-            base_path
         }
         OutboundXhttpSessionPlacement::Header(_)
-        | OutboundXhttpSessionPlacement::Cookie(_) => base_path,
-    };
+        | OutboundXhttpSessionPlacement::Cookie(_) => {}
+    }
+    if !sequence.is_empty() {
+        match &settings.seq_placement {
+            OutboundXhttpSessionPlacement::Path => {
+                xhttp_append_path_segment(&mut path, sequence)
+            }
+            OutboundXhttpSessionPlacement::Query(key) => {
+                query = Some(xhttp_query_set(query.as_deref(), key, sequence));
+            }
+            OutboundXhttpSessionPlacement::Header(_)
+            | OutboundXhttpSessionPlacement::Cookie(_) => {}
+        }
+    }
     let uri = match query.filter(|query| !query.is_empty()) {
         Some(query) => format!("https://{authority}{path}?{query}"),
         None => format!("https://{authority}{path}"),
@@ -509,6 +946,13 @@ fn xhttp_request_uri(
             format!("invalid XHTTP outbound URI: {error}"),
         )
     })
+}
+
+fn xhttp_append_path_segment(path: &mut String, segment: &str) {
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(segment);
 }
 
 fn xhttp_padding_value(
@@ -556,7 +1000,12 @@ fn xhttp_normalized_base_path(settings: &OutboundXhttpClientSettings) -> String 
         .path
         .split_once('?')
         .map_or(settings.path.as_str(), |(path, _)| path);
-    if path.ends_with('/') {
+    let path_metadata =
+        matches!(
+            settings.session_placement,
+            OutboundXhttpSessionPlacement::Path
+        ) || matches!(settings.seq_placement, OutboundXhttpSessionPlacement::Path);
+    if !path_metadata || path.ends_with('/') {
         path.to_string()
     } else {
         format!("{path}/")
@@ -716,9 +1165,11 @@ fn take_xhttp_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     fn settings() -> OutboundXhttpClientSettings {
         OutboundXhttpClientSettings {
+            mode: OutboundXhttpMode::StreamUp,
             host: "example.com".to_string(),
             path: "/reverse?existing=1".to_string(),
             headers: Default::default(),
@@ -733,6 +1184,12 @@ mod tests {
             no_grpc_header: false,
             uplink_http_method: "POST".to_string(),
             session_placement: OutboundXhttpSessionPlacement::Path,
+            seq_placement: OutboundXhttpSessionPlacement::Path,
+            uplink_data_placement: OutboundXhttpDataPlacement::Body,
+            uplink_data_key: String::new(),
+            max_each_post_bytes: (1_000_000, 1_000_000),
+            min_posts_interval_ms: (30, 30),
+            uplink_chunk_size: (1_000_000, 1_000_000),
             xmux: None,
         }
     }
@@ -958,5 +1415,190 @@ mod tests {
         assert_eq!(&id[13..14], "-");
         assert_eq!(&id[18..19], "-");
         assert_eq!(&id[23..24], "-");
+    }
+
+    #[test]
+    fn packet_up_places_sequence_and_header_payload_like_xray() {
+        let mut settings = settings();
+        settings.mode = OutboundXhttpMode::PacketUp;
+        settings.session_placement =
+            OutboundXhttpSessionPlacement::Query("x_session".to_string());
+        settings.seq_placement =
+            OutboundXhttpSessionPlacement::Header("X-Seq".to_string());
+        settings.uplink_data_placement = OutboundXhttpDataPlacement::Header;
+        settings.uplink_data_key = "X-Data".to_string();
+        settings.uplink_chunk_size = (3, 3);
+
+        let uri = xhttp_request_uri_with_sequence(
+            &settings,
+            "example.com",
+            "session",
+            "XXXX",
+            "7",
+        )
+        .expect("packet-up request URI");
+        assert_eq!(
+            uri.to_string(),
+            "https://example.com/reverse?existing=1&x_session=session"
+        );
+
+        let request = apply_xhttp_packet_headers(
+            Request::builder().method(Method::POST).uri(uri),
+            &settings,
+            "example.com",
+            "XXXX",
+            "session",
+            "7",
+            b"hello",
+        )
+        .expect("packet-up headers")
+        .body(())
+        .expect("packet-up request");
+        assert_eq!(request.headers().get("X-Seq").unwrap(), "7");
+        assert_eq!(request.headers().get("X-Data-0").unwrap(), "aGV");
+        assert_eq!(request.headers().get("X-Data-1").unwrap(), "sbG");
+        assert_eq!(request.headers().get("X-Data-2").unwrap(), "8");
+        assert!(request.headers().get(header::CONTENT_TYPE).is_none());
+    }
+
+    #[test]
+    fn packet_up_cookie_payload_keeps_custom_cookies_and_sequence() {
+        let mut settings = settings();
+        settings.mode = OutboundXhttpMode::PacketUp;
+        settings.session_placement =
+            OutboundXhttpSessionPlacement::Cookie("x_session".to_string());
+        settings.seq_placement =
+            OutboundXhttpSessionPlacement::Cookie("x_seq".to_string());
+        settings.uplink_data_placement = OutboundXhttpDataPlacement::Cookie;
+        settings.uplink_data_key = "x_data".to_string();
+        settings.uplink_chunk_size = (64, 64);
+        settings
+            .headers
+            .insert("Cookie".to_string(), "existing=1".to_string());
+
+        let request = apply_xhttp_packet_headers(
+            Request::builder()
+                .method(Method::POST)
+                .uri("https://example.com/reverse/session"),
+            &settings,
+            "example.com",
+            "XXXX",
+            "session",
+            "9",
+            b"packet",
+        )
+        .expect("packet-up headers")
+        .body(())
+        .expect("packet-up request");
+        assert_eq!(
+            request.headers().get(header::COOKIE).unwrap(),
+            "existing=1; x_data_0=cGFja2V0; x_session=session; x_seq=9"
+        );
+    }
+
+    #[tokio::test]
+    async fn packet_up_h2_round_trips_chunked_stream_with_ordered_sequences() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local HTTP/2 fixture");
+        let server_addr = listener.local_addr().expect("fixture address");
+        let received_sequences = Arc::new(Mutex::new(Vec::new()));
+        let sequences_for_service = Arc::clone(&received_sequences);
+        let (downlink_tx, downlink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let downlink_rx = Arc::new(tokio::sync::Mutex::new(downlink_rx));
+        let tx_for_service = downlink_tx.clone();
+        let rx_for_service = Arc::clone(&downlink_rx);
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept H2 client");
+            let service = hyper::service::service_fn(
+                move |request: Request<hyper::body::Incoming>| {
+                    let sequences = Arc::clone(&sequences_for_service);
+                    let tx = tx_for_service.clone();
+                    let rx = Arc::clone(&rx_for_service);
+                    async move {
+                        let response_body = if request.method() == Method::GET {
+                            let stream =
+                                futures::stream::unfold(rx, |rx| async move {
+                                    let next = rx.lock().await.recv().await;
+                                    next.map(|bytes| (Ok(Frame::data(bytes)), rx))
+                                });
+                            StreamBody::new(stream).boxed_unsync()
+                        } else {
+                            let sequence = request
+                                .uri()
+                                .path()
+                                .rsplit('/')
+                                .next()
+                                .expect("packet sequence path segment")
+                                .parse::<u64>()
+                                .expect("numeric packet sequence");
+                            sequences
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(sequence);
+                            let payload = request
+                                .into_body()
+                                .collect()
+                                .await
+                                .expect("collect packet payload")
+                                .to_bytes();
+                            tx.send(payload).expect("forward packet to downlink");
+                            Empty::<Bytes>::new()
+                                .map_err(|never: Infallible| match never {})
+                                .boxed_unsync()
+                        };
+                        Ok::<_, Infallible>(
+                            hyper::Response::builder()
+                                .status(hyper::StatusCode::OK)
+                                .body(response_body)
+                                .expect("build packet-up fixture response"),
+                        )
+                    }
+                },
+            );
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(socket), service)
+                .await
+                .expect("serve packet-up H2 connection");
+        });
+
+        let raw = tokio::net::TcpStream::connect(server_addr)
+            .await
+            .expect("connect packet-up client");
+        let server = NetLocation::from_ip_addr(server_addr.ip(), server_addr.port());
+        let mut packet_settings = settings();
+        packet_settings.mode = OutboundXhttpMode::PacketUp;
+        packet_settings.padding_from = 1;
+        packet_settings.padding_to = 1;
+        packet_settings.max_each_post_bytes = (4, 4);
+        packet_settings.min_posts_interval_ms = (0, 0);
+        packet_settings.uplink_chunk_size = (64, 64);
+        let mut stream =
+            connect_xhttp_h2(Box::new(raw), &packet_settings, &server, None)
+                .await
+                .expect("connect XHTTP packet-up over HTTP/2");
+
+        let payload = b"abcdefghijklmnop";
+        stream
+            .write_all(payload)
+            .await
+            .expect("write uplink payload");
+        let mut echoed = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
+            .await
+            .expect("packet-up downlink timeout")
+            .expect("read packet-up echo");
+        assert_eq!(echoed, payload);
+        assert_eq!(
+            *received_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![0, 1, 2, 3]
+        );
+
+        drop(stream);
+        drop(downlink_tx);
+        server_task.abort();
     }
 }

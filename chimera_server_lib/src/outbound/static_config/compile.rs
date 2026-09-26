@@ -313,11 +313,13 @@ fn encode_static_xhttp_config(
     } else {
         config.mode.trim().to_ascii_lowercase()
     };
-    if mode != "stream-up" {
+    if !matches!(mode.as_str(), "auto" | "packet-up" | "stream-up") {
         return Err(format!(
-            "XHTTP outbound mode {mode:?} is not implemented yet; only stream-up is supported"
+            "XHTTP outbound mode {mode:?} is not implemented yet; supported modes are auto, packet-up, and stream-up"
         ));
     }
+    let packet_up = mode != "stream-up";
+    let packet_up_explicit = mode == "packet-up";
     if config.download_settings.is_some() {
         return Err("XHTTP outbound downloadSettings is not implemented yet".into());
     }
@@ -363,10 +365,11 @@ fn encode_static_xhttp_config(
             "invalid XHTTP outbound xPaddingHeader {x_padding_header:?}"
         ));
     }
-    if !config.seq_placement.trim().is_empty()
-        || !config.seq_key.trim().is_empty()
-        || !config.uplink_data_placement.trim().is_empty()
-        || !config.uplink_data_key.trim().is_empty()
+    if !packet_up
+        && (!config.seq_placement.trim().is_empty()
+            || !config.seq_key.trim().is_empty()
+            || !config.uplink_data_placement.trim().is_empty()
+            || !config.uplink_data_key.trim().is_empty())
     {
         return Err(
             "XHTTP stream-up outbound does not accept packet-up sequence/data placement settings yet"
@@ -392,6 +395,64 @@ fn encode_static_xhttp_config(
         }
     } else {
         config.session_id_key.clone()
+    };
+    let seq_placement = if packet_up {
+        match config.seq_placement.as_str() {
+            "" | "path" => "path",
+            "query" => "query",
+            "header" => "header",
+            "cookie" => "cookie",
+            placement => {
+                return Err(format!(
+                    "unsupported XHTTP outbound seqPlacement {placement:?}"
+                ));
+            }
+        }
+    } else {
+        ""
+    };
+    let seq_key = if !packet_up || seq_placement == "path" {
+        String::new()
+    } else if config.seq_key.is_empty() {
+        match seq_placement {
+            "query" | "cookie" => "x_seq".to_string(),
+            "header" => "X-Seq".to_string(),
+            _ => String::new(),
+        }
+    } else {
+        config.seq_key.clone()
+    };
+    let uplink_data_placement = if packet_up {
+        match config.uplink_data_placement.as_str() {
+            "" | "body" => "body",
+            "auto" => "auto",
+            "header" => "header",
+            "cookie" => "cookie",
+            placement => {
+                return Err(format!(
+                    "unsupported XHTTP outbound uplinkDataPlacement {placement:?}"
+                ));
+            }
+        }
+    } else {
+        ""
+    };
+    if !packet_up_explicit && matches!(uplink_data_placement, "header" | "cookie") {
+        return Err(
+            "XHTTP uplinkDataPlacement header/cookie is supported only with explicit packet-up mode"
+                .into(),
+        );
+    }
+    let uplink_data_key = if !packet_up || uplink_data_placement == "body" {
+        String::new()
+    } else if config.uplink_data_key.is_empty() {
+        match uplink_data_placement {
+            "cookie" => "x_data".to_string(),
+            "auto" | "header" => "X-Data".to_string(),
+            _ => String::new(),
+        }
+    } else {
+        config.uplink_data_key.clone()
     };
     if !config.session_id_table.trim().is_empty()
         || config.session_id_length.is_some()
@@ -424,8 +485,14 @@ fn encode_static_xhttp_config(
     } else {
         config.uplink_http_method.trim().to_ascii_uppercase()
     };
-    if method == "GET" {
-        return Err("XHTTP stream-up outbound uplinkHTTPMethod cannot be GET".into());
+    if method == "GET" && !packet_up_explicit {
+        return Err("XHTTP uplinkHTTPMethod GET is supported only with explicit packet-up mode".into());
+    }
+    if config
+        .sc_max_each_post_bytes
+        .is_some_and(|range| range.to != 0 && (range.from <= 0 || range.to <= 0))
+    {
+        return Err("XHTTP outbound scMaxEachPostBytes must be positive".into());
     }
     let path = if config.path.trim().is_empty() {
         "/".to_string()
@@ -445,8 +512,18 @@ fn encode_static_xhttp_config(
         }),
         no_grpc_header: config.no_grpc_header,
         no_sse_header: config.no_sse_header,
-        sc_max_each_post_bytes: None,
-        sc_min_posts_interval_ms: None,
+        sc_max_each_post_bytes: config.sc_max_each_post_bytes.map(|range| {
+            XhttpRangePayload {
+                from: range.from,
+                to: range.to,
+            }
+        }),
+        sc_min_posts_interval_ms: config.sc_min_posts_interval_ms.map(|range| {
+            XhttpRangePayload {
+                from: range.from,
+                to: range.to,
+            }
+        }),
         sc_max_buffered_posts: 0,
         sc_stream_up_server_secs: None,
         xmux: None,
@@ -459,11 +536,14 @@ fn encode_static_xhttp_config(
         uplink_http_method: method,
         session_id_placement: session_placement.to_string(),
         session_id_key: session_key,
-        seq_placement: String::new(),
-        seq_key: String::new(),
-        uplink_data_placement: String::new(),
-        uplink_data_key: String::new(),
-        uplink_chunk_size: None,
+        seq_placement: seq_placement.to_string(),
+        seq_key,
+        uplink_data_placement: uplink_data_placement.to_string(),
+        uplink_data_key,
+        uplink_chunk_size: config.uplink_chunk_size.map(|range| XhttpRangePayload {
+            from: range.from,
+            to: range.to,
+        }),
         server_max_header_bytes: 0,
         session_id_table: String::new(),
         session_id_length: None,

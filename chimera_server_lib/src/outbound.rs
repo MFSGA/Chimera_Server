@@ -14,6 +14,7 @@ mod protocol;
 mod routing;
 mod static_config;
 mod wire;
+#[cfg(feature = "tls")]
 mod xhttp_transport;
 
 #[cfg(all(test, feature = "vless-reverse"))]
@@ -46,7 +47,8 @@ use protocol::{
     TcpProtocolHandshake, TrojanCommand, build_trojan_request, socks5_connect,
     trojan_connect, vless_tcp_connect,
 };
-use xhttp_transport::connect_xhttp_stream_up_h2;
+#[cfg(feature = "tls")]
+use xhttp_transport::connect_xhttp_h2;
 
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 pub(crate) use routing::connection_routing_input;
@@ -129,7 +131,7 @@ enum OutboundTransport {
     },
     Xhttp {
         tls: OutboundTlsClientSettings,
-        settings: OutboundXhttpClientSettings,
+        settings: Box<OutboundXhttpClientSettings>,
     },
     #[cfg(feature = "grpc_transport")]
     Grpc {
@@ -165,6 +167,21 @@ enum OutboundXhttpSessionPlacement {
     Cookie(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundXhttpMode {
+    Auto,
+    StreamUp,
+    PacketUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundXhttpDataPlacement {
+    Auto,
+    Body,
+    Header,
+    Cookie,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundXhttpXmuxSettings {
     max_concurrency: Option<(i32, i32)>,
@@ -177,6 +194,7 @@ struct OutboundXhttpXmuxSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundXhttpClientSettings {
+    mode: OutboundXhttpMode,
     host: String,
     path: String,
     headers: HashMap<String, String>,
@@ -190,6 +208,12 @@ struct OutboundXhttpClientSettings {
     no_grpc_header: bool,
     uplink_http_method: String,
     session_placement: OutboundXhttpSessionPlacement,
+    seq_placement: OutboundXhttpSessionPlacement,
+    uplink_data_placement: OutboundXhttpDataPlacement,
+    uplink_data_key: String,
+    max_each_post_bytes: (usize, usize),
+    min_posts_interval_ms: (usize, usize),
+    uplink_chunk_size: (usize, usize),
     xmux: Option<OutboundXhttpXmuxSettings>,
 }
 
@@ -285,7 +309,7 @@ pub(crate) fn prepare_vless_reverse_bridge(
             {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "VLESS Reverse Bridge XHTTP stream-up requires the tls feature",
+                    "VLESS Reverse Bridge XHTTP requires the tls feature",
                 ))
             }
         }
@@ -399,7 +423,7 @@ pub(crate) async fn connect_vless_reverse_bridge(
                     connect_tls_transport(raw_stream, &tls, &endpoint.server)
                         .await?;
                 Box::new(
-                    connect_xhttp_stream_up_h2(
+                    connect_xhttp_h2(
                         Box::new(base_stream),
                         &settings,
                         &endpoint.server,
@@ -413,7 +437,7 @@ pub(crate) async fn connect_vless_reverse_bridge(
                 let _ = (raw_stream, tls, settings);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "VLESS Reverse Bridge XHTTP stream-up requires the tls feature",
+                    "VLESS Reverse Bridge XHTTP requires the tls feature",
                 ));
             }
         }
@@ -853,7 +877,7 @@ async fn connect_planned_tcp_outbound(
                             return Err(error);
                         }
                     };
-                match connect_xhttp_stream_up_h2(
+                match connect_xhttp_h2(
                     base_stream,
                     &settings,
                     server,

@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_xhttp_non_stream_up_modes() {
+    fn plan_accepts_xhttp_packet_up_with_tls_h2() {
         let item: OutboundItem = serde_json::from_value(serde_json::json!({
             "tag": "reverse",
             "protocol": "vless",
@@ -326,18 +326,25 @@ mod tests {
             },
             "streamSettings": {
                 "network": "xhttp",
-                "security": "none",
+                "security": "tls",
+                "tlsSettings": {"serverName": "localhost"},
                 "xhttpSettings": {
                     "path": "/reverse-xhttp/",
-                    "mode": "packet-up"
+                    "mode": "packet-up",
+                    "scMaxEachPostBytes": {"from": 4096, "to": 8192},
+                    "scMinPostsIntervalMs": {"from": 0, "to": 0},
+                    "seqPlacement": "header",
+                    "uplinkDataPlacement": "cookie",
+                    "uplinkChunkSize": 2048
                 }
             }
         }))
-        .expect("parse unsupported XHTTP Reverse Bridge outbound");
-        let error = compile_static_outbound(&item).expect_err(
-            "packet-up must fail closed in the first XHTTP Reverse batch",
-        );
-        assert!(error.contains("only stream-up is supported"), "{error}");
+        .expect("parse packet-up XHTTP Reverse Bridge outbound");
+        let outbound = compile_static_outbound(&item)
+            .expect("compile packet-up XHTTP Reverse Bridge outbound");
+        let plans = prepare_reverse_bridge_plans(&[outbound])
+            .expect("packet-up XHTTP/TLS Reverse Bridge should be supported");
+        assert_eq!(plans.len(), 1);
     }
 
     #[cfg(feature = "ws")]

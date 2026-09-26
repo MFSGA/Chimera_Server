@@ -1057,6 +1057,117 @@ fn static_vless_reverse_xhttp_obfs_round_trips_config() {
 
 #[cfg(all(feature = "vless-reverse", feature = "tls"))]
 #[test]
+fn static_vless_reverse_xhttp_packet_up_round_trips_current_fields() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-xhttp-packet-up",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 443,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {"tag": "bridge-in"}
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {"serverName": "localhost"},
+            "xhttpSettings": {
+                "host": "portal.example.test",
+                "path": "/reverse?edge=1",
+                "mode": "packet-up",
+                "uplinkHTTPMethod": "GET",
+                "sessionIDPlacement": "query",
+                "sessionIDKey": "sid",
+                "seqPlacement": "header",
+                "seqKey": "X-Seq-Number",
+                "uplinkDataPlacement": "cookie",
+                "uplinkDataKey": "reverse_data",
+                "uplinkChunkSize": 128,
+                "scMaxEachPostBytes": {"from": 4096, "to": 8192},
+                "scMinPostsIntervalMs": {"from": -1, "to": -1}
+            }
+        }
+    }))
+    .expect("parse packet-up XHTTP Reverse Bridge outbound");
+
+    let outbound = compile_static_outbound(&item)
+        .expect("compile packet-up XHTTP Reverse Bridge outbound");
+    let transport = super::decode::decode_outbound_transport(&outbound)
+        .expect("decode packet-up XHTTP transport");
+    let OutboundTransport::Xhttp { settings, .. } = transport else {
+        panic!("expected XHTTP transport");
+    };
+    assert_eq!(settings.mode, OutboundXhttpMode::PacketUp);
+    assert_eq!(settings.uplink_http_method, "GET");
+    assert_eq!(settings.max_each_post_bytes, (4096, 8192));
+    assert_eq!(settings.min_posts_interval_ms, (0, 0));
+    assert_eq!(settings.uplink_chunk_size, (128, 128));
+    assert_eq!(
+        settings.session_placement,
+        OutboundXhttpSessionPlacement::Query("sid".to_string())
+    );
+    assert_eq!(
+        settings.seq_placement,
+        OutboundXhttpSessionPlacement::Header("X-Seq-Number".to_string())
+    );
+    assert_eq!(
+        settings.uplink_data_placement,
+        OutboundXhttpDataPlacement::Cookie
+    );
+    assert_eq!(settings.uplink_data_key, "reverse_data");
+}
+
+#[cfg(all(feature = "vless-reverse", feature = "tls"))]
+#[test]
+fn static_vless_reverse_xhttp_auto_uses_packet_up_and_matches_xray_validation() {
+    let mut value = serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-xhttp-auto",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 443,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {"tag": "bridge-in"}
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {"serverName": "localhost"},
+            "xhttpSettings": {
+                "host": "portal.example.test",
+                "path": "/reverse",
+                "mode": "auto"
+            }
+        }
+    });
+    let item: OutboundItem = serde_json::from_value(value.clone())
+        .expect("parse auto XHTTP Reverse Bridge");
+    let outbound =
+        compile_static_outbound(&item).expect("compile auto XHTTP Reverse Bridge");
+    let transport = super::decode::decode_outbound_transport(&outbound)
+        .expect("decode auto XHTTP transport");
+    let OutboundTransport::Xhttp { settings, .. } = transport else {
+        panic!("expected XHTTP transport");
+    };
+    assert_eq!(settings.mode, OutboundXhttpMode::Auto);
+    assert_eq!(
+        settings.uplink_data_placement,
+        OutboundXhttpDataPlacement::Body
+    );
+
+    value["streamSettings"]["xhttpSettings"]["uplinkDataPlacement"] =
+        serde_json::json!("header");
+    let item: OutboundItem = serde_json::from_value(value)
+        .expect("parse auto XHTTP with packet placement");
+    let error = compile_static_outbound(&item)
+        .expect_err("Xray only allows header/cookie payload placement in packet-up");
+    assert!(error.to_string().contains("explicit packet-up mode"));
+}
+
+#[cfg(all(feature = "vless-reverse", feature = "tls"))]
+#[test]
 fn static_vless_reverse_compiles_tcp_tls_sender_settings() {
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "vless",

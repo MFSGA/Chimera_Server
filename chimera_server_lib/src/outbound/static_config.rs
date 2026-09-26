@@ -215,6 +215,12 @@ struct StaticOutboundXhttpSettings {
     no_sse_header: bool,
     #[serde(default, rename = "uplinkHTTPMethod")]
     uplink_http_method: String,
+    #[serde(default)]
+    sc_max_each_post_bytes: Option<StaticOutboundXhttpRange>,
+    #[serde(default)]
+    sc_min_posts_interval_ms: Option<StaticOutboundXhttpRange>,
+    #[serde(default)]
+    uplink_chunk_size: Option<StaticOutboundXhttpRange>,
     #[serde(default, rename = "sessionIDPlacement", alias = "sessionPlacement")]
     session_id_placement: String,
     #[serde(default, rename = "sessionIDKey", alias = "sessionKey")]

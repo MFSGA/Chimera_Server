@@ -377,18 +377,21 @@ command `0x04` 编解码与显式 Reverse outcome，不直接维护全局 outbou
 `reverse.tag` 作为动态 outbound 能力，内网侧 tag 作为逻辑 inbound identity 进入现有 routing；TCP、
 UDP/XUDP、源地址、sniffing、断线恢复和关闭都必须经过现有 policy/traffic/lifecycle 边界。完整字段、
 模块、批次和互操作验收见 [VLESS Reverse 支持设计与实施计划](VLESS_REVERSE_DESIGN.md)。当前已完成
-Batch A–F 的 TCP 角色已经接通：配置/account/`0x04`/Reverse Mux wire/Portal registry/routing 与
-受监督 Chimera Bridge monitor 均已落地。固定 Xray-core `v26.9.9` 双向互操作已验证 Xray Bridge ->
-Chimera Portal 以及 Chimera Bridge -> Xray Portal 的 RAW VLESS/TCP 与 VLESS/TCP+TLS loopback echo；
-Bridge 还覆盖首次拨号失败后的 2 秒周期重试和 Portal 重启后的自动重连。当前声明仍限 TCP RAW/TLS；
-UDP/XUDP、sniffing、动态管理和更广 transport/security 矩阵尚未实现。
+Batch A–I 已落地：除 Portal/Bridge TCP roles 外，现有实现还包括 RAW Reverse UDP、Bridge sniffing、
+VLESS Reverse 动态用户管理与 XHTTP TLS/H2 `auto`（解析为 packet-up）、`stream-up`、`packet-up`。固定 Xray-core `v26.9.9`
+双向互操作覆盖 RAW/TLS TCP、RAW UDP、WebSocket（无 early data）以及 XHTTP `auto`、`stream-up`、`packet-up`；
+packet-up 用例还验证自定义 header sequence/data placement 与 payload chunking。Bridge 的失败重试、
+Portal 重启重连和 packet-up 本地 H2 字节流回环均有覆盖。Reverse 整体仍为部分兼容：H1/H3、
+`stream-one`、xmux、`downloadSettings`、WebSocket early data、HTTPUpgrade/gRPC/REALITY 及其他
+未列 transport/security 组合不能据此宣称支持；详见支持矩阵和实施记录。
 
 交付顺序进一步收缩为 Portal-first。第一阶段复用现有 DokodemoDoor 固定 TCP 目标和
 `inboundTag -> outboundTag` routing：公网 Chimera 暴露普通 TCP 端口，内网固定版本 Xray 主动建立
 VLESS Reverse Bridge，外部访问者不需要 Xray 客户端。该阶段仍必须实现 Xray-compatible command
 `0x04`、Mux TCP frame、Reverse 控制 session、worker picker 与生命周期，不能使用私有 tunnel wire。
-Batch F 已补齐 Chimera Bridge 的 TCP RAW/TLS 主动角色；UDP/XUDP、sniffing、动态映射和更广 transport
-矩阵仍后置。尚未实现的当前字段或组合必须明确报错，不能静默接受。此顺序不改变最终双角色兼容目标，
+Batch F 及后续切片已补齐 Chimera Bridge 的 RAW/TLS、WebSocket、XHTTP TLS/H2 主动角色、Reverse UDP、
+sniffing 与动态管理；H1/H3、`stream-one`、xmux、`downloadSettings` 和更广 transport 矩阵仍后置。
+尚未实现的当前字段或组合必须明确报错，不能静默接受。此顺序不改变最终双角色兼容目标，
 也不让 Reverse 绕过 routing 或 TUN。
 
 已选定的方向：单核心库内渐进分层；共用配置语义入口；计划与运行实体分离；管理器拥有生命周期；数据面仅接收必要能力；复用既有观测面。

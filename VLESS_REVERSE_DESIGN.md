@@ -1,7 +1,7 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–F 的 TCP RAW/TLS 角色已实现（Portal + Chimera Bridge 双向 Xray 互操作）；Batch G 的普通 Reverse UDP RAW 已完成双向固定 Xray 互操作；Batch H 已接入 Bridge outbound Reverse HTTP/TLS sniffing、routeOnly 与 domain/IP exclusions；Batch I 已接入 VLESS Reverse AddUser/RemoveUser 的热更新、首次 RVS 懒发布和删除撤销；XHTTP `stream-up` + TLS/H2 已完成双向固定 Xray 互操作，其他 transport/security 仍待完成
-- 更新日期：2026-09-23
+- 状态：Batch A–I 已实现；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
+- 更新日期：2026-09-26
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
 - 最新字段复核：Xray-core 官方 `main` 提交
@@ -436,7 +436,7 @@ Reverse 是 VLESS account/command 能力，物理连接继续使用 VLESS outbou
 | RAW/TLS | 第一阶段部署验收；Chimera 只需已有 inbound TLS，主动拨号由 Xray Bridge 完成 |
 | REALITY | Portal 侧可在现有 inbound 能力上追加验证；Chimera Bridge 方向后续单独验证 |
 | WebSocket | Chimera Bridge -> Xray Portal 已验证（无 early data） |
-| XHTTP `stream-up` + TLS/H2 | 已完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；已验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。client request-shape/config 回归另覆盖 session path/query/header/cookie、padding query/header/queryInHeader/cookie placement 与 repeat-x/tokenish 生成；显式非 `h2` ALPN 在 H1/H3 client 未实现前 fail closed；packet-up/stream-one/xmux/downloadSettings/H3 暂不声明 |
+| XHTTP `auto` / `stream-up` / `packet-up` + TLS/H2 | 三种配置 mode 均完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；当前 Xray TLS/H2 `auto` 在运行时选择 packet-up。显式 packet-up 另验证自定义 header 序号、header payload 分块与 `uplinkChunkSize`。既有 stream-up 用例验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。request-shape/config 回归覆盖 session path/query/header/cookie、seq/data header/cookie 与 padding placements；显式非 `h2` ALPN 在 H1/H3 client 未实现前 fail closed；`stream-one`、xmux、`downloadSettings`、H1/H3 暂不声明 |
 | HTTPUpgrade / gRPC | 按现有 feature 和 connector 能力分别验证 |
 | Vision | 独立 VLESS flow 能力，不因 Reverse 自动宣称支持 |
 | ML-KEM VLESS Encryption | 独立加密能力，不因当前字段存在而静默接受 |
@@ -535,11 +535,11 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 
 - 简化 VLESS outbound 现在会编译为 Reverse Bridge startup plan，并由现有 server `service_tasks` 启动受监督 monitor；仅有 Reverse outbound、没有 inbound 的进程也属于有效 server component。
 - monitor 对齐固定 Xray：启动前等待 2 秒，之后每 2 秒清理失效 worker；没有 ACTIVE worker 或 `active_connections / active_workers > 16` 时补一个 worker。拨号失败只记录安全的 outbound tag/error 并在下一 tick 重试。
-- 物理 worker 复用现有 VLESS account、DNS/TCP dial 与 transport client，发送无地址的 command `0x04` 并校验 VLESS response header；当前支持 RAW TCP、TLS、WebSocket（无 early data）以及 XHTTP `stream-up` + TLS/H2。XHTTP packet-up/stream-one/xmux/downloadSettings/H3 与 gRPC/REALITY 等未验证组合仍 fail closed。
+- 物理 worker 复用现有 VLESS account、DNS/TCP dial 与 transport client，发送无地址的 command `0x04` 并校验 VLESS response header；当前支持 RAW TCP、TLS、WebSocket（无 early data）以及 XHTTP `auto`/`stream-up`/`packet-up` + TLS/H2。packet-up 对齐当前字段 `seqPlacement`/`seqKey`、`uplinkDataPlacement`/`uplinkDataKey`、`uplinkChunkSize`、`scMaxEachPostBytes`、`scMinPostsIntervalMs`；TLS/H2 下 `auto` 选择 packet-up，header/cookie placement 和 GET 则要求显式 `packet-up`，遵循当前 Xray 配置校验。旧字段不作为兼容目标。`stream-one`/xmux/`downloadSettings`/H3 与 gRPC/REALITY 等未验证组合仍 fail closed。
 - Mux server worker 按 Xray NEW/KEEP/END 处理 TCP logical session，`reverse.tag` 作为逻辑 inbound identity 重新进入现有 routing；source/local metadata 会传播给 dispatcher。`udp://reverse:0` control session 对齐 ACTIVE/DRAIN 生命周期；普通 UDP packet session 已接入既有 targeted UDP routing，非零 GlobalID 的 XUDP 重附着仍显式 Unsupported。
 - worker/monitor 由 server lifecycle 持有；物理 EOF、非法 frame 或 owner shutdown 会关闭/摘除 worker。定向测试锁定 Xray 的整数平均扩容阈值、worker Drop 关闭物理流和 TCP roundtrip。
 - 固定 Xray-core `v26.9.9` Portal 的真实互操作已验证 RAW 与 TLS：测试会先让 Chimera 首次拨号失败再启动 Xray，确认周期重试；随后重启 Xray Portal，确认 Chimera 自动建立新 worker 并再次完成 DokodemoDoor loopback echo。
-- Batch F 后续扩展已额外验证 Chimera Bridge 到 Xray Portal 的 TCP WebSocket（无 early data），以及 XHTTP `stream-up` + TLS/H2 的双向角色互操作；XHTTP Bridge fixture 同样覆盖 Portal 重启后的 reconnect echo。RAW/TLS 仍保持双向验证。后续 Batch G 已增加 RAW Reverse UDP 双向互操作。
+- Batch F 后续扩展已额外验证 Chimera Bridge 到 Xray Portal 的 TCP WebSocket（无 early data），以及 XHTTP `stream-up` + TLS/H2 的双向角色互操作；XHTTP Bridge fixture 同样覆盖 Portal 重启后的 reconnect echo。当前切片新增 XHTTP TLS/H2 `auto`、显式 `packet-up` 双向真实互操作，并覆盖自定义 header 序号、header payload 分块；RAW/TLS 仍保持双向验证。后续 Batch G 已增加 RAW Reverse UDP 双向互操作。
 
 ### G. UDP/XUDP
 
