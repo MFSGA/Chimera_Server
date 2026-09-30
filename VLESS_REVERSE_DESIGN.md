@@ -1,7 +1,7 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–I 已实现；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
-- 更新日期：2026-09-26
+- 状态：Batch A–I 已实现，Batch J 收口进行中；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。RAW 双向互操作现额外锁定 256 KiB 连续回显、4 路并发 TCP session 和 Xray Mux `END` 的整会话关闭语义；Xray Bridge -> Chimera Portal 还验证错误 UUID 不会建立 Reverse worker 或拨号目标，listener 保持健康并可随后接受正确 Bridge。XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
+- 更新日期：2026-10-01
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
 - 最新字段复核：Xray-core 官方 `main` 提交
@@ -564,11 +564,14 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 动态语义除 gRPC/handler/registry 本地回归外，已增加真实 HandlerService 网络 fixture 与固定 Xray-core `v26.9.9` 对照：`AlterInbound(AddUser reverse)` -> 原生 VLESS command `0x04` -> lazy Reverse outbound 出现 -> `RemoveUser` -> route/user 撤销，两端均通过。共享 reverse tag 的多用户边界已覆盖：删除任一用户会撤掉共享 tag，幸存用户下一次 RVS 可重新懒建；动态 tag 与普通 outbound 冲突时首次 RVS 明确失败且不会替换该 outbound。固定 Xray `RemoveReverse` 对冲突 tag 无条件 `RemoveHandler` 的破坏性语义也已用 Chimera 本地回归锁定：此时 RemoveUser 会删除同 tag 的普通 outbound。
 - 可观测性已增加安全的结构化 Reverse lifecycle 日志：Bridge monitor 仅在 worker/session 状态变化时报告 tag、worker/active-session counts，dial 区分 initial/reconnect/scale 并携带 consecutive failure/recovery count；Portal attach/open 报告 tag、worker id、ACTIVE worker 与 Mux session count。logical connection/bytes 继续走既有 traffic/StatsService。VLESS HandlerService `GetInboundUsers` 现按 Xray 保留 `User.level`，包括动态 Reverse 用户。日志不记录 UUID、email、认证 payload、private key 或完整配置。
 
-### J. 真实互操作与文档收口
+### J. 真实互操作与文档收口（进行中）
 
 - 双向运行固定 Xray：Xray Bridge -> Chimera Portal、Chimera Bridge -> Xray Portal。
+- 2026-10-01 RAW 双向真实互操作新增 acceptance 覆盖：256 KiB 连续回显、4 路并发 TCP session，以及本地写侧结束后 Xray Mux `END` 关闭完整逻辑 session；该关闭语义与固定 Xray `common/mux` 一致，不按普通 TCP half-close 声明。
+- Xray Bridge -> Chimera Portal RAW 路径新增错误 UUID 负向阶段：错误凭据持续拨入时 Reverse route 不可用、目标端保持零新增字节、Chimera listener 继续运行；停止错误 Bridge 后，同一 listener 可由正确凭据建立 worker 并完成后续互通。
 - 更新 materialized examples、支持矩阵、配置文档和 ARCHITECTURE 实施状态。
 - 未验证组合保持 Partial/Missing，不因主路径通过改成完整支持。
+- Batch J 尚未据此标记完成：多物理 Reverse 线路的真实故障切换、错误 command 的真实网络负向覆盖，以及完整发布门槛仍需逐项核验。2026-10-01 用户决定这些额外真实网络测试暂缓，不作为当前代码迭代的阻塞项；后续准备做发布级兼容收口时再恢复执行，并在完成前继续维持 Partial 支持声明。
 
 ## 10. 测试与验证矩阵
 

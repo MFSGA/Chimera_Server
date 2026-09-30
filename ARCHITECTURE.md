@@ -380,8 +380,10 @@ UDP/XUDP、源地址、sniffing、断线恢复和关闭都必须经过现有 pol
 Batch A–I 已落地：除 Portal/Bridge TCP roles 外，现有实现还包括 RAW Reverse UDP、Bridge sniffing、
 VLESS Reverse 动态用户管理与 XHTTP TLS/H2 `auto`（解析为 packet-up）、`stream-up`、`packet-up`。固定 Xray-core `v26.9.9`
 双向互操作覆盖 RAW/TLS TCP、RAW UDP、WebSocket（无 early data）以及 XHTTP `auto`、`stream-up`、`packet-up`；
-packet-up 用例还验证自定义 header sequence/data placement 与 payload chunking。Bridge 的失败重试、
-Portal 重启重连和 packet-up 本地 H2 字节流回环均有覆盖。Reverse 整体仍为部分兼容：H1/H3、
+packet-up 用例还验证自定义 header sequence/data placement 与 payload chunking。2026-10-01 的 RAW acceptance
+又在两个角色方向锁定 256 KiB 连续回显、4 路并发 TCP session 与 Xray Mux `END` 的整会话关闭语义；
+Xray Bridge -> Chimera Portal 还验证错误 UUID 不建立可路由 worker、不拨号目标且 listener 可继续接受随后正确凭据。
+Bridge 的失败重试、Portal 重启重连和 packet-up 本地 H2 字节流回环均有覆盖。Reverse 整体仍为部分兼容：H1/H3、
 `stream-one`、xmux、`downloadSettings`、WebSocket early data、HTTPUpgrade/gRPC/REALITY 及其他
 未列 transport/security 组合不能据此宣称支持；详见支持矩阵和实施记录。
 
