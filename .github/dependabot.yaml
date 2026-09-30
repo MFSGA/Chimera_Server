@@ -2,18 +2,86 @@ version: 2
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
+    target-branch: master
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
     schedule:
-      interval: monthly
+      interval: weekly
     groups:
-      rust-dependencies:
+      async-runtime:
+        patterns:
+          - "tokio"
+          - "tokio-*"
+          - "bytes"
+          - "futures"
+        update-types:
+          - "minor"
+          - "patch"
+      http-stack:
+        patterns:
+          - "http"
+          - "http-body-util"
+          - "h2"
+          - "hyper"
+          - "hyper-*"
+          - "axum"
+          - "tower"
+        update-types:
+          - "minor"
+          - "patch"
+      tls-stack:
+        patterns:
+          - "rustls"
+          - "rustls-*"
+          - "tokio-rustls"
+          - "aws-lc-rs"
+          - "rcgen"
+        update-types:
+          - "minor"
+          - "patch"
+      grpc-stack:
+        patterns:
+          - "tonic"
+          - "tonic-*"
+          - "prost"
+          - "prost-*"
+          - "protoc-bin-vendored"
+        update-types:
+          - "minor"
+          - "patch"
+      routine:
         patterns:
           - "*"
+        exclude-patterns:
+          - "quinn"
+          - "quinn-proto"
+          - "h3"
+          - "h3-quinn"
+          - "boringtun"
+          - "tun"
+          - "x25519-dalek"
+          - "aes"
+          - "chacha20poly1305"
+          - "sha*"
+          - "blake*"
+          - "md-5"
+        update-types:
+          - "minor"
+          - "patch"
+
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: master
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
     schedule:
-      interval: monthly
+      interval: weekly
     groups:
       actions-dependencies:
         patterns:
           - "*"
-
+        update-types:
+          - "minor"
+          - "patch"
