@@ -33,10 +33,13 @@
           inherit system;
         };
 
+      workspaceVersion =
+        (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
       mkChimera = pkgs:
         pkgs.rustPlatform.buildRustPackage {
           pname = "chimera-server";
-          version = "0.3.2";
+          version = workspaceVersion;
 
           src = pkgs.lib.cleanSourceWith {
             src = ./.;

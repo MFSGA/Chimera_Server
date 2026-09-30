@@ -3,7 +3,7 @@ mod xhttp_support;
 use std::{
     fs::{self, File},
     io::{BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -24,6 +24,7 @@ use xhttp_support::{
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const REVERSE_READY_TIMEOUT: Duration = Duration::from_secs(12);
+const WRONG_TEST_UUID: &str = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
 
 #[derive(Clone, Copy)]
 enum ReverseSecurity {
@@ -1254,6 +1255,9 @@ fn run_chimera_bridge_interop(
         reconnect_payload.as_bytes(),
         &echoed_bytes,
     );
+    if matches!(security, ReverseSecurity::Raw) {
+        assert_reverse_tcp_acceptance(public_addr, &echoed_bytes);
+    }
 
     chimera.assert_running();
     xray.assert_running();
@@ -1277,6 +1281,7 @@ fn run_reverse_interop(security: ReverseSecurity) {
     let public_port = free_localhost_port();
     let chimera_config = work_dir.join("chimera.json");
     let xray_config = work_dir.join("xray.json");
+    let xray_bad_auth_config = work_dir.join("xray-bad-auth.json");
 
     let (chimera_stream, xray_stream) = match security {
         ReverseSecurity::Raw => (
@@ -1485,59 +1490,76 @@ fn run_reverse_interop(security: ReverseSecurity) {
         }),
     );
 
-    write_json(
-        &xray_config,
-        json!({
-            "log": {"loglevel": "debug"},
-            "outbounds": [
-                {
-                    "tag": "reverse-bridge",
-                    "protocol": "vless",
-                    "settings": {
-                        "address": "127.0.0.1",
-                        "port": reverse_port,
-                        "id": TEST_UUID,
-                        "encryption": "none",
-                        "reverse": {"tag": "bridge-in"}
-                    },
-                    "streamSettings": xray_stream
+    let xray_config_value = json!({
+        "log": {"loglevel": "debug"},
+        "outbounds": [
+            {
+                "tag": "reverse-bridge",
+                "protocol": "vless",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": reverse_port,
+                    "id": TEST_UUID,
+                    "encryption": "none",
+                    "reverse": {"tag": "bridge-in"}
                 },
-                {
-                    "tag": "direct",
-                    "protocol": "freedom",
-                    "settings": {
-                        // Current Xray applies a default private-IP block to
-                        // traffic originating from a VLESS inbound. The echo
-                        // target is intentionally loopback, so allow it
-                        // explicitly for this interoperability fixture.
-                        "finalRules": [{
-                            "action": "allow",
-                            "network": "tcp",
-                            "ip": ["127.0.0.0/8"]
-                        }]
-                    }
+                "streamSettings": xray_stream
+            },
+            {
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    // Current Xray applies a default private-IP block to
+                    // traffic originating from a VLESS inbound. The echo
+                    // target is intentionally loopback, so allow it
+                    // explicitly for this interoperability fixture.
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "ip": ["127.0.0.0/8"]
+                    }]
                 }
-            ],
-            "routing": {
-                "rules": [{
-                    "type": "field",
-                    "inboundTag": ["bridge-in"],
-                    "network": "tcp",
-                    "outboundTag": "direct"
-                }]
             }
-        }),
-    );
+        ],
+        "routing": {
+            "rules": [{
+                "type": "field",
+                "inboundTag": ["bridge-in"],
+                "network": "tcp",
+                "outboundTag": "direct"
+            }]
+        }
+    });
+    write_json(&xray_config, xray_config_value.clone());
+    if matches!(security, ReverseSecurity::Raw) {
+        let mut bad_auth = xray_config_value.clone();
+        bad_auth["outbounds"][0]["settings"]["id"] = json!(WRONG_TEST_UUID);
+        write_json(&xray_bad_auth_config, bad_auth);
+    }
 
     let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
     chimera.assert_running();
 
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    if matches!(security, ReverseSecurity::Raw) {
+        let before = echoed_bytes.load(Ordering::SeqCst);
+        let mut bad_xray = start_xray(&workspace, &work_dir, &xray_bad_auth_config);
+        std::thread::sleep(Duration::from_millis(2300));
+        bad_xray.assert_running();
+        assert_reverse_echo_unavailable(public_addr);
+        assert_eq!(
+            echoed_bytes.load(Ordering::SeqCst),
+            before,
+            "invalid Reverse authentication must not dial the target"
+        );
+        chimera.assert_running();
+        drop(bad_xray);
+    }
+
     let mut xray = start_xray(&workspace, &work_dir, &xray_config);
     xray.assert_running();
-
-    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
     assert_reverse_echo_with_retry(
         public_addr,
         format!(
@@ -1547,6 +1569,9 @@ fn run_reverse_interop(security: ReverseSecurity) {
         .as_bytes(),
         &echoed_bytes,
     );
+    if matches!(security, ReverseSecurity::Raw) {
+        assert_reverse_tcp_acceptance(public_addr, &echoed_bytes);
+    }
 
     chimera.assert_running();
     xray.assert_running();
@@ -1689,6 +1714,90 @@ fn assert_reverse_echo_with_retry(
     );
 }
 
+fn assert_reverse_echo_unavailable(public_addr: SocketAddr) {
+    let error = reverse_echo_once(public_addr, b"reverse-invalid-auth").expect_err(
+        "invalid Reverse authentication must leave the route unavailable",
+    );
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut
+        ),
+        "unexpected unavailable-route error: {error}"
+    );
+}
+
+fn assert_reverse_tcp_acceptance(
+    public_addr: SocketAddr,
+    echoed_bytes: &AtomicUsize,
+) {
+    let large_payload = (0..256 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    reverse_echo_once(public_addr, &large_payload)
+        .expect("Reverse RAW path must round-trip a 256 KiB payload");
+
+    let concurrent_payload_len = 32 * 1024;
+    let mut workers = Vec::new();
+    for worker_id in 0..4u8 {
+        workers.push(std::thread::spawn(move || {
+            let payload = vec![
+                worker_id.wrapping_mul(53).wrapping_add(17);
+                concurrent_payload_len
+            ];
+            reverse_echo_once(public_addr, &payload)
+        }));
+    }
+    for worker in workers {
+        worker
+            .join()
+            .expect("Reverse concurrent echo worker panicked")
+            .expect("Reverse RAW path must carry concurrent TCP sessions");
+    }
+
+    reverse_echo_then_shutdown(public_addr)
+        .expect("Reverse Mux END must close the complete logical TCP session");
+
+    let minimum_echoed = large_payload.len() + 4 * concurrent_payload_len;
+    assert!(
+        echoed_bytes.load(Ordering::SeqCst) >= minimum_echoed,
+        "Reverse target must observe the large and concurrent payloads"
+    );
+}
+
+fn reverse_echo_then_shutdown(public_addr: SocketAddr) -> std::io::Result<()> {
+    let payload = b"reverse-mux-end";
+    let mut stream = TcpStream::connect_timeout(&public_addr, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(payload)?;
+
+    let mut response = [0u8; 15];
+    stream.read_exact(&mut response)?;
+    if response != *payload {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Reverse shutdown echo payload mismatch",
+        ));
+    }
+
+    stream.shutdown(Shutdown::Write)?;
+    let mut trailing = [0u8; 1];
+    match stream.read(&mut trailing) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Reverse Mux END left the logical session readable",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 fn start_proxy_protocol_echo_server() -> (SocketAddr, Arc<Mutex<Option<SocketAddr>>>)
 {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1791,11 +1900,17 @@ fn start_observed_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {
                 let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
                 let mut buffer = [0u8; 4096];
-                if let Ok(length) = stream.read(&mut buffer)
-                    && length != 0
-                {
+                loop {
+                    let Ok(length) = stream.read(&mut buffer) else {
+                        break;
+                    };
+                    if length == 0 {
+                        break;
+                    }
                     received.fetch_add(length, Ordering::SeqCst);
-                    let _ = stream.write_all(&buffer[..length]);
+                    if stream.write_all(&buffer[..length]).is_err() {
+                        break;
+                    }
                 }
             });
         }
