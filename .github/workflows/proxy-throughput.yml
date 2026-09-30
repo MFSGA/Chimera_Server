@@ -6,8 +6,6 @@ on:
     paths:
       - "chimera_server_app/**"
       - "chimera_server_lib/src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
       - "bench/**"
       - ".github/actions/**"
       - ".github/workflows/proxy-throughput.yml"
@@ -33,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: ./.github/actions/rust-ci-setup
         with:
@@ -82,7 +80,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: proxy-throughput
           path: |
@@ -106,14 +104,14 @@ jobs:
     steps:
       - name: Download benchmark report
         continue-on-error: true
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: proxy-throughput
           path: target
 
       - name: Update PR comment
         continue-on-error: true
-        uses: actions/github-script@v9
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             const fs = require('fs');

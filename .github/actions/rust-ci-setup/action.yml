@@ -24,29 +24,29 @@ runs:
   steps:
     - name: Install Rust
       if: inputs.components == '' && inputs.target == ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
 
     - name: Install Rust with components
       if: inputs.components != '' && inputs.target == ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
       with:
         components: ${{ inputs.components }}
 
     - name: Install Rust with target
       if: inputs.components == '' && inputs.target != ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
       with:
         targets: ${{ inputs.target }}
 
     - name: Install Rust with components and target
       if: inputs.components != '' && inputs.target != ''
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
       with:
         components: ${{ inputs.components }}
         targets: ${{ inputs.target }}
 
     - name: Cache Rust build state
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       with:
         shared-key: ${{ inputs.cache-key }}
         cache-on-failure: true

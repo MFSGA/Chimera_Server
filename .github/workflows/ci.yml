@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: ./.github/actions/rust-ci-setup
         with:
@@ -52,7 +52,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: ./.github/actions/rust-ci-setup
         with:
@@ -60,6 +60,48 @@ jobs:
 
       - name: Workspace tests
         run: cargo test --workspace --all-features --locked
+
+  feature-matrix:
+    name: Feature compatibility (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            feature: ""
+          - name: minimal-vless
+            feature: minimal-vless
+          - name: minimal-vless-tls
+            feature: minimal-vless-tls
+          - name: vless-reverse
+            feature: vless-reverse
+          - name: vless-reverse-tls
+            feature: vless-reverse,tls
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: feature-${{ matrix.feature }}
+
+      - name: Check feature boundary
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FEATURE" ]; then
+            cargo check \
+              --package chimera_server_app \
+              --no-default-features \
+              --features "$FEATURE" \
+              --locked
+          else
+            cargo check \
+              --package chimera_server_app \
+              --locked
+          fi
 
   build:
     name: Build (${{ matrix.name }})
@@ -82,7 +124,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             tool: cargo
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - uses: ./.github/actions/rust-ci-setup
         with:

@@ -48,12 +48,12 @@ jobs:
       tag: ${{ steps.prepare.outputs.tag }}
       release_goal: ${{ steps.prepare.outputs.release_goal }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           token: ${{ github.token }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
 
       - name: Configure Git
         run: |
@@ -145,7 +145,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.candidate_commit }}
 
@@ -162,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.candidate_commit }}
 
@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.candidate_commit }}
 
@@ -220,7 +220,7 @@ jobs:
           (cd dist && sha256sum "chimera_server_app-${TAG}-linux-x86_64" > "chimera_server_app-${TAG}-linux-x86_64.sha256")
           (cd dist && sha256sum "chimera_server_app-${TAG}-linux-x86_64-musl" > "chimera_server_app-${TAG}-linux-x86_64-musl.sha256")
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-linux-${{ needs.prepare.outputs.tag }}
           path: dist/*
@@ -232,7 +232,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.candidate_commit }}
 
@@ -255,7 +255,7 @@ jobs:
           "$hash  chimera_server_app-$env:TAG-windows-x86_64.exe" |
             Out-File -Encoding ascii "$binary.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-windows-${{ needs.prepare.outputs.tag }}
           path: dist/*
@@ -269,7 +269,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.candidate_commit }}
@@ -280,7 +280,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: release-*-${{ needs.prepare.outputs.tag }}
           path: dist
@@ -346,7 +346,7 @@ jobs:
             "refs/tags/$TAG"
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: ${{ needs.prepare.outputs.tag }} — ${{ needs.prepare.outputs.release_goal }}
@@ -377,7 +377,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.base_commit }}
           token: ${{ github.token }}
