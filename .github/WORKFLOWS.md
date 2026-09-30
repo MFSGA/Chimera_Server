@@ -111,3 +111,50 @@ When changing workflow infrastructure:
 5. Prefer explicit job timeouts for network, benchmark, build, and release work.
 6. Keep platform tests independent so one operating system cannot hide another operating system's failure.
 7. Do not trigger `release.yml` merely to validate workflow edits; validate through ordinary CI and only dispatch a release when publication is explicitly requested.
+
+## Dependency update policy
+
+Dependency maintenance must preserve reproducibility and reviewability:
+
+- Do not perform unrelated dependency upgrades during feature or bug-fix changes.
+- Review dependency updates as behavior changes, including transitive changes that affect security, build reproducibility, or platform support.
+- Keep `Cargo.lock` changes limited to intentional dependency updates or release version changes.
+- Prefer updating dependencies through normal pull requests with CI coverage rather than changing versions directly in release workflows.
+- Document compatibility-impacting dependency changes in the relevant change notes.
+
+## Feature compatibility checks
+
+Workflow changes and new capabilities must keep compatibility boundaries explicit:
+
+- New protocol, transport, security, or platform capabilities require corresponding validation coverage before being described as supported.
+- CI configuration must not silently skip required compatibility checks through feature flags, conditional jobs, or missing matrix entries.
+- When a feature depends on optional Cargo features, verify the intended feature combination explicitly.
+- Keep unsupported combinations visible through diagnostics or documentation rather than silently accepting them.
+
+## Benchmark policy
+
+Benchmarks are engineering measurements, not release substitutes:
+
+- Benchmark changes must record the workload, binary versions, build mode, and environment assumptions.
+- Compare measurements only when the client, server, transport, and security settings are equivalent.
+- Avoid using benchmark results to justify compatibility claims unless correctness validation has also passed.
+- Keep benchmark artifacts and logs available for investigation of regressions.
+
+## GitHub Actions supply-chain policy
+
+Actions and workflow dependencies must be controlled:
+
+- Pin third-party GitHub Actions to reviewed versions or immutable references where practical.
+- Avoid executing unreviewed remote scripts from workflows.
+- Keep downloaded tools checksum-verified when they affect compatibility testing or releases.
+- Limit workflow permissions and secrets to the smallest scope required by each job.
+- Review changes to workflow dependencies with the same care as application dependencies.
+
+## Version source of truth
+
+Repository versioning must have one predictable source of truth:
+
+- Workspace package versions and release tags must remain synchronized through the release workflow.
+- Release automation calculates the next version from repository state rather than accepting arbitrary user-provided tags.
+- Manual workflow inputs select the release increment or goal, not the final published version string.
+- Development changes must not create stable release tags outside the documented release process.
