@@ -1900,10 +1900,7 @@ fn start_observed_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {
                 let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
                 let mut buffer = [0u8; 4096];
-                loop {
-                    let Ok(length) = stream.read(&mut buffer) else {
-                        break;
-                    };
+                while let Ok(length) = stream.read(&mut buffer) {
                     if length == 0 {
                         break;
                     }
