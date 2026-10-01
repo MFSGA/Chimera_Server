@@ -32,7 +32,7 @@ use super::OutboundGrpcClientSettings;
 use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
-    beginning::grpc_transport::{
+    transport::grpc::{
         decode_grpc_message_payloads, encode_grpc_message, grpc_service_paths,
     },
 };

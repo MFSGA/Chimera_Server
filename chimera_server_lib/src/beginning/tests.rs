@@ -24,7 +24,7 @@ use crate::{
 use crate::transport::tcp::{
     ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
     ACCEPT_ERROR_MIN_FAILURES, ACCEPT_ERROR_UNHEALTHY_AFTER, AcceptErrorDisposition,
-    build_proxy_protocol_header, tcp_server_connection_context,
+    TcpAcceptHealth, build_proxy_protocol_header, tcp_server_connection_context,
 };
 use crate::{
     address::{Address, BindLocation, NetLocation},
@@ -119,9 +119,10 @@ async fn quic_endpoint_driver_loss_reaches_inbound_health() {
     )
     .expect("construct endpoint with controlled failing socket");
     let task = tokio::spawn(async move {
-        let error = accept_quic_with_health(&endpoint, "test-quic")
-            .await
-            .expect_err("driver loss must end QUIC accept");
+        let error =
+            crate::transport::accept_quic_with_health(&endpoint, "test-quic")
+                .await
+                .expect_err("driver loss must end QUIC accept");
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     });
     runtime.register_inbound_tasks("quic-driver-loss", vec![task]);

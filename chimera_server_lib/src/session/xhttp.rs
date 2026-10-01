@@ -22,16 +22,16 @@ use crate::{
     runtime::DataPlaneRuntime,
 };
 
-use super::XHTTP_PIPE_CAPACITY;
+pub(crate) const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SessionTtlSnapshot {
-    pub(super) is_current: bool,
-    pub(super) fully_connected: bool,
+pub(crate) struct SessionTtlSnapshot {
+    pub(crate) is_current: bool,
+    pub(crate) fully_connected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionTtlPlan {
+pub(crate) enum SessionTtlPlan {
     Keep,
     RemoveAndClose,
 }
@@ -43,7 +43,7 @@ fn same_xhttp_session(
     current.is_some_and(|current| Arc::ptr_eq(current, candidate))
 }
 
-pub(super) fn plan_session_ttl(snapshot: SessionTtlSnapshot) -> SessionTtlPlan {
+pub(crate) fn plan_session_ttl(snapshot: SessionTtlSnapshot) -> SessionTtlPlan {
     if snapshot.is_current && !snapshot.fully_connected {
         SessionTtlPlan::RemoveAndClose
     } else {
@@ -52,16 +52,16 @@ pub(super) fn plan_session_ttl(snapshot: SessionTtlSnapshot) -> SessionTtlPlan {
 }
 
 #[derive(Clone)]
-pub(super) struct SessionStore {
-    pub(super) inner: Arc<RwLock<HashMap<String, Arc<XhttpSession>>>>,
+pub(crate) struct SessionStore {
+    pub(crate) inner: Arc<RwLock<HashMap<String, Arc<XhttpSession>>>>,
     ttl: Duration,
-    pub(super) max_buffered_posts: usize,
+    pub(crate) max_buffered_posts: usize,
     shutdown: CancellationToken,
     runtime: DataPlaneRuntime,
 }
 
 impl SessionStore {
-    pub(super) fn new(
+    pub(crate) fn new(
         ttl: Duration,
         max_buffered_posts: usize,
         shutdown: CancellationToken,
@@ -76,7 +76,7 @@ impl SessionStore {
         }
     }
 
-    pub(super) fn get_or_create(&self, session_id: &str) -> Arc<XhttpSession> {
+    pub(crate) fn get_or_create(&self, session_id: &str) -> Arc<XhttpSession> {
         if let Some(existing) = self.inner.read().unwrap().get(session_id) {
             return existing.clone();
         }
@@ -96,7 +96,7 @@ impl SessionStore {
     }
 
     #[cfg(test)]
-    pub(super) fn remove(&self, session_id: &str) {
+    pub(crate) fn remove(&self, session_id: &str) {
         self.inner.write().unwrap().remove(session_id);
     }
 
@@ -151,10 +151,10 @@ impl SessionStore {
     }
 }
 
-pub(super) struct SessionCleanupGuard {
-    pub(super) sessions: SessionStore,
-    pub(super) session_id: String,
-    pub(super) session: Arc<XhttpSession>,
+pub(crate) struct SessionCleanupGuard {
+    pub(crate) sessions: SessionStore,
+    pub(crate) session_id: String,
+    pub(crate) session: Arc<XhttpSession>,
 }
 
 impl Drop for SessionCleanupGuard {
@@ -165,13 +165,13 @@ impl Drop for SessionCleanupGuard {
     }
 }
 
-pub(super) struct IncomingBodyReader<B> {
+pub(crate) struct IncomingBodyReader<B> {
     body: B,
     current: Bytes,
 }
 
 impl<B> IncomingBodyReader<B> {
-    pub(super) fn new(body: B) -> Self {
+    pub(crate) fn new(body: B) -> Self {
         Self {
             body,
             current: Bytes::new(),
@@ -219,15 +219,15 @@ enum UploadPacket {
     Payload { seq: u64, data: Bytes },
 }
 
-pub(super) struct UploadQueueSender {
+pub(crate) struct UploadQueueSender {
     sender: mpsc::Sender<UploadPacket>,
-    pub(super) reader_claimed: AtomicBool,
+    pub(crate) reader_claimed: AtomicBool,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
-    pub(super) closed: Arc<AtomicBool>,
+    pub(crate) closed: Arc<AtomicBool>,
 }
 
 impl UploadQueueSender {
-    pub(super) async fn push_reader(
+    pub(crate) async fn push_reader(
         &self,
         reader: BoxedUploadReader,
     ) -> std::io::Result<()> {
@@ -252,7 +252,7 @@ impl UploadQueueSender {
         Ok(())
     }
 
-    pub(super) async fn push_payload(
+    pub(crate) async fn push_payload(
         &self,
         seq: u64,
         data: Bytes,
@@ -272,22 +272,22 @@ impl UploadQueueSender {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct UploadReassemblySnapshot {
-    pub(super) has_current_payload: bool,
-    pub(super) has_next_buffered_payload: bool,
-    pub(super) buffered_packets: usize,
-    pub(super) max_buffered_posts: usize,
+pub(crate) struct UploadReassemblySnapshot {
+    pub(crate) has_current_payload: bool,
+    pub(crate) has_next_buffered_payload: bool,
+    pub(crate) buffered_packets: usize,
+    pub(crate) max_buffered_posts: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UploadReassemblyPlan {
+pub(crate) enum UploadReassemblyPlan {
     ConsumeCurrent,
     PromoteBuffered,
     RejectTooLarge,
     PollReceiver,
 }
 
-pub(super) fn plan_upload_reassembly(
+pub(crate) fn plan_upload_reassembly(
     snapshot: UploadReassemblySnapshot,
 ) -> UploadReassemblyPlan {
     if snapshot.has_current_payload {
@@ -302,12 +302,12 @@ pub(super) fn plan_upload_reassembly(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UploadPayloadPlan {
+pub(crate) enum UploadPayloadPlan {
     Buffer,
     DropStale,
 }
 
-pub(super) fn plan_upload_payload(
+pub(crate) fn plan_upload_payload(
     next_seq: u64,
     incoming_seq: u64,
 ) -> UploadPayloadPlan {
@@ -318,19 +318,19 @@ pub(super) fn plan_upload_payload(
     }
 }
 
-pub(super) struct XhttpUploadReader {
+pub(crate) struct XhttpUploadReader {
     receiver: mpsc::Receiver<UploadPacket>,
     reader: Arc<StdMutex<Option<BoxedUploadReader>>>,
-    pub(super) closed: Arc<AtomicBool>,
+    pub(crate) closed: Arc<AtomicBool>,
     current_payload: Option<Bytes>,
     buffered: BTreeMap<u64, VecDeque<Bytes>>,
-    pub(super) buffered_packets: usize,
+    pub(crate) buffered_packets: usize,
     next_seq: u64,
-    pub(super) max_buffered_posts: usize,
+    pub(crate) max_buffered_posts: usize,
 }
 
 impl XhttpUploadReader {
-    pub(super) fn new(max_buffered_posts: usize) -> (UploadQueueSender, Self) {
+    pub(crate) fn new(max_buffered_posts: usize) -> (UploadQueueSender, Self) {
         let (sender, receiver) = mpsc::channel(max_buffered_posts);
         let reader = Arc::new(StdMutex::new(None));
         let closed = Arc::new(AtomicBool::new(false));
@@ -457,8 +457,8 @@ impl AsyncRead for XhttpUploadReader {
     }
 }
 
-pub(super) struct SharedUploadReader {
-    pub(super) inner: Arc<StdMutex<XhttpUploadReader>>,
+pub(crate) struct SharedUploadReader {
+    pub(crate) inner: Arc<StdMutex<XhttpUploadReader>>,
 }
 
 impl AsyncRead for SharedUploadReader {
@@ -475,15 +475,15 @@ impl AsyncRead for SharedUploadReader {
     }
 }
 
-pub(super) struct XhttpSession {
-    pub(super) upload_queue: UploadQueueSender,
-    pub(super) upload_reader: Arc<StdMutex<XhttpUploadReader>>,
-    pub(super) fully_connected: AtomicBool,
-    pub(super) closed: CancellationToken,
+pub(crate) struct XhttpSession {
+    pub(crate) upload_queue: UploadQueueSender,
+    pub(crate) upload_reader: Arc<StdMutex<XhttpUploadReader>>,
+    pub(crate) fully_connected: AtomicBool,
+    pub(crate) closed: CancellationToken,
 }
 
 impl XhttpSession {
-    pub(super) fn new(max_buffered_posts: usize) -> Self {
+    pub(crate) fn new(max_buffered_posts: usize) -> Self {
         let (upload_queue, upload_reader) =
             XhttpUploadReader::new(max_buffered_posts);
 
@@ -495,7 +495,7 @@ impl XhttpSession {
         }
     }
 
-    pub(super) fn new_downlink_connection(
+    pub(crate) fn new_downlink_connection(
         &self,
     ) -> (XhttpLogicalStream, DuplexStream) {
         // Xray v26.2.6 creates a fresh logical inbound connection for every
@@ -510,7 +510,7 @@ impl XhttpSession {
         )
     }
 
-    pub(super) fn close_upload_queue(&self) {
+    pub(crate) fn close_upload_queue(&self) {
         self.closed.cancel();
         let mut reader = self
             .upload_reader
@@ -526,13 +526,13 @@ impl XhttpSession {
     }
 }
 
-pub(super) struct XhttpLogicalStream {
+pub(crate) struct XhttpLogicalStream {
     reader: BoxedUploadReader,
     writer: DuplexStream,
 }
 
 impl XhttpLogicalStream {
-    pub(super) fn new<R>(reader: R, writer: DuplexStream) -> Self
+    pub(crate) fn new<R>(reader: R, writer: DuplexStream) -> Self
     where
         R: AsyncRead + Send + 'static,
     {

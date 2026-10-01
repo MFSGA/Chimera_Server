@@ -5,12 +5,8 @@ use tokio::{io::AsyncWriteExt, time::timeout};
 use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
-    beginning::{
-        build_proxy_protocol_header, copy_bidirectional,
-        copy_bidirectional_with_timeouts,
-        udp::{
-            run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
-        },
+    beginning::udp::{
+        run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
     },
     config::server_config::InboundSniffingConfig,
     handler::{
@@ -24,13 +20,16 @@ use crate::{
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     resolver::Resolver,
     runtime::DataPlaneRuntime,
-    session::sniff::{
-        SniffedRoutePlan, build_sniffed_route_plan, sniff_stream_protocol,
+    session::{
+        policy_stream::copy_bidirectional_with_timeouts,
+        sniff::{SniffedRoutePlan, build_sniffed_route_plan, sniff_stream_protocol},
+        tcp_relay::copy_bidirectional,
     },
     traffic::{
         MeteredStream, TrafficContext, TrafficDirection, record_transfer,
         register_connection,
     },
+    transport::tcp::build_proxy_protocol_header,
     util::prefixed_stream::PrefixedStream,
 };
 

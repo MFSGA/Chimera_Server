@@ -183,6 +183,7 @@ impl RuntimeState {
             routing_publication: Arc::new(RwLock::new(Arc::new(
                 RoutingPublication::new(routing, outbounds),
             ))),
+            #[cfg(feature = "vless-reverse")]
             routing_updates: routing_updates.clone(),
             policy: Arc::new(RwLock::new(PolicyConfig::default())),
             resolver,
@@ -441,6 +442,16 @@ impl RuntimeState {
         self.data_plane.0.inbound_manager.config_by_tag(tag)
     }
 
+    /// Legacy low-level mutation facade.
+    ///
+    /// This only mutates the stored configuration view and does not run the
+    /// transactional inbound lifecycle used by startup and the management API.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "low-level inbound mutation bypasses transactional listener lifecycle; prefer configured startup or the management API"
+        )
+    )]
     pub fn with_inbound_mut<R, F>(&self, tag: &str, mutator: F) -> Option<R>
     where
         F: FnOnce(&mut ServerConfig) -> R,
@@ -451,14 +462,45 @@ impl RuntimeState {
             .with_config_mut(tag, mutator)
     }
 
+    /// Legacy low-level mutation facade.
+    ///
+    /// This removes the stored instance directly instead of executing the
+    /// generation-aware remove transaction used by the management API.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "low-level inbound removal bypasses the generation-aware lifecycle transaction; prefer the management API"
+        )
+    )]
     pub fn remove_inbound(&self, tag: &str) -> Option<ServerConfig> {
         self.data_plane.0.inbound_manager.remove_config(tag)
     }
 
+    /// Legacy low-level mutation facade.
+    ///
+    /// This publishes configuration state without binding the listener or
+    /// performing the rollback transaction required for a running inbound.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "low-level inbound addition does not start or transactionally publish a listener; prefer configured startup or the management API"
+        )
+    )]
     pub fn add_inbound(&self, inbound: ServerConfig) -> Result<(), String> {
         self.data_plane.0.inbound_manager.add_config(inbound)
     }
 
+    /// Legacy task-registration facade retained for compatibility.
+    ///
+    /// Normal listener tasks are owned and published by InboundManager
+    /// transactions; external callers should not assemble that ownership
+    /// relationship manually.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "manual inbound task registration bypasses InboundManager ownership; prefer configured startup or the management API"
+        )
+    )]
     pub fn register_inbound_tasks(&self, tag: &str, handles: Vec<JoinHandle<()>>) {
         self.data_plane
             .0
@@ -466,6 +508,16 @@ impl RuntimeState {
             .register_tasks(tag, handles);
     }
 
+    /// Legacy task-control facade retained for compatibility.
+    ///
+    /// Stopping only the registered task handles is not equivalent to the
+    /// generation-aware inbound removal transaction.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "stopping task handles directly bypasses the inbound removal transaction; prefer the management API"
+        )
+    )]
     pub async fn stop_inbound_tasks(&self, tag: &str) -> bool {
         self.data_plane.0.inbound_manager.stop_tasks(tag).await
     }

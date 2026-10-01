@@ -42,37 +42,39 @@ use crate::{
     resolver::Resolver,
     runtime::DataPlaneRuntime,
     session::dispatcher::process_stream_with_sniffing_and_local_addr,
+    transport::tcp::{
+        TcpAcceptHealth, accept_tcp_with_health, apply_tcp_socket_policy,
+        create_tcp_listener,
+    },
 };
 #[cfg(feature = "tls")]
 use crate::{
     config::server_config::TcpSocketPolicy, handler::tls::build_server_config,
 };
 
-use super::transport_plan::{ListenerSecurityPlan, XhttpListenerPlan};
+use crate::transport::{ListenerSecurityPlan, XhttpListenerPlan};
 
 #[cfg(feature = "tls")]
 mod h3_transport;
 mod request;
 mod response;
-mod session;
 
 #[cfg(feature = "tls")]
 use h3_transport::*;
 
-use request::*;
-pub(crate) use request::{generate_padding, random_xray_range};
-use response::*;
-use session::{
-    IncomingBodyReader, SessionCleanupGuard, SessionStore, XhttpLogicalStream,
+use crate::session::xhttp::{
+    IncomingBodyReader, SessionCleanupGuard, SessionStore, XHTTP_PIPE_CAPACITY,
+    XhttpLogicalStream,
 };
 #[cfg(test)]
-use session::{
+use crate::session::xhttp::{
     SessionTtlPlan, SessionTtlSnapshot, SharedUploadReader, UploadPayloadPlan,
     UploadReassemblyPlan, UploadReassemblySnapshot, XhttpSession, XhttpUploadReader,
     plan_session_ttl, plan_upload_payload, plan_upload_reassembly,
 };
-
-const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
+use request::*;
+pub(crate) use request::{generate_padding, random_xray_range};
+use response::*;
 const XHTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
 type ResponseBody = UnsyncBoxBody<Bytes, Infallible>;
@@ -139,13 +141,13 @@ pub async fn start_xhttp_server(
     }
 
     let listener =
-        super::create_tcp_listener(bind_addr, tcp_socket_policy.as_ref()).await?;
+        create_tcp_listener(bind_addr, tcp_socket_policy.as_ref()).await?;
     let security = listener_config.security.clone();
 
     let handle = tokio::spawn(async move {
-        let mut accept_health = super::TcpAcceptHealth::default();
+        let mut accept_health = TcpAcceptHealth::default();
         loop {
-            let (stream, peer_addr) = match super::accept_tcp_with_health(
+            let (stream, peer_addr) = match accept_tcp_with_health(
                 &listener,
                 &mut accept_health,
                 "xhttp_tcp",
@@ -160,9 +162,8 @@ pub async fn start_xhttp_server(
             };
             let _ = stream.set_nodelay(true);
             if let Some(policy) = tcp_socket_policy.as_ref()
-                && let Err(err) = super::apply_tcp_socket_policy(
-                    &stream, bind_addr, peer_addr, policy,
-                )
+                && let Err(err) =
+                    apply_tcp_socket_policy(&stream, bind_addr, peer_addr, policy)
             {
                 error!("xhttp TCP socket policy for {} failed: {}", peer_addr, err);
                 continue;

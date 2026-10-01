@@ -195,7 +195,7 @@ pub async fn run_hysteria2_server(
 
         let join_handle = tokio::spawn(async move {
             loop {
-                let incoming = match crate::beginning::accept_quic_with_health(
+                let incoming = match crate::transport::accept_quic_with_health(
                     &endpoint,
                     "hysteria2",
                 )

@@ -31,9 +31,14 @@ use crate::{
     },
     resolver::Resolver,
     runtime::DataPlaneRuntime,
+    transport::{
+        GrpcListenerPlan, ListenerSecurityPlan,
+        tcp::{
+            TcpAcceptHealth, accept_tcp_with_health, apply_tcp_socket_policy,
+            create_tcp_listener,
+        },
+    },
 };
-
-use super::transport_plan::{GrpcListenerPlan, ListenerSecurityPlan};
 
 const GRPC_MAX_HEADER_LIST_BYTES: u32 = 16 * 1024 * 1024;
 const GRPC_CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -190,7 +195,7 @@ enum GrpcSecurity {
     Reality(crate::config::server_config::RealityTransportConfig),
 }
 
-pub(super) async fn start_grpc_server(
+pub(crate) async fn start_grpc_server(
     config: ServerConfig,
     runtime: DataPlaneRuntime,
     plan: GrpcListenerPlan,
@@ -219,7 +224,7 @@ pub(super) async fn start_grpc_server(
         BindLocation::Address(location) => location.to_socket_addr()?,
     };
     let listener =
-        super::create_tcp_listener(listen_addr, tcp_socket_policy.as_ref()).await?;
+        create_tcp_listener(listen_addr, tcp_socket_policy.as_ref()).await?;
     info!(
         service = %grpc_config.service_name,
         multi_mode = grpc_config.multi_mode,
@@ -230,9 +235,9 @@ pub(super) async fn start_grpc_server(
         grpc_service_paths(&grpc_config.service_name);
 
     let handle = tokio::spawn(async move {
-        let mut accept_health = super::TcpAcceptHealth::default();
+        let mut accept_health = TcpAcceptHealth::default();
         loop {
-            let (stream, peer_addr) = match super::accept_tcp_with_health(
+            let (stream, peer_addr) = match accept_tcp_with_health(
                 &listener,
                 &mut accept_health,
                 "grpc_transport",
@@ -246,12 +251,8 @@ pub(super) async fn start_grpc_server(
                 }
             };
             if let Some(policy) = tcp_socket_policy.as_ref()
-                && let Err(error) = super::apply_tcp_socket_policy(
-                    &stream,
-                    listen_addr,
-                    peer_addr,
-                    policy,
-                )
+                && let Err(error) =
+                    apply_tcp_socket_policy(&stream, listen_addr, peer_addr, policy)
             {
                 error!(
                     "gRPC transport TCP socket policy for {peer_addr} failed: {error}"

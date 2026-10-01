@@ -37,8 +37,8 @@ use super::{
 use crate::{
     address::{Address, NetLocation},
     async_stream::{AsyncPing, AsyncStream},
-    beginning::{generate_padding, random_xray_range},
     config::server_config::XhttpPaddingPlacement,
+    transport::xhttp::{generate_padding, random_xray_range},
 };
 
 const XHTTP_PIPE_CAPACITY: usize = 64 * 1024;
@@ -499,7 +499,7 @@ async fn run_xhttp_packet_uplink(
     authority: &str,
     session_id: &str,
 ) -> io::Result<()> {
-    let max_each_post_bytes = crate::beginning::random_xray_range(
+    let max_each_post_bytes = random_xray_range(
         settings.max_each_post_bytes.0,
         settings.max_each_post_bytes.1,
     );
@@ -515,11 +515,10 @@ async fn run_xhttp_packet_uplink(
         }
 
         if settings.min_posts_interval_ms.0 > 0 {
-            let minimum =
-                Duration::from_millis(crate::beginning::random_xray_range(
-                    settings.min_posts_interval_ms.0,
-                    settings.min_posts_interval_ms.1,
-                ) as u64);
+            let minimum = Duration::from_millis(random_xray_range(
+                settings.min_posts_interval_ms.0,
+                settings.min_posts_interval_ms.1,
+            ) as u64);
             if let Some(last_write) = last_write {
                 let elapsed = last_write.elapsed();
                 if elapsed < minimum {
@@ -806,8 +805,7 @@ fn xhttp_payload_chunks(
         if offset >= encoded.len() {
             return None;
         }
-        let size =
-            crate::beginning::random_xray_range(chunk_size.0, chunk_size.1).max(1);
+        let size = random_xray_range(chunk_size.0, chunk_size.1).max(1);
         let end = (offset + size).min(encoded.len());
         let chunk = &encoded[offset..end];
         offset = end;

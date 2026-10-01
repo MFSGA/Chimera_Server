@@ -10,7 +10,7 @@ use crate::config::server_config::TlsServerConfig;
 /// Security selected for a listener transport after the recursive compatibility
 /// config has been classified once at the server boundary.
 #[derive(Debug, Clone)]
-pub(super) enum ListenerSecurityPlan {
+pub(crate) enum ListenerSecurityPlan {
     None,
     #[cfg(feature = "tls")]
     Tls(TlsServerConfig),
@@ -20,21 +20,21 @@ pub(super) enum ListenerSecurityPlan {
 
 #[cfg(feature = "grpc_transport")]
 #[derive(Debug, Clone)]
-pub(super) struct GrpcListenerPlan {
+pub(crate) struct GrpcListenerPlan {
     pub config: GrpcServerConfig,
     pub protocol: ServerProxyConfig,
     pub security: ListenerSecurityPlan,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct XhttpListenerPlan {
+pub(crate) struct XhttpListenerPlan {
     pub config: XhttpServerConfig,
     pub protocol: ServerProxyConfig,
     pub security: ListenerSecurityPlan,
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum InboundListenerPlan {
+pub(crate) enum InboundListenerPlan {
     Stream,
     #[cfg(feature = "grpc_transport")]
     Grpc(Box<GrpcListenerPlan>),
@@ -47,7 +47,7 @@ pub(super) enum InboundListenerPlan {
 /// builders retain `ServerProxyConfig` wrappers for compatibility during the
 /// migration, but runtime startup must not recursively rediscover that choice
 /// in multiple transport modules.
-pub(super) fn compile_listener_plan(
+pub(crate) fn compile_listener_plan(
     protocol: &ServerProxyConfig,
 ) -> InboundListenerPlan {
     match protocol {

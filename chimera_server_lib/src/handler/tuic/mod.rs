@@ -224,7 +224,7 @@ pub async fn run_tuic_server(
             .map_err(std::io::Error::other)?;
 
             loop {
-                let conn = match crate::beginning::accept_quic_with_health(
+                let conn = match crate::transport::accept_quic_with_health(
                     &endpoint, "tuic",
                 )
                 .await

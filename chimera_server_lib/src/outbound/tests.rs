@@ -38,12 +38,10 @@ use super::routing::{
     apply_routing_metadata, connection_routing_input, select_direct_outbound,
 };
 use super::*;
-#[cfg(feature = "grpc_transport")]
-use crate::beginning::grpc_transport::{
-    decode_grpc_message_payloads, encode_grpc_message,
-};
 #[cfg(feature = "ws")]
 use crate::handler::ws::WebsocketStream;
+#[cfg(feature = "grpc_transport")]
+use crate::transport::grpc::{decode_grpc_message_payloads, encode_grpc_message};
 #[cfg(feature = "ws")]
 use crate::util::prefixed_stream::PrefixedStream;
 use crate::{
@@ -4119,7 +4117,7 @@ async fn freedom_tcp_outbound_writes_configured_proxy_protocol_v1_and_v2() {
             .expect("write freedom payload");
 
         let (mut accepted, _) = listener.accept().await.expect("accept dial");
-        let mut expected = crate::beginning::build_proxy_protocol_header(
+        let mut expected = crate::transport::tcp::build_proxy_protocol_header(
             version as u8,
             source,
             Some(target_addr),

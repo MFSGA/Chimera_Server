@@ -1,12 +1,10 @@
 use super::*;
 #[cfg(any(feature = "ws", feature = "httpupgrade", feature = "reality"))]
 use crate::async_stream::AsyncStream;
-#[cfg(feature = "grpc_transport")]
-use crate::beginning::grpc_transport::{
-    decode_grpc_message_payloads, encode_grpc_message,
-};
 #[cfg(feature = "ws")]
 use crate::handler::ws::WebsocketStream;
+#[cfg(feature = "grpc_transport")]
+use crate::transport::grpc::{decode_grpc_message_payloads, encode_grpc_message};
 use crate::{
     config::{
         def::OutboundItem,

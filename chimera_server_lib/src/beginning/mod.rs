@@ -1,6 +1,5 @@
 use quic::start_quic_server;
 use tokio::task::JoinHandle;
-use tracing::error;
 use udp::start_udp_server;
 
 use crate::{
@@ -12,55 +11,11 @@ use crate::{
     traffic::register_identity,
 };
 
-/// Wait for the next QUIC connection attempt and surface endpoint-driver loss as
-/// a listener failure. Quinn 0.11 reports UDP socket I/O failure by terminating
-/// its internal endpoint driver; `Endpoint::accept()` then yields `None`, the
-/// same value used for an explicitly closed endpoint. Chimera does not close
-/// these endpoints directly during normal inbound stop (the owning listener
-/// task is aborted instead), so a naturally completed accept is unexpected and
-/// must terminate the listener task for generation-aware health propagation.
-#[allow(dead_code)] // Used by HTTP/3 and QUIC listener variants when enabled.
-pub(crate) async fn accept_quic_with_health(
-    endpoint: &quinn::Endpoint,
-    listener_kind: &'static str,
-) -> std::io::Result<quinn::Incoming> {
-    match endpoint.accept().await {
-        Some(incoming) => Ok(incoming),
-        None => {
-            let error = std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                format!("{listener_kind} QUIC endpoint stopped accepting"),
-            );
-            error!(
-                listener_kind,
-                %error,
-                "QUIC endpoint stopped unexpectedly; stopping listener task"
-            );
-            Err(error)
-        }
-    }
-}
-
-#[cfg(feature = "grpc_transport")]
-pub(crate) mod grpc_transport;
 #[allow(dead_code)]
 // mKCP's demux/runtime slice is retained for the next transport integration.
 mod mkcp;
-mod policy_stream;
 mod quic;
-mod tcp_relay;
-
-pub(crate) use policy_stream::copy_bidirectional_with_timeouts;
-pub(crate) use tcp_relay::copy_bidirectional;
-mod transport_plan;
 pub(crate) mod udp;
-mod xhttp;
-pub(crate) use xhttp::{generate_padding, random_xray_range};
-
-pub(crate) use crate::transport::tcp::{
-    TcpAcceptHealth, accept_tcp_with_health, apply_tcp_socket_policy,
-    build_proxy_protocol_header, create_tcp_listener,
-};
 
 struct StartingTasks {
     handles: Vec<JoinHandle<()>>,
@@ -152,15 +107,21 @@ async fn start_server_tasks(
             .await
             .map(|handle| vec![handle]);
     }
-    match transport_plan::compile_listener_plan(&config.protocol) {
-        transport_plan::InboundListenerPlan::Xhttp(plan) => {
-            return xhttp::start_xhttp_server(config, runtime, *plan).await;
+    match crate::transport::compile_listener_plan(&config.protocol) {
+        crate::transport::InboundListenerPlan::Xhttp(plan) => {
+            return crate::transport::xhttp::start_xhttp_server(
+                config, runtime, *plan,
+            )
+            .await;
         }
         #[cfg(feature = "grpc_transport")]
-        transport_plan::InboundListenerPlan::Grpc(plan) => {
-            return grpc_transport::start_grpc_server(config, runtime, *plan).await;
+        crate::transport::InboundListenerPlan::Grpc(plan) => {
+            return crate::transport::grpc::start_grpc_server(
+                config, runtime, *plan,
+            )
+            .await;
         }
-        transport_plan::InboundListenerPlan::Stream => {}
+        crate::transport::InboundListenerPlan::Stream => {}
     }
 
     let mut join_handles = StartingTasks::with_capacity(3);

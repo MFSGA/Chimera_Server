@@ -69,10 +69,10 @@ pub(crate) use static_config::{compile_static_outbound, parse_xray_uuid};
 use crate::{
     address::{Address, NetLocation},
     async_stream::AsyncStream,
-    beginning::build_proxy_protocol_header,
     resolver::{Resolver, resolve_single_address},
     routing_state::OutboundObservation,
     runtime::{DataPlaneRuntime, OutboundSummary},
+    transport::tcp::build_proxy_protocol_header,
     util::socket::new_tcp_socket,
 };
 
@@ -285,10 +285,10 @@ pub(crate) fn prepare_vless_reverse_bridge(
             #[cfg(not(feature = "ws"))]
             {
                 let _ = (tls, settings);
-                return Err(std::io::Error::new(
+                Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "VLESS Reverse Bridge WebSocket requires the ws feature",
-                ));
+                ))
             }
             #[cfg(feature = "ws")]
             if tls.is_some() && !cfg!(feature = "tls") {

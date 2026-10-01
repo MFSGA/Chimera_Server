@@ -1,6 +1,8 @@
+#[cfg(feature = "vless-reverse")]
+use std::sync::Mutex;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -101,6 +103,7 @@ fn xray_handshake_timeout_for_policy(
 pub(super) struct DataPlaneState {
     pub(super) inbound_manager: Arc<InboundManager>,
     pub(super) routing_publication: Arc<RwLock<Arc<RoutingPublication>>>,
+    #[cfg(feature = "vless-reverse")]
     pub(super) routing_updates: Arc<Mutex<()>>,
     pub(super) policy: Arc<RwLock<PolicyConfig>>,
     pub(super) resolver: Arc<dyn Resolver>,

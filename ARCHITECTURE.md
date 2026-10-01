@@ -396,6 +396,79 @@ sniffing 与动态管理；H1/H3、`stream-one`、xmux、`downloadSettings` 和�
 尚未实现的当前字段或组合必须明确报错，不能静默接受。此顺序不改变最终双角色兼容目标，
 也不让 Reverse 绕过 routing 或 TUN。
 
+### 13.3 Legacy RuntimeState inbound mutation facade deprecation (2026-10-02)
+
+`RuntimeState::with_inbound_mut`、`add_inbound`、`remove_inbound`、`register_inbound_tasks` 和
+`stop_inbound_tasks` 属于早期兼容 facade：它们分别直接修改配置视图或 task handles，不能提供
+当前 `InboundManager` 的 bind-before-publish、generation 检查、失败回滚和 remove cleanup 事务。
+为避免在 0.9 系列中直接破坏可能存在的库调用方，本轮不删除或改变其运行行为，而是在非测试构建中
+标记为 deprecated，并明确引导调用方使用配置化 startup 或管理 API。仓库内部生命周期生产路径已经
+不依赖这些 facade；现有单元测试仍可用它们构造故障和 owner 场景。后续只有在完成公开替代路径和版本
+迁移说明后，才考虑缩小可见性或删除。该调整只收紧 API 契约，不改变 Xray wire、listener、认证、路由或关闭语义。
+
+### 13.4 Server shutdown orchestration migration (2026-10-02)
+
+第四批目录责任迁移从 `lib.rs -> server` 开始。首个切片迁移进程级退出与关停编排：shutdown signal、
+非 inbound service task 异常结束、inbound failure 汇合，以及 listener/connection/GlobalID XUDP 的统一
+shutdown/drain 顺序。第二个切片继续把 startup resource assembly/transaction 归到 `server.rs`：MCP、configured
+inbounds、VLESS Reverse monitor、observatory、gRPC 按原顺序启动，任一阶段失败仍复用同一 rollback，只有全部
+启动成功后才执行 `Starting -> Running` 发布。第三个切片把运行监督循环也收口到 `server.rs`：signal、service-task
+退出与 inbound failure 的竞争等待、shutdown 日志和最终 `Error` 映射由同一 server owner 处理，并把这些内部 helper
+从 crate-visible 收回为模块私有。`lib.rs` 现在继续负责日志初始化、配置编译、API resolve、RuntimeState 初始数据发布，
+随后只调用 server startup/supervision 边界；没有修改 listener 启动实现、协议 wire、超时数值或资源 owner。后续不再
+为形式上的 `lib.rs` 变短继续拆生命周期细节，下一批可转到 `beginning -> transport/session` 或 TLS/REALITY security。
+
+### 13.5 TCP relay session migration (2026-10-02)
+
+第四批 `beginning -> transport/session` 从 TCP relay 会话责任开始：`tcp_relay` 的 userspace copy、raw handoff、
+Linux splice/downlink-splice/auto backend、buffer/backend 环境配置、relay result，以及直接依赖这些结果的
+policy idle/uplink-only/downlink-only timeout wrapper 一起迁入 `session`。这样 half-close、超时和 relay backend
+仍由同一会话边界持有，不为跨目录访问扩大内部可见性。`session::dispatcher` 直接调用新的 session 模块；
+`beginning` 删除对应实现模块和内部 re-export，没有保留第二份 facade。迁移只改变 Rust 模块归属与测试路径，
+不改变 copy buffer、splice 阈值、handoff 时机、timeout、计量结果或 EOF/半关闭语义。
+
+### 13.6 Listener transport plan migration (2026-10-02)
+
+第四批继续把 listener transport 分类责任从 `beginning/transport_plan.rs` 迁入 `transport/listener_plan.rs`。
+该 plan 只负责把兼容保留的递归 `ServerProxyConfig` 一次分类为 stream、gRPC 或 XHTTP，并携带唯一
+TLS/REALITY security 与 leaf protocol；listener 启动仍由现有 `beginning`/具体 transport 实现执行。
+`beginning`、gRPC transport 和 XHTTP 现在消费 `crate::transport` 暴露的 crate-private plan 类型与编译函数，
+没有保留旧模块 facade。跨父模块访问要求这些内部项从 `pub(super)` 调整为 `pub(crate)`，但不形成公开 API。
+本切片不改变 effective transport 选择、security 组合、配置解析、listener bind 或协议 wire。UDP 当前仍同时混合
+listener、Dokodemo、targeted session、GlobalID XUDP 与 worker/routing owner，因此没有在本切片做大范围机械迁移。
+
+### 13.7 gRPC transport migration (2026-10-02)
+
+第四批继续把 gRPC listener transport 从 `beginning/grpc_transport` 整体迁入 `transport/grpc`，包含 HTTP/2
+setup guard、request handling、gRPC framing codec 和对应测试。该 codec 同时被 outbound gRPC 与 routing
+observatory 测试复用，因此归入 transport 比继续挂在 inbound startup facade 下更符合共享责任。listener startup
+只把 `start_grpc_server` 从 sibling-only 可见性调整为 crate-private，并直接依赖 `transport::tcp` 的 listener、accept
+health 与 socket policy helper；`beginning` 只根据已编译的 listener plan 调用 `transport::grpc`，不保留旧 facade。
+outbound 与测试调用也改为新的共享 transport 路径。本切片不改变 service path、HTTP/2 settings、setup/deadline
+超时、metadata 校验、framing、TLS/REALITY 选择、listener bind、socket policy 或 logical session owner。
+
+### 13.8 XHTTP logical session migration (2026-10-02)
+
+第四批继续把 XHTTP 的 logical session/store 从 `beginning/xhttp/session.rs` 迁入 `session/xhttp.rs`。该模块
+持有 session map、TTL cleanup、stream-down cleanup guard、upload reader/packet reassembly、logical duplex stream
+和 session-level pipe capacity；HTTP request/response dispatch、HTTP/1.1/2/3 listener 与 H3 transport 仍保留在
+当前 XHTTP transport 实现中。由于 owner 跨出 `beginning::xhttp`，原 sibling-only `pub(super)` 项统一放宽为
+crate-private `pub(crate)`，不形成公开 API；pipe capacity 也随 session owner 迁移，避免 `session -> beginning`
+反向依赖。本切片不改变 TTL、buffer limits、sequence ordering、queue close、logical stream half-close/cancel、
+connection task ownership 或 XHTTP wire。剩余 XHTTP transport 将在独立切片评估后迁移，不与 session owner 混做。
+
+### 13.9 XHTTP transport migration (2026-10-02)
+
+在 logical session owner 独立后，第四批把剩余 XHTTP HTTP transport 从 `beginning/xhttp` 整体迁入
+`transport/xhttp`：HTTP/1.1/2 request/response dispatch、HTTP/3 adapter、listener security、padding/request
+metadata helpers 和对应 transport tests 归到同一 transport owner；`session::xhttp` 继续独立持有 session/store。
+outbound XHTTP 对 padding/range helper 的共享调用也改为 `transport::xhttp`，不再经 `beginning` facade。
+为避免 `transport -> beginning` 反向依赖，QUIC endpoint accept-health helper 同时迁到 `transport`，Hysteria2、
+TUIC 和对应 health test 只更新调用路径；其 BrokenPipe 判定和日志语义保持不变。此前 `beginning` 对 TCP
+listener/accept/socket-policy/proxy-header helper 的内部 re-export 也已归零，相关生产调用直接依赖
+`transport::tcp`。本切片不改变 XHTTP mode、HTTP settings、header/TLS timeout、H3 flow control/congestion、
+padding、request classification、listener bind/socket policy、TLS/REALITY 选择或 logical-session 生命周期。
+
 已选定的方向：单核心库内渐进分层；共用配置语义入口；计划与运行实体分离；管理器拥有生命周期；数据面仅接收必要能力；复用既有观测面。
 
 实施前需按切片验证，而非臆定：

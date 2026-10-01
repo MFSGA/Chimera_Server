@@ -68,9 +68,31 @@ fn load_external_config_source(source: &str) -> Result<String, Error> {
             fetch_http_content(source)
         }
         _ => Err(Error::InvalidConfig(format!(
-            "unsupported external config source: {source}"
+            "unsupported external config source: {}",
+            safe_config_source_label(source)
         ))),
     }
+}
+
+fn safe_config_source_label(source: &str) -> String {
+    if source == "stdin:" {
+        return source.to_string();
+    }
+    if source.starts_with("http+unix://") {
+        return "http+unix://<redacted>".to_string();
+    }
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let scheme = if source.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        return reqwest::Url::parse(source)
+            .ok()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|| format!("{scheme}://<redacted>"));
+    }
+    "<redacted config source>".to_string()
 }
 
 fn fetch_http_content(target: &str) -> Result<String, Error> {
@@ -82,29 +104,39 @@ fn fetch_http_content(target: &str) -> Result<String, Error> {
         .build()
         .map_err(|err| {
             Error::InvalidConfig(format!(
-                "could not build config source client for {target}: {err}"
+                "could not build config source client: {err}"
             ))
         })?;
+    let source = safe_config_source_label(target);
     let response = client.get(target).send().map_err(|err| {
+        let category = if err.is_timeout() {
+            "request timed out"
+        } else if err.is_connect() {
+            "connection failed"
+        } else if err.is_builder() {
+            "request could not be built"
+        } else {
+            "request failed"
+        };
         Error::InvalidConfig(format!(
-            "could not fetch config source {target}: {err}"
+            "could not fetch config source {source}: {category}"
         ))
     })?;
     let status = response.status();
     if !status.is_success() {
         return Err(Error::InvalidConfig(format!(
-            "unexpected HTTP status code from config source {target}: {status}"
+            "unexpected HTTP status code from config source {source}: {status}"
         )));
     }
 
-    response.text().map_err(|err| {
+    response.text().map_err(|_| {
         Error::InvalidConfig(format!(
-            "config source {target} did not contain valid UTF-8 text: {err}"
+            "config source {source} did not contain valid UTF-8 text"
         ))
     })
 }
 
-fn parse_config_content(
+pub(crate) fn parse_config_content(
     content: &str,
     format: Option<ConfigFormat>,
 ) -> Result<LiteralConfig, Error> {
@@ -310,7 +342,7 @@ fn expand_env_placeholders(input: &str) -> Result<String, Error> {
 mod tests {
     use super::{
         decode_chunked_body, expand_env_placeholders, is_external_config_source,
-        parse_unix_socket_target,
+        parse_unix_socket_target, safe_config_source_label,
     };
 
     #[test]
@@ -359,6 +391,28 @@ mod tests {
         assert!(is_external_config_source(
             "http://127.0.0.1:8080/config.json"
         ));
+    }
+
+    #[test]
+    fn safe_config_source_label_redacts_credentials_and_paths() {
+        assert_eq!(
+            safe_config_source_label(
+                "https://user:secret@example.com/private/config.json?token=abc#fragment"
+            ),
+            "https://example.com"
+        );
+        assert_eq!(
+            safe_config_source_label(
+                "http://127.0.0.1:8080/config.json?signature=secret"
+            ),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            safe_config_source_label(
+                "http+unix:///tmp/chimera.sock/internal/get-config?token=abc"
+            ),
+            "http+unix://<redacted>"
+        );
     }
 
     use std::path::PathBuf;

@@ -352,7 +352,7 @@ pub(super) async fn start_xhttp_h3_server(
     let handle = tokio::spawn(async move {
         let _cancel_on_drop = CancelOnDrop(state.shutdown.clone());
         loop {
-            let incoming = match super::super::accept_quic_with_health(
+            let incoming = match crate::transport::accept_quic_with_health(
                 &endpoint,
                 "xhttp-http3",
             )
