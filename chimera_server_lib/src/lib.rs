@@ -1,3 +1,7 @@
+// async-trait expands async methods into must-use boxed futures; Clippy 1.99 flags
+// the macro-generated annotation as redundant throughout this crate.
+#![allow(clippy::double_must_use)]
+
 pub use beginning::start_tcp_server;
 pub use config::{
     def::LiteralConfig,
