@@ -181,9 +181,9 @@ fn compile_vless_inbound_reverse(
     #[cfg(not(feature = "vless-reverse"))]
     {
         let _ = (&reverse.tag, &reverse.sniffing);
-        return Err(Error::InvalidConfig(
+        Err(Error::InvalidConfig(
             "vless clients[].reverse requires the vless-reverse feature".into(),
-        ));
+        ))
     }
 
     #[cfg(feature = "vless-reverse")]

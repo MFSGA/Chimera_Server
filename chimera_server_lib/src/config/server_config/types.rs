@@ -714,6 +714,10 @@ impl RealityTransportConfig {
     }
 }
 
+// In reduced feature builds XHTTP can dominate the enum layout. Boxing that
+// public variant only for those builds would change the exported API shape, so
+// keep one stable representation and tolerate the size skew outside `full`.
+#[cfg_attr(not(feature = "full"), allow(clippy::large_enum_variant))]
 #[derive(Debug, Clone, Deserialize)]
 pub enum ServerProxyConfig {
     #[cfg(feature = "vless")]

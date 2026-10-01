@@ -71,10 +71,15 @@ struct StaticVlessClientConfig {
 struct StaticVlessReverseConfig {
     #[serde(default)]
     tag: String,
+    #[cfg(feature = "vless-reverse")]
     #[serde(default)]
     sniffing: Option<StaticVlessReverseSniffingConfig>,
+    #[cfg(not(feature = "vless-reverse"))]
+    #[serde(default)]
+    sniffing: Option<serde_json::Value>,
 }
 
+#[cfg(feature = "vless-reverse")]
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StaticVlessReverseSniffingConfig {
