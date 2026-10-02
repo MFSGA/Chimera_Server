@@ -5,9 +5,6 @@ use tokio::{io::AsyncWriteExt, time::timeout};
 use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
-    beginning::udp::{
-        run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
-    },
     config::server_config::InboundSniffingConfig,
     handler::{
         http::relay_plain_http_response,
@@ -24,6 +21,9 @@ use crate::{
         policy_stream::copy_bidirectional_with_timeouts,
         sniff::{SniffedRoutePlan, build_sniffed_route_plan, sniff_stream_protocol},
         tcp_relay::copy_bidirectional,
+        udp::{
+            run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
+        },
     },
     traffic::{
         MeteredStream, TrafficContext, TrafficDirection, record_transfer,

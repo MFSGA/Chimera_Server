@@ -28,14 +28,14 @@ use crate::{
     handler::trojan_udp::TrojanUdpStream, outbound::connect_trojan_udp_via_outbound,
 };
 
-#[cfg(feature = "trojan")]
-use super::targeted_session::shutdown_targeted_message;
 use super::{
     UDP_BUFFER_SIZE, UDP_SESSION_CHANNEL_CAPACITY, UDP_SESSION_IDLE_TIMEOUT,
 };
+#[cfg(feature = "trojan")]
+use crate::session::udp::shutdown_targeted_message;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum UdpOutboundAction {
+pub(crate) enum UdpOutboundAction {
     Freedom {
         tag: Option<String>,
     },
@@ -97,7 +97,7 @@ impl UdpRelayState {
     }
 }
 
-pub(super) async fn run_dokodemo_udp_server(
+pub(crate) async fn run_dokodemo_udp_server(
     socket: Arc<UdpSocket>,
     config: DokodemoDoorConfig,
     target_addr: impl Into<Option<SocketAddr>> + Send,
@@ -674,7 +674,7 @@ async fn run_freedom_udp_session(
     relay_state.sessions.lock().await.remove(&key);
 }
 
-pub(super) async fn select_udp_outbound(
+pub(crate) async fn select_udp_outbound(
     runtime: &DataPlaneRuntime,
     inbound_tag: &str,
     client_addr: SocketAddr,

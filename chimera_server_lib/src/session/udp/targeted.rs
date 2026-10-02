@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap, future::poll_fn, net::SocketAddr, pin::Pin, sync::Arc,
+    time::Duration,
 };
 
 use tokio::{
@@ -28,12 +29,17 @@ use crate::{
 #[cfg(feature = "trojan")]
 use crate::resolver::resolve_single_address;
 
+const UDP_BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(feature = "trojan")]
-use super::VMESS_UDP_MESSAGE_BUFFER_SIZE;
-use super::{
-    TargetedUdpSessionKey, UDP_BUFFER_SIZE, UDP_SESSION_CHANNEL_CAPACITY,
-    UDP_SESSION_IDLE_TIMEOUT,
-};
+const VMESS_UDP_MESSAGE_BUFFER_SIZE: usize = 8192;
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_SESSION_CHANNEL_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TargetedUdpSessionKey {
+    target_addr: SocketAddr,
+    outbound_tag: Option<String>,
+}
 
 #[cfg(feature = "trojan")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,7 +54,7 @@ struct TargetedUdpResponse {
     traffic_context: Option<TrafficContext>,
 }
 
-pub(super) async fn run_multi_directional_udp_with_tasks(
+pub(crate) async fn run_multi_directional_udp_with_tasks(
     mut server_stream: Box<dyn AsyncTargetedMessageStream>,
     resolver: Arc<dyn Resolver>,
     runtime: DataPlaneRuntime,
@@ -498,7 +504,7 @@ async fn flush_targeted_message(
     poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx)).await
 }
 
-pub(super) async fn shutdown_targeted_message(
+pub(crate) async fn shutdown_targeted_message(
     stream: &mut dyn AsyncTargetedMessageStream,
 ) -> std::io::Result<()> {
     poll_fn(|cx| Pin::new(&mut *stream).poll_shutdown_message(cx)).await

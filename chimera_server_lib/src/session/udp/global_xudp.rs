@@ -27,7 +27,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum GlobalUdpWorkerKey {
+pub(crate) enum GlobalUdpWorkerKey {
     Direct {
         target_is_ipv6: bool,
         outbound_tag: Option<String>,
@@ -46,7 +46,7 @@ impl From<&TargetedUdpSessionKey> for GlobalUdpWorkerKey {
 }
 
 #[derive(Clone)]
-pub(super) enum GlobalUdpBackendStart {
+pub(crate) enum GlobalUdpBackendStart {
     Direct,
     #[cfg(feature = "trojan")]
     Trojan {
@@ -66,51 +66,51 @@ impl GlobalUdpBackendStart {
     }
 }
 
-pub(super) struct GlobalSessionUdpAttachStart {
-    pub(super) global_id: [u8; 8],
-    pub(super) session_id: u16,
-    pub(super) generation: u64,
-    pub(super) key: TargetedUdpSessionKey,
-    pub(super) response_sender: mpsc::Sender<SessionUdpEvent>,
-    pub(super) traffic_context: Option<TrafficContext>,
-    pub(super) idle_timeout: Duration,
-    pub(super) backend_start: GlobalUdpBackendStart,
+pub(crate) struct GlobalSessionUdpAttachStart {
+    pub(crate) global_id: [u8; 8],
+    pub(crate) session_id: u16,
+    pub(crate) generation: u64,
+    pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) traffic_context: Option<TrafficContext>,
+    pub(crate) idle_timeout: Duration,
+    pub(crate) backend_start: GlobalUdpBackendStart,
 }
 
 #[derive(Clone)]
-pub(super) struct GlobalUdpAttachment {
-    pub(super) token: u64,
-    pub(super) session_id: u16,
-    pub(super) generation: u64,
-    pub(super) response_sender: mpsc::Sender<SessionUdpEvent>,
-    pub(super) traffic_context: Option<TrafficContext>,
+pub(crate) struct GlobalUdpAttachment {
+    pub(crate) token: u64,
+    pub(crate) session_id: u16,
+    pub(crate) generation: u64,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) traffic_context: Option<TrafficContext>,
 }
 
-pub(super) struct GlobalUdpPayload {
-    pub(super) attachment_token: u64,
-    pub(super) target_addr: SocketAddr,
-    pub(super) payload: Vec<u8>,
-    pub(super) completion: oneshot::Sender<std::io::Result<()>>,
+pub(crate) struct GlobalUdpPayload {
+    pub(crate) attachment_token: u64,
+    pub(crate) target_addr: SocketAddr,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) completion: oneshot::Sender<std::io::Result<()>>,
 }
 
-pub(super) struct PendingGlobalUdpResponse {
-    pub(super) source: SocketAddr,
-    pub(super) payload: Vec<u8>,
+pub(crate) struct PendingGlobalUdpResponse {
+    pub(crate) source: SocketAddr,
+    pub(crate) payload: Vec<u8>,
 }
 
-pub(super) struct GlobalUdpResponseDelivery {
-    pub(super) attachment_token: u64,
-    pub(super) response_sender: mpsc::Sender<SessionUdpEvent>,
-    pub(super) response: SessionUdpResponse,
+pub(crate) struct GlobalUdpResponseDelivery {
+    pub(crate) attachment_token: u64,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) response: SessionUdpResponse,
 }
 
-pub(super) enum GlobalUdpPayloadPlan {
+pub(crate) enum GlobalUdpPayloadPlan {
     Send(GlobalUdpAttachment),
     RejectDetached,
     RejectStale { current_token: u64 },
 }
 
-pub(super) fn plan_global_udp_payload(
+pub(crate) fn plan_global_udp_payload(
     attachment: Option<GlobalUdpAttachment>,
     request_token: u64,
 ) -> GlobalUdpPayloadPlan {
@@ -125,7 +125,7 @@ pub(super) fn plan_global_udp_payload(
     }
 }
 
-pub(super) fn should_pause_global_udp_receive(
+pub(crate) fn should_pause_global_udp_receive(
     attachment_present: bool,
     pending_responses: usize,
     capacity: usize,
@@ -133,7 +133,7 @@ pub(super) fn should_pause_global_udp_receive(
     !attachment_present && pending_responses >= capacity
 }
 
-pub(super) fn plan_global_udp_response_delivery(
+pub(crate) fn plan_global_udp_response_delivery(
     attachment: Option<GlobalUdpAttachment>,
     pending: PendingGlobalUdpResponse,
 ) -> Result<GlobalUdpResponseDelivery, PendingGlobalUdpResponse> {
@@ -153,28 +153,28 @@ pub(super) fn plan_global_udp_response_delivery(
     })
 }
 
-pub(super) struct GlobalSessionUdpWorker {
-    pub(super) key: GlobalUdpWorkerKey,
-    pub(super) sender: mpsc::Sender<GlobalUdpPayload>,
-    pub(super) attachment: Arc<RwLock<Option<GlobalUdpAttachment>>>,
-    pub(super) attachment_notify: Arc<Notify>,
-    pub(super) task: JoinHandle<()>,
+pub(crate) struct GlobalSessionUdpWorker {
+    pub(crate) key: GlobalUdpWorkerKey,
+    pub(crate) sender: mpsc::Sender<GlobalUdpPayload>,
+    pub(crate) attachment: Arc<RwLock<Option<GlobalUdpAttachment>>>,
+    pub(crate) attachment_notify: Arc<Notify>,
+    pub(crate) task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct GlobalUdpWorkerSnapshot {
-    pub(super) key_matches: bool,
-    pub(super) task_finished: bool,
-    pub(super) sender_closed: bool,
+pub(crate) struct GlobalUdpWorkerSnapshot {
+    pub(crate) key_matches: bool,
+    pub(crate) task_finished: bool,
+    pub(crate) sender_closed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GlobalUdpWorkerPlan {
+pub(crate) enum GlobalUdpWorkerPlan {
     Reuse,
     Replace,
 }
 
-pub(super) fn plan_global_udp_worker(
+pub(crate) fn plan_global_udp_worker(
     snapshot: Option<GlobalUdpWorkerSnapshot>,
 ) -> GlobalUdpWorkerPlan {
     match snapshot {
@@ -187,7 +187,7 @@ pub(super) fn plan_global_udp_worker(
     }
 }
 
-pub(super) fn snapshot_global_udp_worker(
+pub(crate) fn snapshot_global_udp_worker(
     worker: Option<&GlobalSessionUdpWorker>,
     desired_key: &GlobalUdpWorkerKey,
 ) -> Option<GlobalUdpWorkerSnapshot> {
@@ -199,24 +199,24 @@ pub(super) fn snapshot_global_udp_worker(
 }
 
 #[derive(Default)]
-pub(super) struct GlobalXudpWorkers {
-    pub(super) registry: XudpGlobalRegistry,
-    pub(super) workers: HashMap<[u8; 8], GlobalSessionUdpWorker>,
-    pub(super) gates: HashMap<[u8; 8], Weak<Mutex<()>>>,
-    pub(super) maintenance_tasks: TaskTracker,
-    pub(super) maintenance_cancellation: CancellationToken,
+pub(crate) struct GlobalXudpWorkers {
+    pub(crate) registry: XudpGlobalRegistry,
+    pub(crate) workers: HashMap<[u8; 8], GlobalSessionUdpWorker>,
+    pub(crate) gates: HashMap<[u8; 8], Weak<Mutex<()>>>,
+    pub(crate) maintenance_tasks: TaskTracker,
+    pub(crate) maintenance_cancellation: CancellationToken,
 }
 
 static GLOBAL_XUDP_WORKERS: OnceLock<Arc<Mutex<GlobalXudpWorkers>>> =
     OnceLock::new();
 
-pub(super) fn global_xudp_workers() -> Arc<Mutex<GlobalXudpWorkers>> {
+pub(crate) fn global_xudp_workers() -> Arc<Mutex<GlobalXudpWorkers>> {
     GLOBAL_XUDP_WORKERS
         .get_or_init(|| Arc::new(Mutex::new(GlobalXudpWorkers::default())))
         .clone()
 }
 
-pub(super) async fn global_xudp_gate(global_id: [u8; 8]) -> Arc<Mutex<()>> {
+pub(crate) async fn global_xudp_gate(global_id: [u8; 8]) -> Arc<Mutex<()>> {
     let globals = global_xudp_workers();
     let mut guard = globals.lock().await;
     guard.gates.retain(|_, gate| gate.strong_count() > 0);
@@ -229,7 +229,7 @@ pub(super) async fn global_xudp_gate(global_id: [u8; 8]) -> Arc<Mutex<()>> {
     gate
 }
 
-pub(super) async fn attach_global_session_udp_session(
+pub(crate) async fn attach_global_session_udp_session(
     start: GlobalSessionUdpAttachStart,
 ) -> std::io::Result<SessionUdpWorker> {
     let GlobalSessionUdpAttachStart {
@@ -387,7 +387,7 @@ pub(super) async fn attach_global_session_udp_session(
     })
 }
 
-pub(super) async fn forward_global_udp_response(
+pub(crate) async fn forward_global_udp_response(
     attachment: &Arc<RwLock<Option<GlobalUdpAttachment>>>,
     pending: PendingGlobalUdpResponse,
 ) -> Result<(), (PendingGlobalUdpResponse, Option<u64>)> {
@@ -420,7 +420,7 @@ pub(super) async fn forward_global_udp_response(
     }
 }
 
-pub(super) async fn clear_global_attachment_if_current(
+pub(crate) async fn clear_global_attachment_if_current(
     attachment: &Arc<RwLock<Option<GlobalUdpAttachment>>>,
     attachment_token: u64,
 ) {
@@ -431,7 +431,7 @@ pub(super) async fn clear_global_attachment_if_current(
     }
 }
 
-pub(super) async fn start_global_session_udp_worker(
+pub(crate) async fn start_global_session_udp_worker(
     key: GlobalUdpWorkerKey,
     target_addr: SocketAddr,
     idle_timeout: Duration,
@@ -629,7 +629,7 @@ pub(super) async fn start_global_session_udp_worker(
     })
 }
 
-pub(super) fn take_expired_global_udp_worker(
+pub(crate) fn take_expired_global_udp_worker(
     globals: &mut GlobalXudpWorkers,
     global_id: [u8; 8],
     now: Instant,
@@ -641,7 +641,7 @@ pub(super) fn take_expired_global_udp_worker(
     }
 }
 
-pub(super) async fn expire_global_udp_worker(global_id: [u8; 8], now: Instant) {
+pub(crate) async fn expire_global_udp_worker(global_id: [u8; 8], now: Instant) {
     let gate = global_xudp_gate(global_id).await;
     let _gate_guard = gate.lock().await;
     let globals = global_xudp_workers();
@@ -654,7 +654,7 @@ pub(super) async fn expire_global_udp_worker(global_id: [u8; 8], now: Instant) {
     }
 }
 
-pub(super) fn schedule_global_udp_worker_expiry(
+pub(crate) fn schedule_global_udp_worker_expiry(
     maintenance_tasks: TaskTracker,
     maintenance_cancellation: CancellationToken,
     global_id: [u8; 8],
@@ -668,7 +668,7 @@ pub(super) fn schedule_global_udp_worker_expiry(
     }));
 }
 
-pub(super) async fn detach_global_udp_worker(
+pub(crate) async fn detach_global_udp_worker(
     global_id: [u8; 8],
     attachment_token: u64,
 ) {
@@ -710,7 +710,7 @@ pub(super) async fn detach_global_udp_worker(
     );
 }
 
-pub(super) async fn shutdown_workers() -> usize {
+pub(crate) async fn shutdown_workers() -> usize {
     let globals = global_xudp_workers();
     let (workers, maintenance_tasks) = {
         let mut guard = globals.lock().await;
@@ -739,12 +739,12 @@ pub(super) async fn shutdown_workers() -> usize {
     stopped
 }
 
-pub(super) async fn stop_global_udp_worker(worker: GlobalSessionUdpWorker) {
+pub(crate) async fn stop_global_udp_worker(worker: GlobalSessionUdpWorker) {
     worker.task.abort();
     let _ = worker.task.await;
 }
 
-pub(super) async fn terminate_global_udp_worker(
+pub(crate) async fn terminate_global_udp_worker(
     global_id: [u8; 8],
     attachment_token: u64,
 ) {

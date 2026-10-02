@@ -169,14 +169,16 @@ async fn mkcp_transport_binds_udp_and_tracks_protocol_session() {
     let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind mKCP test client");
-    let ping = super::mkcp::encode_packet(&[super::mkcp::MkcpSegment::Command {
-        conversation: 7,
-        command: 3,
-        option: 0,
-        sending_next: 0,
-        receiving_next: 0,
-        peer_rto: 100,
-    }])
+    let ping = crate::transport::mkcp::encode_packet(&[
+        crate::transport::mkcp::MkcpSegment::Command {
+            conversation: 7,
+            command: 3,
+            option: 0,
+            sending_next: 0,
+            receiving_next: 0,
+            peer_rto: 100,
+        },
+    ])
     .expect("encode mKCP ping");
     client
         .send_to(&ping, address)

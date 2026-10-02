@@ -3,6 +3,7 @@ use std::os::fd::AsRawFd;
 use std::{
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
+    time::Duration,
 };
 
 #[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
@@ -21,6 +22,7 @@ use tokio::io::{
     AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
 };
 use tokio::{net::UdpSocket, time::timeout};
+use tokio_util::task::TaskTracker;
 
 use crate::{
     address::{Address, BindLocation, NetLocation},
@@ -2043,19 +2045,20 @@ async fn multi_directional_udp_relays_trojan_packets() {
     let (mut client, server) = duplex(4096);
     let session_tasks = TaskTracker::new();
     let observed_session_tasks = session_tasks.clone();
-    let relay_task = tokio::spawn(run_multi_directional_udp_with_tasks(
-        Box::new(TrojanUdpStream::new(Box::new(TestStream(server)))),
-        Arc::new(NativeResolver::new()),
-        runtime_with_outbounds(vec![outbound("direct", "freedom")]).data_plane(),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 32000)),
-        None,
-        Some(
-            TrafficContext::new("trojan")
-                .with_identity("udp-user")
-                .with_inbound_tag("trojan-udp"),
-        ),
-        session_tasks,
-    ));
+    let relay_task =
+        tokio::spawn(crate::session::udp::run_multi_directional_udp_with_tasks(
+            Box::new(TrojanUdpStream::new(Box::new(TestStream(server)))),
+            Arc::new(NativeResolver::new()),
+            runtime_with_outbounds(vec![outbound("direct", "freedom")]).data_plane(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 32000)),
+            None,
+            Some(
+                TrafficContext::new("trojan")
+                    .with_identity("udp-user")
+                    .with_inbound_tag("trojan-udp"),
+            ),
+            session_tasks,
+        ));
 
     let mut request = vec![1];
     let IpAddr::V4(echo_ip) = echo_addr.ip() else {
@@ -2174,7 +2177,7 @@ async fn multi_directional_udp_routes_through_trojan_outbound() {
     let runtime = runtime_routing_udp_to(proxy, "trojan-udp");
     let (client, server) = duplex(4096);
     let mut client_stream = TrojanUdpStream::new(Box::new(TestStream(client)));
-    let relay_task = tokio::spawn(run_multi_directional_udp(
+    let relay_task = tokio::spawn(crate::session::udp::run_multi_directional_udp(
         Box::new(TrojanUdpStream::new(Box::new(TestStream(server)))),
         Arc::new(NativeResolver::new()),
         runtime,

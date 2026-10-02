@@ -24,7 +24,6 @@ use tokio::{
 use crate::{
     address::{Address, BindLocation, NetLocation},
     async_stream::AsyncPing,
-    beginning::udp::run_session_based_udp,
     config::{
         Transport,
         server_config::{ServerConfig, ServerProxyConfig},
@@ -33,6 +32,7 @@ use crate::{
         FrameMetadata, FrameOption, SessionStatus, TargetNetwork,
     },
     runtime::RuntimeState,
+    session::udp::run_session_based_udp,
 };
 
 use super::super::fnv1a::Fnv1aHasher;

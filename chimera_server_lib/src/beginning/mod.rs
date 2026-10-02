@@ -1,6 +1,4 @@
-use quic::start_quic_server;
 use tokio::task::JoinHandle;
-use udp::start_udp_server;
 
 use crate::{
     config::{
@@ -11,10 +9,7 @@ use crate::{
     traffic::register_identity,
 };
 
-#[allow(dead_code)]
-// mKCP's demux/runtime slice is retained for the next transport integration.
-mod mkcp;
-mod quic;
+#[cfg(test)]
 pub(crate) mod udp;
 
 struct StartingTasks {
@@ -149,21 +144,7 @@ async fn start_server_tasks(
                 Ok(None) => {}
                 Err(error) => return Err(error),
             }
-            match start_udp_server(config.clone(), runtime).await {
-                Ok(Some(handle)) => join_handles.push(handle),
-                Ok(None) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Transport::Quic => match start_quic_server(config.clone(), runtime).await {
-            Ok(Some(handle)) => {
-                join_handles.push(handle);
-            }
-            Ok(None) => (),
-            Err(e) => return Err(e),
-        },
-        Transport::Mkcp(mkcp) => {
-            match mkcp::server::start_mkcp_server(config.clone(), runtime, mkcp)
+            match crate::transport::udp::start_udp_server(config.clone(), runtime)
                 .await
             {
                 Ok(Some(handle)) => join_handles.push(handle),
@@ -171,14 +152,42 @@ async fn start_server_tasks(
                 Err(error) => return Err(error),
             }
         }
-        // UDP listeners need runtime state for routing/outbound selection.
-        Transport::Udp => match start_udp_server(config.clone(), runtime).await {
-            Ok(Some(handle)) => {
-                join_handles.push(handle);
+        Transport::Quic => {
+            match crate::transport::quic::start_quic_server(config.clone(), runtime)
+                .await
+            {
+                Ok(Some(handle)) => {
+                    join_handles.push(handle);
+                }
+                Ok(None) => (),
+                Err(e) => return Err(e),
             }
-            Ok(None) => (),
-            Err(e) => return Err(e),
-        },
+        }
+        Transport::Mkcp(mkcp) => {
+            match crate::transport::mkcp::server::start_mkcp_server(
+                config.clone(),
+                runtime,
+                mkcp,
+            )
+            .await
+            {
+                Ok(Some(handle)) => join_handles.push(handle),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // UDP listeners need runtime state for routing/outbound selection.
+        Transport::Udp => {
+            match crate::transport::udp::start_udp_server(config.clone(), runtime)
+                .await
+            {
+                Ok(Some(handle)) => {
+                    join_handles.push(handle);
+                }
+                Ok(None) => (),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     if join_handles.is_empty() {

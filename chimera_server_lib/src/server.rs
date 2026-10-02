@@ -7,7 +7,7 @@ use crate::ApiListen;
 #[cfg(feature = "vless-reverse")]
 use crate::handler::vless_reverse::bridge_runtime::ReverseBridgePlan;
 use crate::{
-    Error, beginning,
+    Error,
     config::def::{ApiConfig, BurstObservatoryConfig, ObservatoryConfig},
     inbound::InboundFailure,
     mcp::{self, McpServerConfig},
@@ -311,7 +311,7 @@ async fn shutdown_server_runtime(
         .drain_inbound_connection_tasks(connection_grace_period)
         .await;
     let stopped_global_xudp_workers =
-        beginning::udp::shutdown_global_xudp_workers().await;
+        crate::session::udp::shutdown_global_xudp_workers().await;
     runtime_state.finish_shutdown(failed);
 
     ServerShutdownReport {

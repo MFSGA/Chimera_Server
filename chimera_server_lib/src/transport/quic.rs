@@ -23,7 +23,7 @@ use crate::{
 #[cfg(not(any(feature = "hysteria", feature = "tuic")))]
 use crate::{config::server_config::ServerConfig, runtime::DataPlaneRuntime};
 
-pub async fn start_quic_server(
+pub(crate) async fn start_quic_server(
     config: ServerConfig,
     runtime: DataPlaneRuntime,
 ) -> std::io::Result<Option<JoinHandle<()>>> {

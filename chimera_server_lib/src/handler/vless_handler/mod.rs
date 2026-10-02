@@ -520,7 +520,6 @@ mod tests {
     use crate::{
         address::{Address, BindLocation, NetLocation},
         async_stream::{AsyncPing, AsyncStream},
-        beginning::udp::{run_bidirectional_udp, run_session_based_udp},
         config::{
             Transport,
             def::{PolicyConfig, PolicyLevelConfig},
@@ -537,6 +536,7 @@ mod tests {
         },
         resolver::NativeResolver,
         runtime::RuntimeState,
+        session::udp::{run_bidirectional_udp, run_session_based_udp},
     };
 
     #[cfg(feature = "vless-reverse")]

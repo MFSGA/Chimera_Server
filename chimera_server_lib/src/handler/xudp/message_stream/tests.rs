@@ -9,9 +9,9 @@ use tokio::{
 use crate::{
     address::Address,
     async_stream::{AsyncReadSessionMessage, AsyncWriteSessionMessage},
-    beginning::udp::run_session_based_udp,
     resolver::NativeResolver,
     runtime::RuntimeState,
+    session::udp::run_session_based_udp,
 };
 
 use super::*;

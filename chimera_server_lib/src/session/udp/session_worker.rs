@@ -6,7 +6,7 @@ use crate::resolver::resolve_single_address;
 use super::*;
 
 #[derive(Clone)]
-pub(super) enum SessionUdpSender {
+pub(crate) enum SessionUdpSender {
     Local(mpsc::Sender<LocalUdpPayload>),
     #[cfg(feature = "trojan")]
     Trojan(mpsc::Sender<LocalUdpPayload>),
@@ -17,7 +17,7 @@ pub(super) enum SessionUdpSender {
 }
 
 impl SessionUdpSender {
-    pub(super) fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         match self {
             Self::Local(sender) => sender.is_closed(),
             #[cfg(feature = "trojan")]
@@ -26,7 +26,7 @@ impl SessionUdpSender {
         }
     }
 
-    pub(super) async fn send_to(
+    pub(crate) async fn send_to(
         &self,
         payload: Vec<u8>,
         target_addr: SocketAddr,
@@ -71,9 +71,9 @@ impl SessionUdpSender {
     }
 }
 
-pub(super) struct LocalSessionUdpTask {
-    pub(super) cancellation: CancellationToken,
-    pub(super) join: Option<JoinHandle<()>>,
+pub(crate) struct LocalSessionUdpTask {
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) join: Option<JoinHandle<()>>,
 }
 
 impl LocalSessionUdpTask {
@@ -94,40 +94,40 @@ impl Drop for LocalSessionUdpTask {
     }
 }
 
-pub(super) struct SessionUdpWorker {
-    pub(super) key: TargetedUdpSessionKey,
-    pub(super) global_id: Option<[u8; 8]>,
-    pub(super) generation: u64,
-    pub(super) sender: SessionUdpSender,
-    pub(super) task: Option<LocalSessionUdpTask>,
+pub(crate) struct SessionUdpWorker {
+    pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) global_id: Option<[u8; 8]>,
+    pub(crate) generation: u64,
+    pub(crate) sender: SessionUdpSender,
+    pub(crate) task: Option<LocalSessionUdpTask>,
 }
 
-pub(super) enum SessionUdpWorkerPlan {
+pub(crate) enum SessionUdpWorkerPlan {
     Reuse(SessionUdpSender),
     Replace,
 }
 
-pub(super) struct SessionUdpWorkerStart {
-    pub(super) key: TargetedUdpSessionKey,
-    pub(super) response_sender: mpsc::Sender<SessionUdpEvent>,
-    pub(super) traffic_context: Option<TrafficContext>,
-    pub(super) global_id: Option<[u8; 8]>,
-    pub(super) idle_timeout: Duration,
+pub(crate) struct SessionUdpWorkerStart {
+    pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) traffic_context: Option<TrafficContext>,
+    pub(crate) global_id: Option<[u8; 8]>,
+    pub(crate) idle_timeout: Duration,
 }
 
 #[cfg(feature = "trojan")]
-pub(super) struct TrojanSessionUdpWorkerStart {
-    pub(super) key: TargetedUdpSessionKey,
-    pub(super) response_sender: mpsc::Sender<SessionUdpEvent>,
-    pub(super) traffic_context: Option<TrafficContext>,
-    pub(super) resolver: Arc<dyn Resolver>,
-    pub(super) runtime: DataPlaneRuntime,
-    pub(super) outbound: crate::runtime::OutboundSummary,
-    pub(super) global_id: Option<[u8; 8]>,
-    pub(super) idle_timeout: Duration,
+pub(crate) struct TrojanSessionUdpWorkerStart {
+    pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) traffic_context: Option<TrafficContext>,
+    pub(crate) resolver: Arc<dyn Resolver>,
+    pub(crate) runtime: DataPlaneRuntime,
+    pub(crate) outbound: crate::runtime::OutboundSummary,
+    pub(crate) global_id: Option<[u8; 8]>,
+    pub(crate) idle_timeout: Duration,
 }
 
-pub(super) fn session_udp_worker_matches(
+pub(crate) fn session_udp_worker_matches(
     worker: &SessionUdpWorker,
     key: &TargetedUdpSessionKey,
     global_id: Option<[u8; 8]>,
@@ -137,7 +137,7 @@ pub(super) fn session_udp_worker_matches(
         && GlobalUdpWorkerKey::from(&worker.key) == GlobalUdpWorkerKey::from(key)
 }
 
-pub(super) fn plan_session_udp_worker(
+pub(crate) fn plan_session_udp_worker(
     worker: Option<&SessionUdpWorker>,
     key: &TargetedUdpSessionKey,
     global_id: Option<[u8; 8]>,
@@ -148,7 +148,7 @@ pub(super) fn plan_session_udp_worker(
         .unwrap_or(SessionUdpWorkerPlan::Replace)
 }
 
-pub(super) fn plan_session_generation(
+pub(crate) fn plan_session_generation(
     next_generation: u64,
 ) -> std::io::Result<(u64, u64)> {
     let following_generation = next_generation.checked_add(1).ok_or_else(|| {
@@ -157,7 +157,7 @@ pub(super) fn plan_session_generation(
     Ok((next_generation, following_generation))
 }
 
-pub(super) async fn replace_session_udp_worker(
+pub(crate) async fn replace_session_udp_worker(
     sessions: &mut HashMap<u16, SessionUdpWorker>,
     session_id: u16,
     next_generation: &mut u64,
@@ -183,7 +183,7 @@ pub(super) async fn replace_session_udp_worker(
 }
 
 #[cfg(feature = "trojan")]
-pub(super) async fn replace_trojan_session_udp_worker(
+pub(crate) async fn replace_trojan_session_udp_worker(
     sessions: &mut HashMap<u16, SessionUdpWorker>,
     session_id: u16,
     next_generation: &mut u64,
@@ -204,7 +204,7 @@ async fn stop_local_session_udp_task(task: LocalSessionUdpTask) {
     task.stop().await;
 }
 
-pub(super) async fn terminate_session_udp_worker(
+pub(crate) async fn terminate_session_udp_worker(
     sessions: &mut HashMap<u16, SessionUdpWorker>,
     session_id: u16,
 ) {
@@ -225,7 +225,7 @@ pub(super) async fn terminate_session_udp_worker(
     }
 }
 
-pub(super) async fn expire_session_udp_worker(
+pub(crate) async fn expire_session_udp_worker(
     sessions: &mut HashMap<u16, SessionUdpWorker>,
     session_id: u16,
 ) {
@@ -234,7 +234,7 @@ pub(super) async fn expire_session_udp_worker(
     }
 }
 
-pub(super) async fn detach_session_udp_worker(worker: SessionUdpWorker) {
+pub(crate) async fn detach_session_udp_worker(worker: SessionUdpWorker) {
     if let Some(task) = worker.task {
         stop_local_session_udp_task(task).await;
     }
@@ -249,7 +249,7 @@ pub(super) async fn detach_session_udp_worker(worker: SessionUdpWorker) {
     }
 }
 
-pub(super) fn is_current_session_udp_generation(
+pub(crate) fn is_current_session_udp_generation(
     sessions: &HashMap<u16, SessionUdpWorker>,
     session_id: u16,
     generation: u64,
@@ -259,7 +259,7 @@ pub(super) fn is_current_session_udp_generation(
         .is_some_and(|worker| worker.generation == generation)
 }
 
-pub(super) fn is_current_session_udp_response(
+pub(crate) fn is_current_session_udp_response(
     sessions: &HashMap<u16, SessionUdpWorker>,
     response: &SessionUdpResponse,
 ) -> bool {
@@ -270,7 +270,7 @@ pub(super) fn is_current_session_udp_response(
     )
 }
 
-pub(super) async fn start_session_udp_session(
+pub(crate) async fn start_session_udp_session(
     session_id: u16,
     generation: u64,
     key: TargetedUdpSessionKey,

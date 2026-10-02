@@ -20,10 +20,10 @@ use crate::{
         AsyncShutdownMessage, AsyncStream, AsyncTargetedMessageStream,
         AsyncWriteSourcedMessage, RawTcpRelayState,
     },
-    beginning::udp::run_multi_directional_udp,
     outbound::{InboundRoutingMetadata, connect_tcp_outbound_with_routing_metadata},
     runtime::DataPlaneRuntime,
     session::sniff::{build_sniffed_route_plan, sniff_stream_protocol},
+    session::udp::run_multi_directional_udp,
     traffic::{
         ConnectionGuard, MeteredStream, TrafficContext, TrafficDirection,
         record_transfer_ref, register_connection,
