@@ -213,7 +213,10 @@ struct WireGuardInboundSettings {
 }
 
 #[cfg(feature = "wireguard")]
-fn decode_wireguard_key(value: &str, field: &str) -> Result<[u8; 32], Error> {
+pub(crate) fn decode_wireguard_key(
+    value: &str,
+    field: &str,
+) -> Result<[u8; 32], Error> {
     let value = value.trim();
     let bytes = if value.len() == 64 {
         let mut bytes = [0u8; 32];

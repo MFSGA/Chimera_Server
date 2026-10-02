@@ -17,13 +17,15 @@ use crate::handler::hysteria2::connection::HysteriaUserStore;
 use crate::handler::shadowsocks::ShadowsocksUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
+#[cfg(feature = "wireguard")]
+use crate::wireguard::WireGuardPeerStore;
 #[cfg(feature = "vmess")]
 use crate::{
     config::server_config::VmessUser, handler::vmess::vmess_handler::VmessUserStore,
 };
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
-    inbound::{InboundFailure, InboundManager},
+    inbound::{AlterInboundError, InboundFailure, InboundManager},
     resolver::{NativeResolver, Resolver},
     routing_state::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,
@@ -525,6 +527,31 @@ impl RuntimeState {
     #[cfg(feature = "vless")]
     pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
         self.data_plane.0.inbound_manager.vless_users_snapshot(tag)
+    }
+
+    #[cfg(feature = "wireguard")]
+    pub(crate) fn wireguard_peer_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<WireGuardPeerStore>> {
+        self.data_plane.0.inbound_manager.wireguard_peer_store(tag)
+    }
+
+    #[cfg(feature = "wireguard")]
+    pub(crate) async fn alter_wireguard_peers<E, F>(
+        &self,
+        tag: &str,
+        update_peers: F,
+    ) -> Result<(), AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&WireGuardPeerStore) -> Result<(), E> + Send,
+    {
+        self.data_plane
+            .0
+            .inbound_manager
+            .alter_wireguard_peers(tag, update_peers)
+            .await
     }
 
     #[cfg(feature = "vless-reverse")]

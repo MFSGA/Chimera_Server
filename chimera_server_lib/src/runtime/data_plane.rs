@@ -18,6 +18,8 @@ use crate::handler::shadowsocks::ShadowsocksUserStore;
 use crate::handler::trojan::TrojanUserStore;
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::vmess_handler::VmessUserStore;
+#[cfg(feature = "wireguard")]
+use crate::wireguard::WireGuardPeerStore;
 #[cfg(feature = "vless-reverse")]
 use crate::{
     address::NetLocation,
@@ -489,6 +491,14 @@ impl DataPlaneRuntime {
         tag: &str,
     ) -> Option<Arc<ShadowsocksUserStore>> {
         self.0.inbound_manager.shadowsocks_user_store(tag)
+    }
+
+    #[cfg(feature = "wireguard")]
+    pub(crate) fn wireguard_peer_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<WireGuardPeerStore>> {
+        self.0.inbound_manager.wireguard_peer_store(tag)
     }
 
     pub(crate) fn select_outbound_checked(

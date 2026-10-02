@@ -5,6 +5,8 @@ mod types;
 
 #[cfg(feature = "api")]
 pub(crate) use builder::collect_xhttp_settings_from_json;
+#[cfg(feature = "wireguard")]
+pub(crate) use builder::decode_wireguard_key;
 #[cfg(feature = "ws")]
 pub mod ws;
 

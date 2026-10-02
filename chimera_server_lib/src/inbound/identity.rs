@@ -1,4 +1,6 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+#[cfg(feature = "vless")]
+use std::sync::RwLock;
 
 use tokio::task::JoinHandle;
 
@@ -10,6 +12,8 @@ use crate::config::server_config::{ServerConfig, ServerProxyConfig};
 use crate::handler::hysteria2::connection::HysteriaUserStore;
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksUserStore;
+#[cfg(feature = "wireguard")]
+use crate::wireguard::WireGuardPeerStore;
 #[cfg(feature = "trojan")]
 use crate::{config::server_config::TrojanUser, handler::trojan::TrojanUserStore};
 #[cfg(feature = "vmess")]
@@ -70,6 +74,13 @@ impl InboundInstance {
                     ShadowsocksUserStore::new(users, identity).ok()
                 })
                 .map(Arc::new),
+            #[cfg(feature = "wireguard")]
+            wireguard_peers: match &config.protocol {
+                ServerProxyConfig::WireGuard { config } => {
+                    Some(Arc::new(WireGuardPeerStore::new(config)))
+                }
+                _ => None,
+            },
             generation,
             lifecycle: InboundLifecycleState::Prepared,
             tasks: None,
@@ -116,6 +127,13 @@ impl InboundInstance {
         if let Some(store) = &self.shadowsocks_users {
             let users = store.snapshot();
             let _ = replace_single_shadowsocks_users(&mut config.protocol, &users);
+        }
+        #[cfg(feature = "wireguard")]
+        if let Some(store) = &self.wireguard_peers
+            && let ServerProxyConfig::WireGuard { config: wireguard } =
+                &mut config.protocol
+        {
+            wireguard.peers = store.config_snapshot();
         }
         config
     }

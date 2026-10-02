@@ -1,4 +1,11 @@
 use super::*;
+#[cfg(feature = "wireguard")]
+use crate::{
+    config::server_config::{
+        WireGuardAllowedIp, WireGuardPeerConfig, decode_wireguard_key,
+    },
+    wireguard::{WireGuardPeerStore, WireGuardPeerStoreError},
+};
 
 mod query;
 
@@ -41,6 +48,136 @@ impl HandlerServiceImpl {
         }
     }
 
+    #[cfg(feature = "wireguard")]
+    pub(super) fn parse_wireguard_peer_user(
+        &self,
+        user: &proto::xray::common::protocol::User,
+    ) -> Result<WireGuardPeerConfig, Status> {
+        let account = user.account.as_ref().ok_or_else(|| {
+            Status::invalid_argument(
+                "AddUserOperation.user.account is required for WireGuard",
+            )
+        })?;
+        if Self::parse_typed_message_type(account)
+            != TYPE_PROXY_WIREGUARD_PEER_CONFIG
+        {
+            return Err(Status::invalid_argument(
+                "unsupported WireGuard account type",
+            ));
+        }
+        let payload = WireGuardPeerAccountPayload::decode(account.value.as_slice())
+            .map_err(|_| {
+                Status::invalid_argument("invalid WireGuard peer account payload")
+            })?;
+        let public_key = decode_wireguard_key(&payload.public_key, "peer.publicKey")
+            .map_err(|_| {
+                Status::invalid_argument("invalid WireGuard peer public key")
+            })?;
+        let pre_shared_key = if payload.pre_shared_key.is_empty() {
+            None
+        } else {
+            Some(
+                decode_wireguard_key(&payload.pre_shared_key, "peer.preSharedKey")
+                    .map_err(|_| {
+                    Status::invalid_argument("invalid WireGuard peer pre-shared key")
+                })?,
+            )
+        };
+        let keep_alive = if payload.keep_alive.is_empty() {
+            0
+        } else {
+            payload.keep_alive.parse::<u16>().map_err(|_| {
+                Status::invalid_argument("invalid WireGuard peer keep_alive")
+            })?
+        };
+        let allowed_ips = payload
+            .allowed_ips
+            .iter()
+            .map(|allowed_ip| Self::parse_wireguard_account_allowed_ip(allowed_ip))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(WireGuardPeerConfig {
+            public_key,
+            pre_shared_key,
+            // Xray's server-side AsAccount conversion does not retain endpoint.
+            endpoint: None,
+            keep_alive,
+            allowed_ips,
+            level: user.level,
+            email: user.email.clone(),
+        })
+    }
+
+    #[cfg(feature = "wireguard")]
+    fn parse_wireguard_account_allowed_ip(
+        value: &str,
+    ) -> Result<WireGuardAllowedIp, Status> {
+        let (address, prefix_len) = value.split_once('/').ok_or_else(|| {
+            Status::invalid_argument("invalid WireGuard peer allowed_ips")
+        })?;
+        let address = address.parse::<std::net::IpAddr>().map_err(|_| {
+            Status::invalid_argument("invalid WireGuard peer allowed_ips")
+        })?;
+        let prefix_len = prefix_len.parse::<u8>().map_err(|_| {
+            Status::invalid_argument("invalid WireGuard peer allowed_ips")
+        })?;
+        let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+        if prefix_len > max_prefix {
+            return Err(Status::invalid_argument(
+                "invalid WireGuard peer allowed_ips",
+            ));
+        }
+        // Xray's MemoryAccount retains netip.Prefix host bits in ToProto.
+        // Matching masks them when evaluating packet source/destination.
+        Ok(WireGuardAllowedIp {
+            address,
+            prefix_len,
+        })
+    }
+
+    #[cfg(feature = "wireguard")]
+    fn map_wireguard_peer_store_error(error: WireGuardPeerStoreError) -> Status {
+        match error {
+            WireGuardPeerStoreError::NotRunning => {
+                Status::unknown("WireGuard inbound is not running")
+            }
+            WireGuardPeerStoreError::InvalidPeer(message) => {
+                Status::invalid_argument(format!(
+                    "invalid WireGuard peer: {message}"
+                ))
+            }
+        }
+    }
+
+    #[cfg(feature = "wireguard")]
+    pub(super) fn apply_wireguard_runtime_operation(
+        &self,
+        store: &WireGuardPeerStore,
+        operation: AlterInboundOperation,
+    ) -> Result<(), Status> {
+        match operation {
+            AlterInboundOperation::Noop => Ok(()),
+            AlterInboundOperation::AddUser(operation) => {
+                let user = operation.user.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("AddUserOperation.user is required")
+                })?;
+                let peer = self.parse_wireguard_peer_user(user)?;
+                store
+                    .add_peer(peer)
+                    .map_err(Self::map_wireguard_peer_store_error)?;
+                let stats = self.runtime.policy_user_stats(user.level);
+                if stats.uplink || stats.downlink {
+                    register_identity(user.email.clone());
+                }
+                Ok(())
+            }
+            AlterInboundOperation::RemoveUser(operation) => store
+                .remove_user(&operation.email)
+                .map_err(Self::map_wireguard_peer_store_error),
+        }
+    }
+
+    #[cfg(feature = "vless")]
     pub(super) fn add_vless_user(
         &self,
         users: &mut Vec<VlessUser>,
@@ -343,7 +480,7 @@ impl HandlerServiceImpl {
         }
     }
 
-    #[cfg(feature = "hysteria")]
+    #[cfg(any(feature = "hysteria", feature = "wireguard"))]
     pub(super) fn apply_add_user_to_protocol(
         &self,
         protocol: &mut ServerProxyConfig,
@@ -409,6 +546,20 @@ impl HandlerServiceImpl {
                     )));
                 }
                 users.push(parsed);
+                Ok(true)
+            }
+            #[cfg(feature = "wireguard")]
+            ServerProxyConfig::WireGuard { config } => {
+                let peer = self.parse_wireguard_peer_user(user)?;
+                if let Some(existing) = config
+                    .peers
+                    .iter_mut()
+                    .find(|existing| existing.public_key == peer.public_key)
+                {
+                    *existing = peer;
+                } else {
+                    config.peers.push(peer);
+                }
                 Ok(true)
             }
             #[cfg(feature = "ws")]
@@ -528,6 +679,15 @@ impl HandlerServiceImpl {
                 users.swap_remove(index);
                 Ok(true)
             }
+            #[cfg(feature = "wireguard")]
+            ServerProxyConfig::WireGuard { config } => {
+                if let Some(index) =
+                    config.peers.iter().position(|peer| peer.email == email)
+                {
+                    config.peers.remove(index);
+                }
+                Ok(true)
+            }
             #[cfg(feature = "ws")]
             ServerProxyConfig::Websocket { targets } => match targets.as_mut() {
                 crate::util::option::OneOrSome::One(target) => {
@@ -576,8 +736,13 @@ impl HandlerServiceImpl {
         protocol: &mut ServerProxyConfig,
         operation: proto::xray::app::proxyman::command::RemoveUserOperation,
     ) -> Result<(), Status> {
-        let email = operation.email.trim();
-        if email.is_empty() {
+        let wireguard = matches!(protocol, ServerProxyConfig::WireGuard { .. });
+        let email = if wireguard {
+            operation.email.as_str()
+        } else {
+            operation.email.trim()
+        };
+        if email.is_empty() && !wireguard {
             return Err(Status::invalid_argument(
                 "RemoveUserOperation.email is required",
             ));

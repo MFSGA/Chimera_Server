@@ -10,6 +10,8 @@ use crate::config::server_config::VlessUser;
 use crate::config::server_config::{
     Hysteria2BandwidthConfig, Hysteria2Client, Hysteria2ServerConfig,
 };
+#[cfg(feature = "wireguard")]
+use crate::config::server_config::{WireGuardDomainStrategy, WireGuardServerConfig};
 use crate::{
     address::{Address, BindLocation, NetLocation},
     config::{
@@ -4136,4 +4138,204 @@ async fn handler_alter_inbound_rejects_unknown_operation_type() {
         .await
         .expect_err("expected invalid argument for unknown operation");
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[cfg(feature = "wireguard")]
+#[tokio::test]
+async fn handler_alters_wireguard_peers_without_restarting_inbound() {
+    let occupied = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("occupy the inbound UDP port");
+    let port = occupied.local_addr().unwrap().port();
+    let inbound_tag = unique_tag("wireguard-user-manager");
+    let runtime = RuntimeState::new(
+        vec![ServerConfig {
+            tag: inbound_tag.clone(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                port,
+            )),
+            protocol: ServerProxyConfig::WireGuard {
+                config: WireGuardServerConfig {
+                    secret_key: [7; 32],
+                    addresses: vec![],
+                    peers: vec![],
+                    mtu: 1420,
+                    reserved: [0; 3],
+                    domain_strategy: WireGuardDomainStrategy::ForceIp,
+                    dns: vec![],
+                    no_kernel_tun: true,
+                },
+            },
+            transport: Transport::Udp,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        }],
+        Vec::new(),
+    );
+    let peer_store = runtime
+        .wireguard_peer_store(&inbound_tag)
+        .expect("WireGuard inbound should own a peer store");
+    peer_store.initialize().expect("initialize peer runtime");
+    let service = HandlerServiceImpl::new(runtime.clone());
+
+    let add_request = |account_type: &str, public_key: &str, email: &str| {
+        let operation = proto::xray::app::proxyman::command::AddUserOperation {
+            user: Some(proto::xray::common::protocol::User {
+                level: 4,
+                email: email.to_string(),
+                account: Some(proto::xray::common::serial::TypedMessage {
+                    r#type: account_type.to_string(),
+                    value: WireGuardPeerAccountPayload {
+                        public_key: public_key.to_string(),
+                        pre_shared_key: String::new(),
+                        endpoint: "192.0.2.9:51820".to_string(),
+                        keep_alive: "25".to_string(),
+                        allowed_ips: vec!["10.0.0.3/24".to_string()],
+                    }
+                    .encode_to_vec(),
+                }),
+            }),
+        };
+        proto::xray::app::proxyman::command::AlterInboundRequest {
+            tag: inbound_tag.clone(),
+            operation: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_ADD_USER_OPERATION.to_string(),
+                value: operation.encode_to_vec(),
+            }),
+        }
+    };
+
+    let before_start = service
+        .alter_inbound(Request::new(add_request(
+            TYPE_PROXY_WIREGUARD_PEER_CONFIG,
+            &"09".repeat(32),
+            "not-running@example.test",
+        )))
+        .await
+        .expect_err("Xray rejects peer updates before the device is running");
+    assert_eq!(before_start.code(), Code::Unknown);
+
+    let placeholder_task = tokio::spawn(std::future::pending::<()>());
+    let abort_handle = placeholder_task.abort_handle();
+    runtime.register_inbound_tasks(&inbound_tag, vec![placeholder_task]);
+
+    let legacy_type = "v2ray.core.proxy.wireguard.PeerConfig";
+    let legacy_error = service
+        .alter_inbound(Request::new(add_request(
+            legacy_type,
+            &"09".repeat(32),
+            "legacy@example.test",
+        )))
+        .await
+        .expect_err("the legacy v2ray WireGuard type must not be accepted");
+    assert_eq!(legacy_error.code(), Code::InvalidArgument);
+
+    service
+        .alter_inbound(Request::new(add_request(
+            TYPE_PROXY_WIREGUARD_PEER_CONFIG,
+            &"09".repeat(32),
+            "peer@example.test",
+        )))
+        .await
+        .expect("add user must update the running peer runtime in place");
+    service
+        .alter_inbound(Request::new(add_request(
+            TYPE_PROXY_WIREGUARD_PEER_CONFIG,
+            &"09".repeat(32),
+            "replacement@example.test",
+        )))
+        .await
+        .expect("same public key must replace its peer, matching Xray");
+
+    assert!(!abort_handle.is_finished());
+    let ServerProxyConfig::WireGuard { config } =
+        runtime.inbound_by_tag(&inbound_tag).unwrap().protocol
+    else {
+        panic!("expected WireGuard inbound");
+    };
+    assert_eq!(config.peers.len(), 1);
+    assert_eq!(config.peers[0].email, "replacement@example.test");
+    assert_eq!(config.peers[0].keep_alive, 25);
+    assert_eq!(config.peers[0].endpoint, None);
+
+    let queried_users = service
+        .get_inbound_users(Request::new(
+            proto::xray::app::proxyman::command::GetInboundUserRequest {
+                tag: inbound_tag.clone(),
+                email: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .users;
+    assert_eq!(queried_users.len(), 1);
+    assert_eq!(queried_users[0].email, "replacement@example.test");
+    let account = queried_users[0]
+        .account
+        .as_ref()
+        .expect("WireGuard UserManager query must include peer account");
+    assert_eq!(account.r#type, TYPE_PROXY_WIREGUARD_PEER_CONFIG);
+    let payload =
+        WireGuardPeerAccountPayload::decode(account.value.as_slice()).unwrap();
+    assert_eq!(payload.public_key, "09".repeat(32));
+    assert_eq!(payload.keep_alive, "25");
+    assert_eq!(payload.allowed_ips, vec!["10.0.0.3/24".to_string()]);
+    assert!(payload.endpoint.is_empty());
+
+    let count = service
+        .get_inbound_users_count(Request::new(
+            proto::xray::app::proxyman::command::GetInboundUserRequest {
+                tag: inbound_tag.clone(),
+                email: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .count;
+    assert_eq!(count, 1);
+
+    let remove_user =
+        |email: &str| proto::xray::app::proxyman::command::AlterInboundRequest {
+            tag: inbound_tag.clone(),
+            operation: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_REMOVE_USER_OPERATION.to_string(),
+                value: proto::xray::app::proxyman::command::RemoveUserOperation {
+                    email: email.to_string(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+    service
+        .alter_inbound(Request::new(remove_user("Replacement@example.test")))
+        .await
+        .expect("missing, case-mismatched email is an Xray no-op");
+    assert_eq!(peer_store.config_snapshot().len(), 1);
+    service
+        .alter_inbound(Request::new(remove_user("replacement@example.test")))
+        .await
+        .expect("exact-email removal should succeed");
+    service
+        .alter_inbound(Request::new(remove_user("replacement@example.test")))
+        .await
+        .expect("removing a missing WireGuard email is idempotent");
+    assert!(peer_store.config_snapshot().is_empty());
+    service
+        .alter_inbound(Request::new(add_request(
+            TYPE_PROXY_WIREGUARD_PEER_CONFIG,
+            &"0a".repeat(32),
+            "",
+        )))
+        .await
+        .expect("Xray permits a WireGuard peer with an empty email");
+    service
+        .alter_inbound(Request::new(remove_user("")))
+        .await
+        .expect("WireGuard RemoveUser passes an empty email through unchanged");
+    assert!(peer_store.config_snapshot().is_empty());
+    assert!(!abort_handle.is_finished());
+    assert!(runtime.stop_inbound_tasks(&inbound_tag).await);
 }

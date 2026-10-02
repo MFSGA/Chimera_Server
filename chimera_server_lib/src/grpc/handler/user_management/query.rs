@@ -95,7 +95,9 @@ impl HandlerServiceImpl {
                 None
             }
             #[cfg(feature = "wireguard")]
-            ServerProxyConfig::WireGuard { .. } => None,
+            ServerProxyConfig::WireGuard { config } => {
+                Some(config.peers.iter().map(|peer| peer.email.clone()).collect())
+            }
         }
     }
 
@@ -344,11 +346,60 @@ impl HandlerServiceImpl {
                     })
                     .collect(),
             ),
+            #[cfg(feature = "wireguard")]
+            ServerProxyConfig::WireGuard { config } => Some(
+                config
+                    .peers
+                    .iter()
+                    .map(|peer| proto::xray::common::protocol::User {
+                        level: peer.level,
+                        email: peer.email.clone(),
+                        account: Some(Self::typed_message(
+                            TYPE_PROXY_WIREGUARD_PEER_CONFIG,
+                            WireGuardPeerAccountPayload {
+                                public_key: encode_wireguard_key_hex(
+                                    &peer.public_key,
+                                ),
+                                pre_shared_key: peer
+                                    .pre_shared_key
+                                    .as_ref()
+                                    .map(encode_wireguard_key_hex)
+                                    .unwrap_or_default(),
+                                endpoint: String::new(),
+                                keep_alive: if peer.keep_alive == 0 {
+                                    String::new()
+                                } else {
+                                    peer.keep_alive.to_string()
+                                },
+                                allowed_ips: peer
+                                    .allowed_ips
+                                    .iter()
+                                    .map(|allowed| {
+                                        format!(
+                                            "{}/{}",
+                                            allowed.address, allowed.prefix_len
+                                        )
+                                    })
+                                    .collect(),
+                            },
+                        )),
+                    })
+                    .collect(),
+            ),
             ServerProxyConfig::DokodemoDoor { .. } | ServerProxyConfig::Tunnel => {
                 None
             }
-            #[cfg(feature = "wireguard")]
-            ServerProxyConfig::WireGuard { .. } => None,
         }
     }
+}
+
+#[cfg(feature = "wireguard")]
+fn encode_wireguard_key_hex(key: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(key.len() * 2);
+    for byte in key {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
 }

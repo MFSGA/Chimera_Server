@@ -9,7 +9,10 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use boringtun::{
@@ -26,7 +29,8 @@ use tokio::{
 use crate::{
     address::BindLocation,
     config::server_config::{
-        ServerConfig, ServerProxyConfig, WireGuardAllowedIp, WireGuardServerConfig,
+        ServerConfig, ServerProxyConfig, WireGuardAllowedIp, WireGuardPeerConfig,
+        WireGuardServerConfig,
     },
     runtime::DataPlaneRuntime,
 };
@@ -45,9 +49,54 @@ pub(crate) struct PeerRuntime {
     pub(crate) level: u32,
     pub(crate) email: String,
     allowed_ips: Vec<WireGuardAllowedIp>,
+    active: AtomicBool,
     endpoint: Mutex<Option<SocketAddr>>,
     tunnel: Mutex<Tunn>,
 }
+
+struct WireGuardPeerState {
+    configs: Vec<WireGuardPeerConfig>,
+    runtimes: Option<Arc<Vec<Arc<PeerRuntime>>>>,
+}
+
+/// Inbound-instance-owned peer state shared by management and the UDP worker.
+pub(crate) struct WireGuardPeerStore {
+    secret_key: [u8; 32],
+    state: RwLock<WireGuardPeerState>,
+}
+
+impl std::fmt::Debug for WireGuardPeerStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self
+            .state
+            .read()
+            .expect("WireGuard peer store lock poisoned");
+        formatter
+            .debug_struct("WireGuardPeerStore")
+            .field("peer_count", &state.configs.len())
+            .field("runtime_ready", &state.runtimes.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WireGuardPeerStoreError {
+    NotRunning,
+    InvalidPeer(String),
+}
+
+impl std::fmt::Display for WireGuardPeerStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning => {
+                formatter.write_str("WireGuard inbound is not running")
+            }
+            Self::InvalidPeer(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WireGuardPeerStoreError {}
 
 impl std::fmt::Debug for PeerRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -61,47 +110,181 @@ impl std::fmt::Debug for PeerRuntime {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_peer_runtimes(
     config: &WireGuardServerConfig,
 ) -> Result<Vec<Arc<PeerRuntime>>, String> {
-    let private_key = StaticSecret::from(config.secret_key);
+    build_peer_runtimes_for(config.secret_key, &config.peers)
+}
+
+fn build_peer_runtimes_for(
+    secret_key: [u8; 32],
+    peers: &[WireGuardPeerConfig],
+) -> Result<Vec<Arc<PeerRuntime>>, String> {
+    let private_key = StaticSecret::from(secret_key);
     let server_public_key = PublicKey::from(&private_key);
-    config
-        .peers
+    peers
         .iter()
-        .map(|peer| {
-            if peer.public_key == server_public_key.to_bytes() {
-                return Err(
-                    "wireguard peer public key must differ from server key".into()
-                );
-            }
-            Ok(Arc::new(PeerRuntime {
-                level: peer.level,
-                email: peer.email.clone(),
-                allowed_ips: peer.allowed_ips.clone(),
-                endpoint: Mutex::new(None),
-                tunnel: Mutex::new(Tunn::new(
-                    private_key.clone(),
-                    PublicKey::from(peer.public_key),
-                    peer.pre_shared_key,
-                    (peer.keep_alive != 0).then_some(peer.keep_alive),
-                    0,
-                    None,
-                )),
-            }))
-        })
+        .map(|peer| build_peer_runtime(&private_key, server_public_key, peer))
         .collect()
 }
 
+fn build_peer_runtime(
+    private_key: &StaticSecret,
+    server_public_key: PublicKey,
+    peer: &WireGuardPeerConfig,
+) -> Result<Arc<PeerRuntime>, String> {
+    if peer.public_key == server_public_key.to_bytes() {
+        return Err("wireguard peer public key must differ from server key".into());
+    }
+    Ok(Arc::new(PeerRuntime {
+        level: peer.level,
+        email: peer.email.clone(),
+        allowed_ips: peer.allowed_ips.clone(),
+        active: AtomicBool::new(true),
+        endpoint: Mutex::new(None),
+        tunnel: Mutex::new(Tunn::new(
+            private_key.clone(),
+            PublicKey::from(peer.public_key),
+            peer.pre_shared_key,
+            (peer.keep_alive != 0).then_some(peer.keep_alive),
+            0,
+            None,
+        )),
+    }))
+}
+
+impl WireGuardPeerStore {
+    pub(crate) fn new(config: &WireGuardServerConfig) -> Self {
+        Self {
+            secret_key: config.secret_key,
+            state: RwLock::new(WireGuardPeerState {
+                configs: config.peers.clone(),
+                runtimes: None,
+            }),
+        }
+    }
+
+    pub(crate) fn initialize(&self) -> Result<Arc<Vec<Arc<PeerRuntime>>>, String> {
+        if let Some(runtimes) = self
+            .state
+            .read()
+            .expect("WireGuard peer store lock poisoned")
+            .runtimes
+            .as_ref()
+            .cloned()
+        {
+            return Ok(runtimes);
+        }
+        let configs = self.config_snapshot();
+        let runtimes = Arc::new(build_peer_runtimes_for(self.secret_key, &configs)?);
+        let mut state = self
+            .state
+            .write()
+            .expect("WireGuard peer store lock poisoned");
+        Ok(Arc::clone(state.runtimes.get_or_insert(runtimes)))
+    }
+
+    pub(crate) fn config_snapshot(&self) -> Vec<WireGuardPeerConfig> {
+        self.state
+            .read()
+            .expect("WireGuard peer store lock poisoned")
+            .configs
+            .clone()
+    }
+
+    pub(crate) fn runtime_snapshot(&self) -> Arc<Vec<Arc<PeerRuntime>>> {
+        self.state
+            .read()
+            .expect("WireGuard peer store lock poisoned")
+            .runtimes
+            .clone()
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn add_peer(
+        &self,
+        peer: WireGuardPeerConfig,
+    ) -> Result<(), WireGuardPeerStoreError> {
+        let private_key = StaticSecret::from(self.secret_key);
+        let server_public_key = PublicKey::from(&private_key);
+        let runtime = build_peer_runtime(&private_key, server_public_key, &peer)
+            .map_err(WireGuardPeerStoreError::InvalidPeer)?;
+        let mut state = self
+            .state
+            .write()
+            .expect("WireGuard peer store lock poisoned");
+        let Some(current_runtimes) = state.runtimes.as_ref() else {
+            return Err(WireGuardPeerStoreError::NotRunning);
+        };
+        let mut runtimes = current_runtimes.as_ref().clone();
+        let index = state
+            .configs
+            .iter()
+            .position(|current| current.public_key == peer.public_key);
+        if let Some(index) = index {
+            runtimes[index].deactivate();
+            state.configs[index] = peer;
+            runtimes[index] = runtime;
+        } else {
+            state.configs.push(peer);
+            runtimes.push(runtime);
+        }
+        state.runtimes = Some(Arc::new(runtimes));
+        Ok(())
+    }
+
+    pub(crate) fn remove_user(
+        &self,
+        email: &str,
+    ) -> Result<(), WireGuardPeerStoreError> {
+        let mut state = self
+            .state
+            .write()
+            .expect("WireGuard peer store lock poisoned");
+        let Some(current_runtimes) = state.runtimes.as_ref() else {
+            return Err(WireGuardPeerStoreError::NotRunning);
+        };
+        if let Some(index) =
+            state.configs.iter().position(|peer| peer.email == email)
+        {
+            let mut runtimes = current_runtimes.as_ref().clone();
+            runtimes[index].deactivate();
+            state.configs.remove(index);
+            runtimes.remove(index);
+            state.runtimes = Some(Arc::new(runtimes));
+        }
+        Ok(())
+    }
+}
+
 impl PeerRuntime {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
     pub(crate) async fn receive(
         &self,
         source: IpAddr,
         datagram: &[u8],
     ) -> ReceiveResult {
+        if !self.is_active() {
+            return ReceiveResult::Rejected;
+        }
         let mut output = vec![0u8; PACKET_BUFFER_SIZE];
         let mut tunnel = self.tunnel.lock().await;
-        match tunnel.decapsulate(Some(source), datagram, &mut output) {
+        if !self.is_active() {
+            return ReceiveResult::Rejected;
+        }
+        let result = tunnel.decapsulate(Some(source), datagram, &mut output);
+        if !self.is_active() {
+            return ReceiveResult::Rejected;
+        }
+        match result {
             TunnResult::WriteToNetwork(packet) => {
                 ReceiveResult::Response(packet.to_vec())
             }
@@ -131,17 +314,34 @@ impl PeerRuntime {
     }
 
     pub(crate) async fn set_endpoint(&self, endpoint: SocketAddr) {
-        *self.endpoint.lock().await = Some(endpoint);
+        let mut current = self.endpoint.lock().await;
+        if self.is_active() {
+            *current = Some(endpoint);
+        }
     }
 
     pub(crate) async fn endpoint(&self) -> Option<SocketAddr> {
-        *self.endpoint.lock().await
+        if !self.is_active() {
+            return None;
+        }
+        let endpoint = *self.endpoint.lock().await;
+        self.is_active().then_some(endpoint).flatten()
     }
 
     pub(crate) async fn encapsulate(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        if !self.is_active() {
+            return None;
+        }
         let mut output = vec![0u8; packet.len() + 148];
         let mut tunnel = self.tunnel.lock().await;
-        match tunnel.encapsulate(packet, &mut output) {
+        if !self.is_active() {
+            return None;
+        }
+        let result = tunnel.encapsulate(packet, &mut output);
+        if !self.is_active() {
+            return None;
+        }
+        match result {
             TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
             TunnResult::Done
             | TunnResult::Err(_)
@@ -151,9 +351,19 @@ impl PeerRuntime {
     }
 
     pub(crate) async fn update_timers(&self) -> Option<Vec<u8>> {
+        if !self.is_active() {
+            return None;
+        }
         let mut output = vec![0u8; PACKET_BUFFER_SIZE];
         let mut tunnel = self.tunnel.lock().await;
-        match tunnel.update_timers(&mut output) {
+        if !self.is_active() {
+            return None;
+        }
+        let result = tunnel.update_timers(&mut output);
+        if !self.is_active() {
+            return None;
+        }
+        match result {
             TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
             TunnResult::Done
             | TunnResult::Err(_)
@@ -171,8 +381,8 @@ impl PeerRuntime {
     }
 
     fn matching_prefix_len(&self, address: IpAddr) -> Option<u8> {
-        if self.allowed_ips.is_empty() {
-            return Some(0);
+        if !self.is_active() {
+            return None;
         }
         self.allowed_ips
             .iter()
@@ -226,7 +436,7 @@ impl PacketDevice for tun::AsyncDevice {
 #[cfg(target_os = "linux")]
 pub(crate) async fn start_server(
     config: ServerConfig,
-    _runtime: DataPlaneRuntime,
+    runtime: DataPlaneRuntime,
 ) -> std::io::Result<JoinHandle<()>> {
     let ServerConfig {
         tag,
@@ -286,7 +496,10 @@ pub(crate) async fn start_server(
         tcp_socket_policy.as_ref(),
         false,
     )?;
-    let peers = build_peer_runtimes(&config).map_err(std::io::Error::other)?;
+    let peer_store = runtime.wireguard_peer_store(&tag).ok_or_else(|| {
+        std::io::Error::other("WireGuard peer store is unavailable for inbound")
+    })?;
+    let peers = peer_store.initialize().map_err(std::io::Error::other)?;
     tracing::info!(
         inbound_tag = %tag,
         bind = %bind_addr,
@@ -294,7 +507,7 @@ pub(crate) async fn start_server(
         peers = peers.len(),
         "starting WireGuard inbound"
     );
-    Ok(tokio::spawn(run_server(socket, device, peers)))
+    Ok(tokio::spawn(run_server(socket, device, peer_store)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -312,7 +525,7 @@ pub(crate) async fn start_server(
 async fn run_server<D: PacketDevice + 'static>(
     socket: Arc<UdpSocket>,
     device: D,
-    peers: Vec<Arc<PeerRuntime>>,
+    peer_store: Arc<WireGuardPeerStore>,
 ) {
     let mut udp_buffer = vec![0u8; PACKET_BUFFER_SIZE];
     let mut tun_buffer = vec![0u8; PACKET_BUFFER_SIZE];
@@ -321,14 +534,17 @@ async fn run_server<D: PacketDevice + 'static>(
         tokio::select! {
             result = socket.recv_from(&mut udp_buffer) => {
                 let Ok((length, source)) = result else { break };
+                let peers = peer_store.runtime_snapshot();
                 process_udp_datagram(&socket, &device, source, &udp_buffer[..length], &peers).await;
             }
             result = device.recv(&mut tun_buffer) => {
                 let Ok(length) = result else { break };
+                let peers = peer_store.runtime_snapshot();
                 process_tun_packet(&socket, &tun_buffer[..length], &peers).await;
             }
             _ = timer.tick() => {
-                for peer in &peers {
+                let peers = peer_store.runtime_snapshot();
+                for peer in peers.iter() {
                     if let (Some(endpoint), Some(packet)) =
                         (peer.endpoint().await, peer.update_timers().await)
                     {
@@ -354,6 +570,9 @@ async fn process_udp_datagram<D: PacketDevice>(
             match peer.receive(source.ip(), packet).await {
                 ReceiveResult::Response(response) => {
                     peer.set_endpoint(source).await;
+                    if !peer.is_active() {
+                        return;
+                    }
                     if socket.send_to(&response, source).await.is_err() {
                         return;
                     }
@@ -361,7 +580,9 @@ async fn process_udp_datagram<D: PacketDevice>(
                 }
                 ReceiveResult::IpPacket { packet, .. } => {
                     peer.set_endpoint(source).await;
-                    let _ = device.send(&packet).await;
+                    if peer.is_active() {
+                        let _ = device.send(&packet).await;
+                    }
                     return;
                 }
                 ReceiveResult::Done => return,
@@ -386,7 +607,9 @@ async fn process_tun_packet(
     let Some(endpoint) = peer.endpoint().await else {
         return;
     };
-    if let Some(encrypted) = peer.encapsulate(packet).await {
+    if let Some(encrypted) = peer.encapsulate(packet).await
+        && peer.is_active()
+    {
         let _ = socket.send_to(&encrypted, endpoint).await;
     }
 }
@@ -594,6 +817,81 @@ mod tests {
         assert_eq!(reply_source, Ipv4Addr::new(10, 0, 0, 1));
     }
 
+    #[tokio::test]
+    async fn peer_with_empty_allowed_ips_cannot_send_or_route_ip_packets() {
+        let server_secret = [7u8; 32];
+        let client_secret = [9u8; 32];
+        let client_public =
+            PublicKey::from(&StaticSecret::from(client_secret)).to_bytes();
+        let server_public = PublicKey::from(&StaticSecret::from(server_secret));
+        let config = WireGuardServerConfig {
+            secret_key: server_secret,
+            addresses: vec![WireGuardAddress {
+                address: "10.0.0.1".parse().unwrap(),
+                prefix_len: 24,
+            }],
+            peers: vec![WireGuardPeerConfig {
+                public_key: client_public,
+                pre_shared_key: None,
+                endpoint: None,
+                keep_alive: 0,
+                allowed_ips: Vec::new(),
+                level: 0,
+                email: "empty-allowed-ips".into(),
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            domain_strategy: WireGuardDomainStrategy::ForceIp,
+            dns: Vec::new(),
+            no_kernel_tun: true,
+        };
+        let peers = build_peer_runtimes(&config).unwrap();
+        let mut client = Tunn::new(
+            StaticSecret::from(client_secret),
+            server_public,
+            None,
+            None,
+            1,
+            None,
+        );
+        let mut client_output = vec![0u8; PACKET_BUFFER_SIZE];
+        let TunnResult::WriteToNetwork(handshake) =
+            client.encapsulate(&[], &mut client_output)
+        else {
+            panic!("client must start a handshake");
+        };
+        let response = peers[0]
+            .receive("192.0.2.10".parse().unwrap(), handshake)
+            .await;
+        let ReceiveResult::Response(response) = response else {
+            panic!("peer with empty AllowedIPs may complete a handshake");
+        };
+        let mut client_handshake_output = vec![0u8; PACKET_BUFFER_SIZE];
+        assert!(matches!(
+            client.decapsulate(None, &response, &mut client_handshake_output),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        let packet = ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]);
+        let TunnResult::WriteToNetwork(encrypted) =
+            client.encapsulate(&packet, &mut client_output)
+        else {
+            panic!("client must encrypt the IP packet");
+        };
+        assert_eq!(
+            peers[0]
+                .receive("192.0.2.10".parse().unwrap(), encrypted)
+                .await,
+            ReceiveResult::Rejected,
+            "an empty AllowedIPs list must not authorize packet source addresses"
+        );
+        assert!(
+            select_peer_for_destination(&peers, "10.0.0.2".parse().unwrap())
+                .is_none(),
+            "an empty AllowedIPs list must not create a catch-all route"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn runtime_moves_packets_between_udp_and_tun() {
@@ -626,7 +924,8 @@ mod tests {
             dns: Vec::new(),
             no_kernel_tun: true,
         };
-        let peers = build_peer_runtimes(&config).unwrap();
+        let peer_store = Arc::new(WireGuardPeerStore::new(&config));
+        peer_store.initialize().unwrap();
         let (to_tun_tx, mut to_tun_rx) = mpsc::channel(4);
         let (from_tun_tx, from_tun_rx) = mpsc::channel(4);
         let device = MemoryTun {
@@ -637,7 +936,8 @@ mod tests {
             Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
         let server_addr = server_socket.local_addr().unwrap();
         let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let server_task = tokio::spawn(run_server(server_socket, device, peers));
+        let server_task =
+            tokio::spawn(run_server(server_socket, device, peer_store));
 
         let mut client = Tunn::new(
             StaticSecret::from(client_secret),
@@ -703,6 +1003,130 @@ mod tests {
         };
         assert_eq!(client_reply, reply);
         assert_eq!(source, Ipv4Addr::new(10, 0, 0, 1));
+
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runtime_observes_peer_add_remove_without_restarting_udp_worker() {
+        let server_secret = [17u8; 32];
+        let client_secret = [19u8; 32];
+        let client_public =
+            PublicKey::from(&StaticSecret::from(client_secret)).to_bytes();
+        let server_public = PublicKey::from(&StaticSecret::from(server_secret));
+        let config = WireGuardServerConfig {
+            secret_key: server_secret,
+            addresses: vec![WireGuardAddress {
+                address: "10.0.0.1".parse().unwrap(),
+                prefix_len: 24,
+            }],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0; 3],
+            domain_strategy: WireGuardDomainStrategy::ForceIp,
+            dns: Vec::new(),
+            no_kernel_tun: true,
+        };
+        let peer_store = Arc::new(WireGuardPeerStore::new(&config));
+        peer_store.initialize().unwrap();
+        let (to_tun_tx, mut to_tun_rx) = mpsc::channel(4);
+        let (_from_tun_tx, from_tun_rx) = mpsc::channel(4);
+        let device = MemoryTun {
+            inbound: Mutex::new(from_tun_rx),
+            outbound: to_tun_tx,
+        };
+        let server_socket =
+            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let server_addr = server_socket.local_addr().unwrap();
+        let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_task =
+            tokio::spawn(run_server(server_socket, device, Arc::clone(&peer_store)));
+
+        peer_store
+            .add_peer(WireGuardPeerConfig {
+                public_key: client_public,
+                pre_shared_key: None,
+                endpoint: None,
+                keep_alive: 0,
+                allowed_ips: vec![WireGuardAllowedIp {
+                    address: "10.0.0.2".parse().unwrap(),
+                    prefix_len: 32,
+                }],
+                level: 0,
+                email: "dynamic-peer".into(),
+            })
+            .unwrap();
+
+        let mut client = Tunn::new(
+            StaticSecret::from(client_secret),
+            server_public,
+            None,
+            None,
+            1,
+            None,
+        );
+        let mut client_output = vec![0u8; PACKET_BUFFER_SIZE];
+        let TunnResult::WriteToNetwork(handshake) =
+            client.encapsulate(&[], &mut client_output)
+        else {
+            panic!("client must start a handshake");
+        };
+        client_socket.send_to(handshake, server_addr).await.unwrap();
+
+        let mut udp_buffer = vec![0u8; PACKET_BUFFER_SIZE];
+        let (length, _) = timeout(
+            Duration::from_secs(1),
+            client_socket.recv_from(&mut udp_buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut client_handshake_output = vec![0u8; PACKET_BUFFER_SIZE];
+        assert!(matches!(
+            client.decapsulate(
+                None,
+                &udp_buffer[..length],
+                &mut client_handshake_output,
+            ),
+            TunnResult::WriteToNetwork(_)
+        ));
+
+        let packet = ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]);
+        let TunnResult::WriteToNetwork(encrypted) =
+            client.encapsulate(&packet, &mut client_output)
+        else {
+            panic!("client must encrypt the IP packet");
+        };
+        client_socket.send_to(encrypted, server_addr).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), to_tun_rx.recv())
+                .await
+                .unwrap()
+                .expect("new peer traffic must reach TUN"),
+            packet
+        );
+
+        peer_store.remove_user("dynamic-peer").unwrap();
+        assert!(peer_store.config_snapshot().is_empty());
+        let revoked_packet = ipv4_packet([10, 0, 0, 2], [10, 0, 0, 1]);
+        let TunnResult::WriteToNetwork(encrypted) =
+            client.encapsulate(&revoked_packet, &mut client_output)
+        else {
+            panic!("client must encrypt the next IP packet");
+        };
+        client_socket.send_to(encrypted, server_addr).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), to_tun_rx.recv())
+                .await
+                .is_err(),
+            "removed peer traffic must no longer reach TUN"
+        );
+        assert!(
+            !server_task.is_finished(),
+            "peer mutation must not restart or stop the UDP worker"
+        );
 
         server_task.abort();
         assert!(server_task.await.unwrap_err().is_cancelled());

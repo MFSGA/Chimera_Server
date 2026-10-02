@@ -352,9 +352,13 @@ cargo check -p chimera_server_app --no-default-features --features minimal-vless
 
 ## 13. 决策记录与待验证事项
 
-### 13.1 WireGuard inbound first slice (2026-09-21)
+### 13.1 WireGuard inbound first slices (2026-09-21–2026-10-02)
 
-当前实现选择 WireGuard 服务端 inbound 作为第一切片：配置编译和 key/peer/AllowedIPs 校验进入 `wireguard` Cargo feature，Linux runtime 使用 userspace `boringtun` 协议状态加系统 L3 TUN 设备，UDP listener 与 TUN 生命周期由同一个 inbound task 持有。2026-09-21 已用无特权 loopback UDP + 内存 `PacketDevice` harness 验证握手、解密包写入 TUN、服务端回复加密和 task abort；真实 system TUN 权限/路由创建与版本化 Xray 客户端互操作仍未验证。`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、IPv6-only TUN 和非 Linux 后端尚未完成，不能据此宣称完整 WireGuard/Xray 兼容。下一步应验证真实 system TUN 启动/停止与 TCP/UDP 转发，再决定是否引入 userspace IP stack。
+当前实现选择 WireGuard 服务端 inbound 作为第一切片：配置编译和 key/peer/AllowedIPs 校验进入 `wireguard` Cargo feature，Linux runtime 使用 userspace `boringtun` 协议状态加系统 L3 TUN 设备，UDP listener 与 TUN 生命周期由同一个 inbound task 持有。2026-09-21 已用无特权 loopback UDP + 内存 `PacketDevice` harness 验证握手、解密包写入 TUN、服务端回复加密和 task abort；真实 system TUN 权限/路由创建与版本化 Xray 客户端互操作仍未验证。2026-10-02 针对固定 Xray-core `v26.9.9` peer 配置语义修正并测试了空 `AllowedIPs`：peer 可完成握手，但不接受任何内层 IP 源地址，也不参与目的地址路由；此前 Chimera 将空列表误作 catch-all。
+
+2026-10-02 增加了实例级 `WireGuardPeerStore`，由 `InboundInstance` 持有，UDP worker 在每个数据面事件读取短锁保护的 peer runtime 快照；Xray `HandlerService.AlterInbound` 的 AddUser/RemoveUser 直接变更此 store，不重启 UDP/TUN listener，管理查询通过配置快照投影反映最新 peer。TypedMessage 只接受固定基线的 `xray.proxy.wireguard.PeerConfig`，使用当前字段编号；AddUser 按公钥替换、RemoveUser 按大小写敏感的原始 email 删除且 missing 为 no-op，GetUsers/GetCount 基于 peer 集合。loopback UDP + 内存 TUN 测试覆盖运行中的增删 peer 不重启 worker，gRPC handler 测试覆盖 modern account 编解码、API 查询、重复公钥替换、email 匹配/幂等性和未运行状态拒绝；精简组合 `cargo test -p chimera_server_lib --no-default-features --features api,wireguard --lib wireguard::tests -- --nocapture`（5 passed）及对应 UserManager 定向测试（1 passed）通过。该证据仅是本地实现测试，不是 Xray 互操作认证；固定 Xray 基线仍为 v26.9.9，未运行真实 Xray gRPC client/server 双端测试。`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、IPv6-only TUN 和非 Linux 后端尚未完成，不能据此宣称完整 WireGuard/Xray 兼容。
+
+本次状态更新取代 2026-09-11 M3 汇总中“WireGuard UserManager 不在当前 compatibility matrix 范围”的旧表述：它现在列为本地 runtime/API 已实现，但在完成固定版本 Xray 双端测试前仍不标记为互操作已验证。
 
 ### 13.2 VLESS Reverse capability boundary (2026-09-21)
 

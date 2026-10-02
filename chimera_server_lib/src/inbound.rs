@@ -15,6 +15,8 @@ use crate::handler::hysteria2::connection::HysteriaUserStore;
 use crate::handler::shadowsocks::ShadowsocksUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
+#[cfg(feature = "wireguard")]
+use crate::wireguard::WireGuardPeerStore;
 use crate::{
     beginning::start_bound_servers, config::server_config::ServerConfig,
     runtime::RuntimeState,
@@ -60,6 +62,8 @@ struct InboundInstance {
     hysteria_users: Option<Arc<HysteriaUserStore>>,
     #[cfg(feature = "shadowsocks")]
     shadowsocks_users: Option<Arc<ShadowsocksUserStore>>,
+    #[cfg(feature = "wireguard")]
+    wireguard_peers: Option<Arc<WireGuardPeerStore>>,
 }
 
 mod identity;
@@ -101,6 +105,7 @@ pub(crate) enum RemoveInboundError {
 #[allow(dead_code)] // Dynamic inbound mutation is provided by the optional API.
 pub(crate) enum AlterInboundError<E> {
     NotFound,
+    NotRunning,
     Update(E),
     State(&'static str),
     Restart {
@@ -236,6 +241,21 @@ impl InboundManager {
             .iter()
             .find(|entry| entry.config.tag == tag)
             .and_then(|entry| entry.shadowsocks_users.as_ref())
+            .cloned()
+    }
+
+    #[cfg(feature = "wireguard")]
+    pub(crate) fn wireguard_peer_store(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<WireGuardPeerStore>> {
+        self.state
+            .read()
+            .expect("inbound manager lock poisoned")
+            .configs
+            .iter()
+            .find(|entry| entry.config.tag == tag)
+            .and_then(|entry| entry.wireguard_peers.as_ref())
             .cloned()
     }
 
@@ -684,6 +704,39 @@ impl InboundManager {
         }
 
         self.alter_started_locked(runtime, tag, update_config).await
+    }
+
+    #[cfg(feature = "wireguard")]
+    pub(crate) async fn alter_wireguard_peers<E, F>(
+        &self,
+        tag: &str,
+        update_peers: F,
+    ) -> Result<(), AlterInboundError<E>>
+    where
+        E: Send,
+        F: FnOnce(&WireGuardPeerStore) -> Result<(), E> + Send,
+    {
+        let _operation_guard = self.operation_lock(tag).lock().await;
+        let store = {
+            let state = self.state.read().expect("inbound manager lock poisoned");
+            let Some(entry) =
+                state.configs.iter().find(|entry| entry.config.tag == tag)
+            else {
+                return Err(AlterInboundError::NotFound);
+            };
+            if entry.lifecycle != InboundLifecycleState::Running
+                || entry
+                    .tasks
+                    .as_ref()
+                    .is_none_or(|tasks| tasks.iter().any(JoinHandle::is_finished))
+            {
+                return Err(AlterInboundError::NotRunning);
+            }
+            entry.wireguard_peers.clone()
+        }
+        .ok_or(AlterInboundError::NotFound)?;
+
+        update_peers(store.as_ref()).map_err(AlterInboundError::Update)
     }
 
     async fn alter_started_locked<E, F>(

@@ -81,6 +81,9 @@ impl HandlerServiceImpl {
     fn map_alter_inbound_error(error: AlterInboundError<Status>) -> Status {
         match error {
             AlterInboundError::NotFound => Status::unknown("inbound not found"),
+            AlterInboundError::NotRunning => {
+                Status::unknown("inbound is not running")
+            }
             AlterInboundError::Update(error) => error,
             AlterInboundError::State(error) => Status::internal(error),
             AlterInboundError::Restart {
@@ -173,6 +176,19 @@ impl proto::xray::app::proxyman::command::handler_service_server::HandlerService
             return Err(Status::unknown("inbound not found"));
         }
         if matches!(&operation, AlterInboundOperation::Noop) {
+            return Ok(Response::new(
+                proto::xray::app::proxyman::command::AlterInboundResponse {},
+            ));
+        }
+
+        #[cfg(feature = "wireguard")]
+        if self.runtime.wireguard_peer_store(&request.tag).is_some() {
+            self.runtime
+                .alter_wireguard_peers(&request.tag, |store| {
+                    self.apply_wireguard_runtime_operation(store, operation)
+                })
+                .await
+                .map_err(Self::map_alter_inbound_error)?;
             return Ok(Response::new(
                 proto::xray::app::proxyman::command::AlterInboundResponse {},
             ));

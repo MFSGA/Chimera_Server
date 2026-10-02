@@ -505,6 +505,7 @@ impl HandlerServiceImpl {
         Ok(ServerProxyConfig::Trojan { users, fallbacks })
     }
 
+    #[cfg(feature = "hysteria")]
     pub(super) fn parse_hysteria_client(
         &self,
         user: &proto::xray::common::protocol::User,

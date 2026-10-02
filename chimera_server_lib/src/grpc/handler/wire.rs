@@ -1,4 +1,5 @@
 use prost::Message;
+#[cfg(feature = "vless")]
 use tonic::Status;
 
 use super::super::proto;
@@ -80,6 +81,9 @@ pub(super) const TYPE_PROXY_SOCKS_CLIENT_CONFIG: &str =
     "xray.proxy.socks.ClientConfig";
 pub(super) const TYPE_PROXY_SOCKS_CLIENT_CONFIG_V2RAY: &str =
     "v2ray.core.proxy.socks.ClientConfig";
+#[cfg(feature = "wireguard")]
+pub(super) const TYPE_PROXY_WIREGUARD_PEER_CONFIG: &str =
+    "xray.proxy.wireguard.PeerConfig";
 pub(super) const TYPE_PROXY_BLACKHOLE_CONFIG: &str = "xray.proxy.blackhole.Config";
 #[cfg(feature = "trojan")]
 pub(super) const TYPE_PROXY_TROJAN_ACCOUNT: &str = "xray.proxy.trojan.Account";
@@ -132,6 +136,21 @@ pub(super) struct TrojanAccountPayload {
 pub(super) struct HysteriaAccountPayload {
     #[prost(string, tag = "1")]
     pub(super) auth: String,
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct WireGuardPeerAccountPayload {
+    #[prost(string, tag = "1")]
+    pub(super) public_key: String,
+    #[prost(string, tag = "2")]
+    pub(super) pre_shared_key: String,
+    #[prost(string, tag = "3")]
+    pub(super) endpoint: String,
+    #[prost(string, tag = "4")]
+    pub(super) keep_alive: String,
+    #[prost(string, repeated, tag = "5")]
+    pub(super) allowed_ips: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
