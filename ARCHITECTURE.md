@@ -469,6 +469,114 @@ listener/accept/socket-policy/proxy-header helper 的内部 re-export 也已归�
 `transport::tcp`。本切片不改变 XHTTP mode、HTTP settings、header/TLS timeout、H3 flow control/congestion、
 padding、request classification、listener bind/socket policy、TLS/REALITY 选择或 logical-session 生命周期。
 
+### 13.10 Generic QUIC listener startup migration (2026-10-02)
+
+第四批继续把通用 QUIC listener startup wrapper 从 `beginning/quic.rs` 迁入 `transport/quic.rs`。该模块只读取
+`ServerQuicConfig` 的证书/私钥/ALPN/client fingerprint，构造共享 rustls server config，并按已编译
+`ServerProxyConfig` 把启动委托给 Hysteria2 或 TUIC protocol server；不持有 routing、logical session 或协议
+wire 状态。`beginning` 的 `Transport::Quic` 分支现在直接调用 `transport::quic::start_quic_server`，旧模块
+不保留 facade，函数从私有子模块中的 `pub` 收紧为显式 crate-private。本切片不改变证书读取顺序、ALPN、
+fingerprint、TUIC sockopt fail-closed、Hysteria2 socket-policy 传递、task ownership 或错误文本。Hysteria-only
+稀疏 feature 构建通过；TUIC-only 仍暴露既有 outbound cfg 缺口（TUIC wrapper 调到仅 hysteria gate 的 helper），
+该问题与目录迁移无关且未在本切片扩展修复。
+
+### 13.11 mKCP transport and UDP socket primitives migration (2026-10-02)
+
+第四批继续把完整 mKCP transport owner 从 `beginning/mkcp` 迁入 `transport/mkcp`。packet codec、session demux、
+sending/receiving window、connection state machine、byte-stream adapter、UDP server driver 和对应测试保持同一
+模块树，不拆散 KCP 状态机；server driver 仍只在形成逻辑 byte stream 后把连接交给 session dispatcher。mKCP
+原先复用的 `beginning::udp` bind/socket-policy helper 同时提取为 `transport::udp` 通用 socket primitives，
+现有 Dokodemo/Shadowsocks UDP listener 和 WireGuard 也直接复用这一份实现；UDP routing、GlobalID XUDP、
+Dokodemo session 与 targeted session 仍留在原 owner，本切片不扩大 UDP 迁移范围。mKCP 六个实现文件与迁移前
+内容逐字一致，UDP helper 函数体也保持逐字一致；旧 `beginning::mkcp` 和 `beginning::udp` helper facade
+调用归零。此前用于保留未直接生产调用状态机 API 的模块级 dead-code allowance 随 mKCP owner 一并迁移。
+本切片不改变 mKCP segment wire、conversation demux、ACK/RTO/cwnd、重传次数与延迟、stream backpressure、
+UDP bind/socket policy、original-destination fail-closed、connection task ownership 或 sniffing/session dispatch。
+
+### 13.12 Targeted UDP logical-session migration (2026-10-02)
+
+第四批继续把 multi-directional targeted UDP relay 从 `beginning/udp/targeted_session.rs` 迁入
+`session/udp/targeted.rs`，并由 `session::udp::run_multi_directional_udp` 直接拥有 TaskTracker wrapper。
+dispatcher 与 VLESS Reverse 不再经 `beginning::udp` facade；Dokodemo、Shadowsocks/Trojan UDP cleanup 和
+现有 session-based worker 需要的 targeted-message shutdown helper 也直接调用新的 session owner。targeted relay
+自己的 direct-session key、buffer/channel capacity 与 60s idle timeout 跟随 owner 内聚，数值与迁移前保持一致；
+除 owner/import/visibility 与这些本地常量定义外，relay 实现保持机械不变。当前 `session_worker` 与
+`global_xudp` 仍共享 attachment、generation、worker registry 与 GlobalID detach/reattach 生命周期，因此没有
+在本切片强拆；它们将与 `run_session_based_udp` 作为后续完整 session slice 处理。本切片不改变 outbound
+selection、user-domain policy 顺序、Trojan proxy session reuse、message boundaries、idle timeout、task drain、
+traffic accounting、shutdown semantics 或 targeted UDP wire。
+
+### 13.13 Session-based UDP and GlobalID XUDP lifecycle migration (2026-10-02)
+
+第四批继续把 `run_session_based_udp`、`session_worker` 与 `global_xudp` 作为一个完整 logical-session owner
+迁入 `session/udp`。三者共同拥有 session generation、local/Trojan/global worker replacement、GlobalID
+attachment token、detach/reattach、expiry timer、stale response filtering、pending downlink buffer 和 worker
+cleanup；因此没有继续拆成跨目录互相引用的半套生命周期。server shutdown 现在直接调用
+`session::udp::shutdown_global_xudp_workers`，dispatcher 与 VLESS/VMess/XUDP 测试调用也直接使用
+`session::udp::run_session_based_udp`，旧 `beginning::udp` facade 与子模块路径归零。为保持现有
+`beginning/udp/tests.rs` 的生命周期回归覆盖，原 sibling-only worker/global internals 从 `pub(super)` 统一
+放宽为 crate-private `pub(crate)`；不形成公开 API。两个 moved worker 文件除该可见性变化外逐字一致，
+session-based 主循环及 session-message read/write/flush/shutdown helpers 从旧父模块原块迁移。session owner
+保留与旧实现相同的 64 KiB buffer、8192-byte proxy message buffer、64-slot channel 与 60s idle timeout；
+listener/Dokodemo 仍保留其现有同值常量，后续只有在 owner 明确时才统一。本切片不改变 GlobalID registry
+语义、generation 单调性、takeover/stale sender 拒绝、detach buffer、DNS/user-domain policy 顺序、Trojan
+GlobalID fail-closed、traffic accounting、idle expiry、task cancellation/drain 或 XUDP/session-message wire。
+
+### 13.14 Bidirectional UDP logical-session migration (2026-10-02)
+
+第四批继续把 `run_bidirectional_udp` 及其 blackhole/direct/Trojan message relay、message read/write/flush/shutdown
+helpers 从 `beginning::udp` 迁入 `session::udp::bidirectional`。dispatcher 与 VLESS UDP 测试路径现在直接依赖
+`session::udp::run_bidirectional_udp`，旧 `beginning::udp` relay facade 归零；现有 UDP listener 与 Dokodemo
+实现继续留在 `beginning::udp`，避免把 listener startup 和 logical session 混为同一切片。机械比对按旧文件中
+“主函数区间 + helper 尾段”重组，除新模块的 `use super::*` 与 Trojan 类型局部 import 外内容一致。
+`beginning::udp` 父模块因此只保留 listener/Dokodemo 的共享 buffer/channel/idle 常量及 test harness，生产构建
+不再携带 bidirectional relay 的 routing/resolver/message-stream imports。本切片不改变 outbound selection、
+user-domain policy 顺序、Freedom UDP bind/connect、Blackhole accounting、Trojan tunnel 建立/关闭、message
+boundary、flush/shutdown、traffic accounting、错误文本或 UDP wire。
+
+### 13.15 Dokodemo UDP flow/session migration (2026-10-02)
+
+第四批继续把 Dokodemo Door 的 UDP flow/session owner 从 `beginning/udp/dokodemo.rs` 迁入
+`session/udp/dokodemo.rs`。该模块持有 client/target/outbound 维度的 session key、Freedom/Trojan/VLESS
+Reverse session reuse、response loop、idle expiry、original-destination datagram handling、routing 与
+user-domain policy 选择；UDP listener 仍只把已绑定 server socket 和 Dokodemo 配置交给该 session owner。
+`beginning/udp/listener.rs` 直接调用 `session::udp::dokodemo::run_dokodemo_udp_server`，不保留旧 sibling
+facade；为保留现有 lifecycle/routing 测试，`UdpOutboundAction`、`run_dokodemo_udp_server` 与
+`select_udp_outbound` 从 sibling-only `pub(super)` 放宽为 crate-private `pub(crate)`，不形成公开 API。
+除前序 targeted-session 路径调整、该可见性变化与格式化 import 顺序外，moved 文件与旧实现机械一致。
+Dokodemo 原先使用的 64-slot session channel 现在直接来自 `session::udp` owner，`beginning::udp` 删除已无使用
+的旧常量副本。本切片不改变 followRedirect/original-destination、session key、Freedom/Trojan/VLESS Reverse
+路由、user-domain policy 顺序、idle timeout、response source filtering、traffic accounting、task ownership、
+错误文本或 UDP wire。
+
+### 13.16 Shadowsocks UDP relay/session migration (2026-10-02)
+
+第四批继续把 Shadowsocks UDP 的 packet/session owner 从 `beginning/udp/listener.rs` 剥离到
+`session/udp/shadowsocks.rs`。listener 现在只负责 bind、Shadowsocks UDP codec 构造、inbound tag/runtime
+传递与 server task 启动；packet receive loop、动态 user store codec 刷新、每包 connection task ownership、
+outbound routing、Freedom/Blackhole/Trojan relay、response timeout 与加密响应全部由 session owner 持有。
+`run_shadowsocks_udp_server` 与 `relay_shadowsocks_udp_packet` 从 sibling-only `pub(super)` 放宽为
+crate-private `pub(crate)`，供 listener 与既有 lifecycle/routing 测试直接调用，不形成公开 API。机械比对确认
+两函数实现除可见性外与迁移前 block 一致；原 `beginning::udp` 中 64 KiB buffer 与 60s idle timeout 副本随
+最后一个使用者迁出后删除，统一使用 `session::udp` owner 的同值常量。本切片不改变动态 Shadowsocks user
+publication、decrypt/encrypt wire、routing/user-domain 输入、Freedom target resolution、Blackhole accounting、
+Trojan tunnel、per-packet task ownership、listener-stop 后既有 packet task 生命周期、response timeout、错误文本
+或 UDP wire。
+
+### 13.17 UDP listener startup migration (2026-10-02)
+
+第四批完成剩余 UDP listener startup 从 `beginning/udp/listener.rs` 到
+`transport/udp/listener.rs` 的迁移。该模块现在只负责 UDP transport 的协议分发、bind/socket-policy、
+Dokodemo target 预解析与 listener task 启动，以及 Shadowsocks UDP codec 构造后把 packet loop 交给
+`session::udp::shadowsocks`；Dokodemo flow/session 继续由 `session::udp::dokodemo` 持有。
+`beginning::start_server_tasks` 的 `TcpAndUdp` 与 `Udp` 分支直接调用
+`transport::udp::start_udp_server`，旧 `beginning::udp` 不再参与生产构建，仅以 `cfg(test)` 保留现有
+UDP 生命周期/路由回归 harness。函数级机械比对确认 `start_udp_server` 与
+`start_shadowsocks_udp_server` 函数体未改变，唯一 owner 级变化是前者从旧模块 `pub` 收紧为
+crate-private `pub(crate)`。本切片不改变 socket bind/options、original-destination、followRedirect 平台
+fail-closed、Dokodemo target resolution、Shadowsocks codec 构造、listener task ownership、错误文本或 UDP
+session/wire 行为。
+
 已选定的方向：单核心库内渐进分层；共用配置语义入口；计划与运行实体分离；管理器拥有生命周期；数据面仅接收必要能力；复用既有观测面。
 
 实施前需按切片验证，而非臆定：
