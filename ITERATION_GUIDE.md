@@ -1,892 +1,232 @@
-# Chimera_Server 需求、架构演进与维护手册
+# VLESS Reverse 站点到站点网关设计
 
-版本：1.0 · 更新：2026-09-12 · 读者：项目维护者、代码审查者及后续 AI 贡献者
+- 启动日期：2026-10-03
+- 状态：VLESS UDP / Hub Reverse 路由、多目标 XUDP/GlobalID 重附着、Edge Overlay 前缀映射与 TCP/UDP allow ACL 已实现。Linux `tun-gateway` 复用 Client `clash-netstack/`（Cargo package `watfaq-netstack`），通过可选 feature 处理双栈 TCP/UDP；真实隔离 namespace 已覆盖 IPv4/IPv6 单站点 veth LAN 路径、IPv4/IPv6 重复 LAN 双站点路径、双站点路径下两 Edge 对 TCP/UDP ACL 的真实目标拒绝、TCP 并发配额拒绝与恢复、UDP session 配额拒绝，以及同一 UDP socket/source/target tuple 连续三轮 62 秒静默后的 DNS A recovery（每轮均重建 Reverse session）、Hub 重启后的 Edge Bridge 重连及新 TCP/UDP 流量恢复、Edge 连续 3 次单独重启后的 TCP 恢复与同源 UDP 有界重试/稳定包验证，以及在 1 秒 Hub drain deadline 后让存量 TCP close（EOF 或 reset）到达 TUN 客户端；另覆盖 4 KiB UDP、Overlay 源地址恢复、两台普通 Office client 并发 UDP、UDP/53 DNS A 查询/响应、短时 TCP/UDP iperf3 与 SIGTERM 设备清理。TUN 本地 IPv6 地址可由可选 `tunGateway.ipv6Address` 配置；本机路由可选由 `routes`、`routeFrom` 和 `routeInputInterface` 源/入接口策略管理，上游静态路由仍由部署方管理。Chimera Hub/Edge 之间另用 Mux option bit `0x04` 承载方向性 TCP half-close；Xray 标准 END 仍整流关闭，half-close 不宣称与 Xray 对端互通。Server 当前 vendored 了 Client 的异步 netstack shutdown 与包日志脱敏修复，并在退出包循环后 join TCP packet engine。物理 LAN/生产路由、生产级负载和高频/长时间 UDP session churn、Xray TUN 互通、其他分片异常、普通 VLESS TCP/TLS outbound 与 Xray Edge Bridge TLS/TCP 已在该站点路径通过单组合验证；其他 Reverse transport/security 组合仍未全面验收，能力保持 Partial。
+- 外部协议基线：本地 `ref/xray-core` Xray-core `v26.9.9`，提交 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
+- Client 网络栈来源：Server vendored Chimera_Client `clash-netstack/`（Cargo package `watfaq-netstack`）`0.26.3` 到 `vendor/watfaq-netstack`；基线为 `6e951d59976c22a65238e8a70069971a6dfea4ae`，快照另包含 Client 本地提交 `925d4b1b66a543956c61239776196cd9d17e5c5d` 与 `8fc9b2b3821a571f806cda6cc4df68bef8ad1b46`。来源、许可证和同步要求见 vendor `UPSTREAM.md`。
+- 本轮实际客户端：本地 Xray `26.9.9 Custom (go1.27rc2 linux/amd64)`，Linux
+- 站点 endpoint 观测：Xray Observatory 的 `probeURL` 已通过真实 Office VLESS→Hub Reverse→Edge 映射/ACL 路径探测；隔离 namespace 验证在线、下线、恢复。独立 gRPC e2e 用本地 HTTP fixture 验证 `GetOutboundStatus` 状态变化，不经过站点拓扑。它观测所选 outbound 的 HTTP endpoint，不提供 Bridge 注册表或真实 LAN 设备清单。
+- Xray Edge 互通边界：`scripts/test_tun_gateway_xray_edge_netns.sh` 使用固定 Xray 26.9.9 Bridge 和 Chimera Hub Portal，在隔离 namespaces 中验证普通 Office LAN 主机的 IPv4/IPv6 TCP、UDP 与 4 KiB UDP 经 Chimera system TUN 到 Xray Edge，再经 veth 到独立 LAN namespace 的 echo 服务并返回正确目标源地址。测试还验证 Xray Edge 的 `finalRules` 允许 TCP 39641/UDP 39642，而 IPv4/IPv6 的 TCP 39643/UDP 39644 虽有真实 LAN 监听器，仍未收到 Office 侧探测。当前测试的 Office VLESS Gateway→Hub Portal 与 Xray Edge Bridge→Hub Portal 均使用 TCP/TLS；双方以 `site-tls.test` SAN 和显式测试信任根验证证书。关闭并重启 TLS Hub 后，烟测等待 Xray Reverse Portal worker 重新挂接，并验证 Office TCP/UDP 新会话恢复；随后保持 Hub 与 Office Gateway 运行、单独重启 TLS Xray Edge，要求 Portal worker attach 计数增加并验证新的 Office IPv4/IPv6 TCP/UDP 会话恢复；烟测还把 Office Gateway 的 TLS SNI 单独改错，确认双栈 TCP/UDP 请求均未抵达仍在线的 Edge LAN；恢复正确 SNI、重建 TUN Gateway 后，双栈 TCP/UDP 再次成功。此测试选择 Overlay 目标地址与 LAN 服务地址完全相同，证明该 TLS/TCP Reverse passthrough 与 Xray Edge 最终目的策略；不证明 Xray 支持 Chimera 的 `siteToSite` prefix map/ACL、不验证地址重叠翻译，也不代表 Xray 自身 TUN inbound 兼容。
 
-**本文是长期迭代工作的入口手册。当前优先 Xray 服务端 inbound 兼容与架构完善；WireGuard、Xray outbound 属于后期目标，顺序未定；TUN 可以最后做；MCP 可做可不做。**
+- Xray Hub/Portal with mapped Chimera Edge: `scripts/test_tun_gateway_xray_hub_netns.sh` verifies IPv4 RAW/TLS, IPv4 XHTTP/TLS H2 `packet-up`/`stream-up`/`auto`, H3 `packet-up`/`stream-up`/`auto`, and IPv6 WebSocket/TLS Office outbounds for TCP, UDP, and 4 KiB UDP through fixed Xray 26.9.9 and a Chimera Edge `siteToSite` prefix map/ACL. Wrong SNI and UUID probes over all H2 profiles, both H3 profiles, and WebSocket/TLS are denied before explicitly allowed LAN targets; denied-port probes remain isolated while Freedom permits their mapped targets. Static VLESS XHTTP H3 uses a separate UDP/QUIC socket; H1 and non-default QUIC settings remain unverified. Xray 26.9.9 warns that WebSocket is deprecated and recommends XHTTP. Static VLESS TCP/UDP uplink-before-response-header behavior has focused regressions. Physical LAN and other Reverse transport/security combinations remain unverified.
 
-本文不宣布所有目标已经实现，不授权批量重写、删除既有功能、修改生产网络或发布版本。示意类型、目录和接口只有经代码核验后才能视为现状。
+## 目标
 
-## 阅读导航
+在普通终端无需安装代理客户端的前提下，通过站点网关访问一个或多个远端 LAN。公网 Hub 使用现有 VLESS Reverse Portal；内网 Edge 主动连接 Hub 并作为 Reverse Bridge。办公室 Gateway 把经静态路由送入 TUN 的 IPv4/IPv6 TCP/UDP 流量接入 Server 现有 routing、policy 和 outbound。
 
-| 你现在要解决的问题 | 阅读位置 |
-| --- | --- |
-| 明确项目目标及范围 | 第 1–3 节 |
-| 理解架构与模块职责 | 第 4–8 节 |
-| 审核生命周期、状态和控制面 | 第 9–11 节 |
-| 规划 WireGuard、outbound、TUN | 第 12 节 |
-| 使用 feature 与定位线上问题 | 第 13–14 节 |
-| 选择下一轮迭代、执行迁移 | 第 15–17 节 |
-| 测试、跨平台、发布与交接 | 第 18–21 节 |
-| 判断架构是否完成、记录决策 | 第 22–24 节 |
+首个产品范围是 Linux system TUN、IPv4/IPv6 TCP/UDP、单 Hub、单远端站点；随后增加 Overlay 前缀映射以支持真实 LAN 网段重叠。`tunGateway.address` 配置必需的 IPv4 接口地址，`tunGateway.ipv6Address` 可选地配置本地 IPv6 地址；静态路由由部署方设置并覆盖测试拓扑。它是 TCP/UDP 代理网关，不提供任意 IP 协议或真实端到端 ICMP 语义。完成本专项也不代表完整 Xray TUN 配置或平台兼容。
 
-## 1. 文档职责与事实来源
-
-| 文档或证据 | 职责 |
-| --- | --- |
-| [AGENTS.md](AGENTS.md) | 贡献流程、操作边界、构建和发布要求 |
-| 本手册 | 已确认需求、优先级、迭代选择、架构审核与维护方法 |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 目标设计、模块契约、已记录迁移进展与设计依据 |
-| [兼容矩阵](examples/xray-compatible/README.md) | 按组合维护支持状态与验证依据 |
-| [配置说明](chimera_server_lib/src/config/README.md) | 用户可见配置的具体语义 |
-| 当前源码、测试及运行记录 | 实际实现与可重复验证的证据 |
-| 固定 Xray 参考提交及二进制 | 外部兼容行为的比较基线 |
-
-使用顺序：先读 AGENTS 的要求及本文优先级，再读架构相关章节，最后核对实际代码、diff、测试和参考行为。已有任务内只需复查变更部分，不机械重复阅读。
-
-用户最新明确指令优先。本文不能覆盖 AGENTS 的发布授权要求；目标设计不能替代运行证据。文档中的“完成”只适用于当时记录的范围和版本，不自动涵盖后来出现的代码改动。
-
-如果文档和代码不同，分别记录“期望行为”“实际行为”“迁移状态”；不要通过删除设计要求掩盖缺口，也不要为了符合旧文档改回已经验证的正确实现。对过时说明做局部修正并保留有价值的证据。
-
-## 2. 已确认的用户需求
-
-### 2.1 最终产品目标
-
-Chimera_Server 是以 Xray 服务端兼容为目标的 Rust 网络核心。现有 Xray-compatible 客户端应在声明支持的范围内无需改变协议配置即可连接；服务端配置应保留等价含义。
-
-兼容包括配置字段、默认值、认证、传输、安全握手、回落、TCP/UDP 行为、用户策略、管理 API、统计和平台行为。编译成功、能够解析配置、单次网页访问成功都不足以宣称完整兼容。
-
-同时改善内部可维护性：修改一种行为时需要协调的责任中心更少，状态和任务归属更清晰，故障可重现、可隔离，架构能够支持后期扩展。
-
-### 2.2 当前与后期优先级
-
-| 层级 | 内容 | 对当前迭代的含义 |
-| --- | --- | --- |
-| 用户已启动的专项 | 当前 Xray VLESS Reverse | 按 `VLESS_REVERSE_DESIGN.md` 分批实现，不恢复 legacy Reverse |
-| 当前主要目标 | 服务端 inbound 兼容与架构收口 | 默认优先选择相关可验证切片 |
-| 当前必要基础 | 既有目标连接、DNS、routing/policy、转发和管理能力 | 保持正确，允许修复直接阻碍 inbound 的问题 |
-| 后期目标 | WireGuard、Xray outbound 能力 | 两者实施顺序未定，不提前扩展功能生态 |
-| 更后期目标 | 与 Xray 对应接口及行为兼容的 TUN | 可以放到最后，目前只避免封死包级接入和设备生命周期 |
-| 可选能力 | MCP | 不列为必交付，不阻塞 inbound、架构收口或发布 |
-
-“后期考虑”不等于现在创建空模块、引入依赖、开放配置字段或调整默认 feature。VLESS Reverse 已由
-用户明确启动，因此不再属于未授权的未来占位目标，但仍须在首个可执行切片中同步落地 feature、配置
-消费者和验证，不能先提交空 feature。既有功能也不因优先级降低而自动获得删除授权。
-
-### 2.3 尚未确定的事项
-
-- WireGuard 与 outbound 的启动顺序、具体兼容版本及验收范围。
-- TUN 的首个平台、网络栈、设备后端及移动端接入方式。
-- MCP 是否保留、何时移出核心、是否采用独立程序。
-- 最终 crate 拆分、公共 API 命名，以及除已确认 `vless-reverse` 外的新 feature 名称。
-- 每个后期协议的完整实现策略与性能目标。
-
-这些应在具体目标启动时决策，不用当前手册替用户作无依据的承诺。
-
-## 3. 独立架构判断与参考方法
-
-Xray 规定外部行为；clash-rs、sing-box、Envoy、shadowsocks-rust、Pingora、Leaf 提供设计思路。参考入口见 [架构参考资料](ARCHITECTURE.md#14-参考资料)。内部实现不必复制任何一个项目。
-
-提出设计时回答四个问题：
-
-1. 当前有哪些具体耦合、重复规则、状态风险或测量到的成本？
-2. 保留现状、借鉴参考、本地简化方案分别有什么代价？
-3. 新边界保护哪个不变量，减少哪些调用方需要知道的细节？
-4. 如何证明外部行为不变或偏差已明确？
-
-不要把 Rust、无锁、Actor、零拷贝、更多 trait 或更多 crate 本身当成结论。也不要为了原创拒绝现有可靠实现。新抽象必须对应真实变化点，通用化至少要有具体使用场景支撑。
-
-## 4. 编写时的项目基线与已有成果
-
-本手册编写开始时仓库 HEAD 为 `a05e780c05a6b2b5e166202eca571244f0a0550a`，工作树包含正在进行的职责提取，因此该 SHA 不代表本次工作树的全部内容。当时本地 Xray 参考为 `5ca6f4b7d4dc20a881d4330e498892697627ec0c`；当前可复现源码基线已更新为 Xray-core `v26.9.9`（`52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`，pre-release）。本手册的历史结论没有因此自动获得新版本互通证据，相关验证仍须按记录的版本重新运行。
-
-维护者可从这些实际入口核验已形成的边界：
-
-| 边界 | 当前入口 | 维护重点 |
-| --- | --- | --- |
-| 管理与数据面能力 | [runtime.rs](chimera_server_lib/src/runtime.rs)、[data_plane.rs](chimera_server_lib/src/runtime/data_plane.rs) | 不再把完整管理能力传回协议层 |
-| Inbound 实例与生命周期 | [inbound.rs](chimera_server_lib/src/inbound.rs)、[lifecycle.rs](chimera_server_lib/src/inbound/lifecycle.rs) | generation、启动清理及发布状态一致 |
-| 用户状态 | [inbound/identity.rs](chimera_server_lib/src/inbound/identity.rs) 与协议用户存储 | 动态发布不得无故重建 listener 或 replay 状态 |
-| 传输计划 | [transport_plan.rs](chimera_server_lib/src/beginning/transport_plan.rs) | 不重新引入多处递归探测 |
-| 任务跟踪 | [session_tasks.rs](chimera_server_lib/src/session_tasks.rs) | 保留任务完成、取消及 drain 语义 |
-| 路由内部职责 | [rule.rs](chimera_server_lib/src/routing_state/rule.rs)、[balancer.rs](chimera_server_lib/src/routing_state/balancer.rs) | 规则与负载选择不依赖具体协议拨号 |
-| 已有出站编译 | [static_config/compile.rs](chimera_server_lib/src/outbound/static_config/compile.rs) | 复用既有语义，后续再调整职责位置 |
-
-ARCHITECTURE 第 12 节记录了 2026-09-11 的 M2–M6 阶段结果及细节。它是已有工作记录，不是本手册重新测试的声明。不得因为新的目标目录尚未出现，就把已完成的动态用户、任务所有权、readiness 或 DataPlaneRuntime 迁移从头重做。
-
-编写开始时观察到的未提交改动涉及 beginning、relay、XHTTP、配置 builder、gRPC stats 及多个协议拆分。该清单是历史快照，不是实时任务列表，也不单凭脏文件推断存在并发 writer。整理期间 HEAD 已推进，后续必须重新检查 git status、具体 diff 和任务归属，再选择不冲突的切片。
-
-## 5. 两条流程与单向依赖
-
-配置生命周期和网络数据路径分别建模；查询、删除及用户修改命令不必都经过完整 Config Compiler。
-
-```mermaid
-flowchart LR
-    F[文件配置] --> A[输入适配]
-    G[gRPC 配置请求] --> A
-    A --> C[配置编译]
-    C --> P[不可变计划]
-    P --> R[资源准备]
-    R --> M[管理器发布运行实例]
-    Q[gRPC 查询或生命周期命令] --> M
-```
-
-```mermaid
-flowchart LR
-    L[监听或未来设备接入] --> T[传输与安全处理]
-    T --> P[协议认证与解析]
-    P --> S[逻辑会话]
-    S --> R[Routing 决策]
-    R --> O[Outbound 执行]
-    I[身份与策略查询] -.-> P
-    I -.-> S
-    S -.计量.-> E[Traffic]
-```
-
-第二张图表示逻辑关系：普通代理、QUIC 多路复用、回落与后期包级接入可有不同执行形态。不强制一条固定的函数调用链。
-
-依赖要求：控制面调用管理服务；数据面不依赖控制请求类型。编译器可以使用纯协议选项校验；运行模块不依赖外部 JSON/protobuf 配置结构。Routing 不建立协议连接，Outbound 不擅自再次执行整套业务路由。
-
-## 6. 目标责任地图
-
-| Domain | 负责 | 不负责 |
-| --- | --- | --- |
-| server | 组件装配、整体 readiness、退出协调 | 协议帧解析 |
-| config/source | 文件/外部来源加载，显式环境输入 | 活跃连接状态 |
-| config/adapter | 格式转换，保留 presence 与来源语义 | 生命周期事务 |
-| config/compile | 默认值、合法组合、能力诊断 | socket bind、后台任务和全局日志初始化 |
-| config/plan | 描述有限且已验证的启动意图 | 动态授权集合和任务句柄 |
-| inbound | 实例注册、generation、生命周期事务 | 独立复制传输和认证逻辑 |
-| transport | 接入、传输 framing、连接作用域 | 业务 routing rule |
-| security | 安全握手及必要能力状态 | 与 transport 争夺连接最终关闭权 |
-| protocol | wire、认证、请求或回落结果 | 全局管理操作 |
-| session | 逻辑转发、超时、半关闭、取消和收尾 | 控制面 protobuf |
-| routing | 规则、balancer、逻辑出口决策 | TLS/Trojan 等拨号细节 |
-| outbound | 实例查找、连接、封装及既有复用资源 | 重复业务路由 |
-| identity | 稳定身份、索引、更新版本 | 强行统一所有协议凭据 |
-| policy | 策略语义与计算 | listener 启停 |
-| runtime | 发布与组装所需共享状态 | 成为所有域的万能入口 |
-| traffic | 计量、聚合、查询 | 作为认证身份唯一事实来源 |
-| control | gRPC 格式、Status、内部命令映射 | 数据面 wire 和生命周期业务事务 |
-| resolver/address/io | 明确的小型基础能力 | 容纳所有难分类逻辑 |
-
-`runtime/policy` 如果保留，只负责发布/存储；策略语义不再另算一份。`outbound/selector` 若只是按选定 tag 找实例，应准确命名，避免和 routing 的选择重复。
-
-`transport/xhttp/session` 负责传输请求关联与重组，顶层 session 负责代理会话执行，两种“session”必须在 API 注释中区分。
-
-### 6.1 目录形态示意
+## 数据流与边界
 
 ```text
-chimera_server_lib/src/
-  server/             # 装配、整体生命周期、readiness
-  config/             # source、adapter、compile、plan、diagnostics
-  inbound/            # manager、instance、lifecycle、实例身份绑定
-  transport/          # tcp、udp、quic、websocket、httpupgrade、grpc、xhttp
-  security/           # tls、reality；按真实使用方设计共享实现
-  protocol/           # vless、vmess、trojan、socks、http、ss、hysteria2、tuic、xudp 等
-  session/            # context、dispatch、sniff、relay、UDP 与持久会话
-  runtime/            # data-plane capability、一致版本发布
-  routing/            # rule、balancer、observation、process、geodata
-  outbound/           # 既有连接能力；新协议扩展后置
-  identity/           # 仅稳定共享概念；不强制立刻独立建目录
-  policy/
-  traffic/
-  control/grpc/       # MCP 不占必需目录
-  resolver/
-  address/
-  io/
+Office LAN host
+  → OS static route
+  → Office Gateway TUN device
+  → watfaq-netstack TCP/UDP session
+  → Chimera Server routing / policy / outbound
+  → Hub VLESS inbound
+  → Hub route by Overlay destination
+  → VLESS Reverse Portal
+  → Site Edge Reverse Bridge
+  → optional Overlay-to-LAN mapping and final ACL
+  → LAN socket
 ```
 
-这是责任地图，不是本次 mkdir/rename 清单。高度内聚的域可以暂用单个 `.rs`，不为目录形式添加空文件。后期 WireGuard/TUN 不在此提前规定内部文件树。
+- `watfaq-netstack` 只做 IP 包到 TCP/UDP 会话转换；不拥有 Server routing、Reverse、身份策略或设备生命周期。
+- TUN device、packet shuttle、netstack task 和逻辑会话都要有清晰 owner、取消、启动回滚及有界关闭。
+- Hub 必须先按 Overlay 目的地址选择站点，前缀映射在对应 Site Edge 最后一跳进行。多个 Edge policy 可以把互不重叠的 Overlay 前缀映射到相同 LAN CIDR；映射前的 Hub route tag 保留站点身份，避免重复 LAN 地址冲突。
+- Site Edge 分开记录原始 Overlay 目标、实际 LAN 目标和返回给 Overlay 会话的源地址；UDP 回复必须恢复为 Overlay endpoint。
+- Overlay ACL 在 Hub 按已认证身份与原始目标检查；Site Edge 在映射后再次对真实目标执行 allow/deny，再拨号或发送数据。
+- Reverse Mux source metadata 不作为身份认证事实。Gateway 入口使用配置的用户级别和 inbound tag；跨站点授权须由可信 VLESS user / policy identity 承载。
 
-### 6.2 既有代码的迁移归属
+### Edge 映射和 ACL 的责任边界
 
-| 现有位置 | 目标 | 需要先验证的边界 |
-| --- | --- | --- |
-| lib.rs 启动编排 | server | 主 CLI、专用 REALITY 服务和库嵌入调用方 |
-| beginning 的监听与 socket | transport / inbound 装配 | bind-ready 与 task publication |
-| stream_session、tcp_relay | session | 响应时机、sniffing、计量及半关闭 |
-| UDP listener 与 worker | transport/udp 与 session/udp | 源/目标关联、超时及 GlobalID 所有权 |
-| gRPC transport、XHTTP | transport 对应域 | 物理连接与逻辑 RPC/请求关联 |
-| handler/ws、httpupgrade、proxy_protocol | transport | 包装边界和安全上下文 |
-| handler/tls、reality | security 与传输装配 | fallback、Vision、底层能力 |
-| handler 中代理协议 | protocol | 认证、codec、Outcome |
-| xudp frame/stream 与 registry | protocol/xudp 与 session | framing 与跨连接生命周期分别归属 |
-| gRPC 服务文件 | control/grpc | 编解码保留，业务事务移交已有 manager |
-| user_domain | policy | 访问规则而非通用用户存储 |
-| socket util、prefixed stream | transport 或 io | 只移动真实共享原语 |
+附带的开发指南把 `Freedom.finalRules`、`prefixRedirect` 和系统路由列为可选实现路径。当前先将映射和最终目标 ACL 实现在 `settings.reverse.siteToSite`：Hub 先按未改写的 Overlay 目的地址选择站点，Edge 的 Reverse Mux worker 再映射并检查实际 LAN 目标。这避免改变所有普通 Freedom outbound 的行为，也让站点边界策略只随对应 Edge Bridge 生效。代价是这是 Chimera 扩展，不是 Xray 配置兼容；配置明确省略该块时保持既有 Reverse 语义，配置该块后未匹配目标默认拒绝。
 
-消除 `beginning` 和含义过宽的 `handler` 是长期归位方向；目录消失不是功能正确或架构完成的充分证据。
+固定 Xray `v26.9.9` 的 `ref/xray-core/proxy/freedom/freedom.go` 将 `finalRules` 用于最后的 Freedom 连接/发送边界，并对 VLESS Reverse inbound 默认 block-all。Server 现已在通用 TCP/UDP 出站选择和 Dokodemo 专用 UDP route 中调用同一规则匹配器，实现部分子集：有序 allow/block、network、port、字面 IPv4/IPv6 CIDR、域名全部 DNS 候选检查，以及 Reverse 默认 block-all/常见 inbound 私网默认阻断。GeoIP、反向匹配、blockDelay、redirect/destinationOverride、非默认 domainStrategy、fragment/noise、socket/dialer 设置仍显式拒绝；拒绝暂时立即关闭 TCP 或丢弃 UDP，而非 Xray 的延迟 blackhole。固定 Xray 26.9.9 客户端已实测 Chimera Freedom 的 VLESS TCP 指定私网 loopback 目标放行、另一个未列出的私网端口拒绝；本设计中的 namespace 测试则验证 Xray Edge 自身 `finalRules` 在真实 TUN/Reverse 路径放行与拒绝双栈 TCP/UDP，这不是 Chimera Freedom 的 UDP 互操作证据。Chimera UDP 管理 API 输入与其他组合仍未互操作验证，故该能力保持 Partial。该通用末端规则和 Edge `siteToSite` 映射/ACL 解决不同边界，互不替代。TUN/system route 仍由独立 inbound 生命周期持有，不与此策略模块耦合。
 
-## 7. 配置契约：Input、Plan、Prepared、Instance
+## 现状核对
 
-### 7.1 各阶段的区别
+| 边界 | 当前观察 | 迭代要求 |
+|---|---|---|
+| Reverse Portal / Bridge | 已有 worker、Mux TCP/packet session、重连和动态用户管理 | 复用现有运行时，不另建 peer registry |
+| TCP Reverse | 已有固定范围的 Xray RAW/TLS 等互操作记录 | 验证任意 IP/端口目标、断线后的新连接与 routing/policy |
+| UDP Reverse | 已有 Reverse packet session、DokodemoDoor 定向 UDP；VLESS UDP session 已能路由到 Reverse，并由 Hub GlobalID worker 保持 Reverse session | Xray 默认 cone/XUDP 同一 association 多目标及来源回复已通过。Hub GlobalID detach/reattach 的 Reverse Portal→Edge 内存集成测试验证复用同一 Mux session 和 Edge UDP socket、回复送到新 attachment；固定 Xray 26.9.9 RAW TCP 测试通过可控代理切断 client→Hub VLESS TCP，随后同一 SOCKS UDP association 建立第二条 TCP 连接并恢复同 GlobalID 会话，再切换目标并核对回包源。真实网络故障、idle expiry、无 worker、其他动态规则形状、负向认证和其他传输/安全组合仍待验收；Hub IPv6 CIDR RemoveRule 的既有/新 UDP 会话边界已通过 RAW、TLS、XHTTP 与 Xray 参考端验证 |
+| Hub Overlay ingress authorization | 固定 Xray 26.9.9 RAW/TCP、TLS/TCP、WebSocket/TLS、XHTTP/TLS `packet-up`/`stream-up`/`auto`、REALITY/TCP 与 SOCKS UDP client 已验证按 VLESS identity、inbound tag、Overlay CIDR、network/port 路由，IPv4 `/24` 与 IPv6 `/64` 黑洞保护也已覆盖。RoutingService AddRule/RemoveRule/ListRule 的 CIDR wire schema 与 live allow/revoke 已验证；已有 TCP 和同目标 UDP association 继续工作，新 association 及同 association 的新目标被拒绝。RAW Xray reference server/client 也确认 active UDP session persistence。 | 继续覆盖更多 rule shapes、REALITY 其他选项、WebSocket 其他安全组合/早期数据、XHTTP 其他传输/设置组合、跨站点 identity/route-tag 组合和物理 LAN |
+| VLESS outbound | 已实现 command `0x02`、Xray response header 与 2-byte length framing；固定目标和 session-based XUDP 会消费该能力。VLESS inbound 会在等待首个 UDP datagram 前发出 response header，避免双方首包互等 | 固定目标 framing 有本地 wire tests；普通静态 VLESS outbound 支持 RAW/TCP + TLS、feature-gated WebSocket/TLS（需 app `ws` feature）与 XHTTP/TLS H2（需 `vless`、`tls`；不单设 XHTTP feature）；固定 Xray 26.9.9 namespace 路径验证 Office IPv4 RAW/TLS、IPv4 XHTTP/TLS `packet-up`/`stream-up`/`auto`、IPv6 WebSocket/TLS 下的 TCP、UDP、4 KiB UDP，并验证三种 XHTTP H2 profile 和 WebSocket/TLS 的错误 SNI、未知 UUID 不触达 Edge 显式放行目标；非空不支持的 `tcpSettings`/`sockopt`，以及 XHTTP 的 `finalmask` 显式失败。隔离 namespace 另实测 Chimera Office VLESS UDP outbound→Hub→Reverse→Edge；普通 Xray SOCKS UDP → Xray VLESS outbound → Chimera VLESS inbound → Reverse → UDP echo 通过固定 Xray 端到端测试；其他 VLESS outbound 传输/security 组合仍未验证 |
+| TUN inbound | 当前 server 有 feature-gated 的 Linux L3 `tunGateway`；设备配置必需 IPv4 地址和可选 IPv6 地址，包处理支持 IPv4/IPv6，`mtu` 默认为 1500、范围 1280–9000，并统一驱动 Linux TUN、netstack 与 UDP 分片。内存 packet harness 覆盖 Freedom echo、Hub Reverse → Edge prefix map/allow ACL → TCP/UDP LAN socket、超限前置拒绝、IPv4 4 KiB UDP 分片重组与坏片丢弃；`tun_udp_ipv6_fragments_reassemble_and_invalid_fragments_are_dropped` 另覆盖逆序 IPv6 4 KiB UDP 分片送入 Reverse、IPv6 回复 tuple 恢复，以及截断/重叠 IPv6 分片拒绝后的合法同源恢复；`tun_tcp_and_udp_cross_hub_reverse_edge_mapping_to_loopback_lan` 还从同一 client source port 访问两个不同 Overlay IP 的相同 UDP 目标端口，Edge 将其映射到共享端口上的两个真实 loopback LAN socket，并分别还原回复 source。`scripts/test_tun_gateway_netns.sh` 验证双栈 TUN→Office VLESS→Hub Reverse→Edge 映射→veth LAN namespace TCP/UDP、双栈 4 KiB UDP、Overlay source restoration；最新真实 namespace 场景还让无代理 Office LAN 主机用同一个 UDP socket 访问 Overlay `10.44.0.20` 与 `.21` 的共享端口 `39642`，Edge 分别映射到真实 LAN `198.18.0.20` 与 `.21`，并核对回复源地址；Hub 重启后 Edge Bridge 自动重连并恢复新 TCP/UDP 流量；held-flow 用例确认在显式配置 1 秒 Hub drain deadline 后，存量 TCP close（EOF 或 reset）到达 TUN client。保持打开的 UDP socket 在 Hub 重启前后使用同一 source tuple 发包并收到回复；Hub 重连后新建 TCP/UDP 流量也成功。另在 Hub/TUN Gateway 持续运行时单独重启 Edge，TCP 自动恢复。单次早期运行观察到同一 UDP source tuple 的第一个新 datagram 未到达 Edge，随后重发成功；最新烟测在一个 UDP socket 保持不变时连续单独重启 Edge 三次，每轮每 0.5 秒发送一个不同 marker、最多重试 12 次（最多 6 秒），收到正确 Overlay source 的回包后再发送稳定包，三轮均恢复，最后一轮在第 6 次发送时恢复。重复 LAN 双站点 smoke 验证按 Overlay prefix 选站。Server 使用 vendor snapshot 中显式 `TcpListener::shutdown` 并 await packet engine；外层 task cancellation/device drop 与 TUN 定向测试通过 | 仍未验证物理 LAN/生产 route policy、真实负载、其他 malformed/overlap/drop 与重组压力组合、未覆盖的 IPv6 分片/扩展头变体、Xray TUN 互通、大 UDP 的 Mux 分片及 TUN IPv6 静态路由自动配置；矩阵保持 Partial |
+| Linux system TUN | Server 的 `wireguard` 能力已有 `tun` crate 设备创建范例 | 评估复用设备后端；不得复用 WireGuard peer / 协议状态 |
+| Edge Overlay 映射 / ACL | VLESS outbound `reverse.siteToSite` 编译为 Edge Bridge policy；等长、同族、无重叠 prefix map，显式 TCP/UDP + IP + port ACL；TCP/UDP Mux worker 在 dispatch 前改写 Overlay target，UDP response source 映回 Overlay。loopback 真实 socket tests 已通过；单站点 TUN namespace smoke 另验证经 veth 到独立 LAN namespace 接口地址的 TCP/UDP socket 出站；双站点 namespace smoke 验证两个 Bridge 把不同 IPv4 `/24` 与 IPv6 `/64` Overlay prefix 映射到相同 IPv4 `/24` 与 IPv6 `/64` LAN prefix，Hub 按 Overlay prefix 正确分流，双栈 TCP/UDP 与 4 KiB UDP 都由相应站点服务回显；新增的真实拒绝探测在底层 Freedom 已放行 39641–39644 时，仍证明各站点 ACL 会拦截双栈 TCP 39643 与 UDP 39644，八个目标 LAN 监听器都收不到 marker | Chimera-only extension；尚不是 Xray Freedom `finalRules`/`prefixRedirect` 兼容层。测试仍不包含物理 LAN、生产路由策略、真实物理重复网段和动态规则管理 |
+| Freedom `finalRules` / `prefixRedirect` | Freedom `finalRules` 有序规则、network、port、literal IP CIDR、域名候选过滤及 Xray 默认 Reverse/private-IP 规则已接入普通 TCP/UDP 路由和 Dokodemo 专用 UDP 路由；本地配置、route、DNS 多候选测试通过。Xray 26.9.9 VLESS TCP 客户端已验证明确允许的 loopback 目标成功、未列出的私网端口被拒绝。GeoIP/ext、reverse-match、blockDelay、redirect/destinationOverride、自定义 domain strategy、fragment/noise、socket/dialer proxy 等未实现并显式拒绝。`prefixRedirect` 与完整 TUN 行为仍未实现 | 增加 UDP、域名及管理 API 的 Xray 互操作；处理或持续记录 delayed blackhole 差异；之后独立扩展 Xray TUN inbound；Edge ACL 不作为此能力的替身 |
 
-| 阶段 | 可以包含 | 不应包含 |
-| --- | --- | --- |
-| Input | 原始选项、别名、是否显式指定 | 默认吞掉未知行为 |
-| Plan | 已验证组合、资源请求、初始凭据 | TcpListener、JoinHandle、CancellationToken、动态用户 store |
-| Prepared resources | 已加载证书、准备后的平台资源 | 对外冒充完全 Running |
-| Instance | 活跃资源、版本与任务所有者 | 与注册表分离且无法核对的状态副本 |
+## Netstack 集成注意
 
-不可变不等于可公开打印。计划和初始配置仍含敏感信息，使用安全摘要而非自动打印全部 Debug。
+Client 中目录名为 `clash-netstack`、Cargo 包名为 `watfaq-netstack`，API 提供 `NetStack`、`TcpListener` 与 `UdpSocket`。该包未发布 crates.io，Client README 标为非生产用途。公开 Client 基线 `6e951d59976c22a65238e8a70069971a6dfea4ae` 经临时 Cargo project 精确 revision probe 编译通过；随后 Server 将该基线及两个本地修复提交的 crate 源码 vendored 到 `vendor/watfaq-netstack`，避免构建依赖另一个仓库的 checkout 或未发布 Git 分支。两个本地提交分别增加显式异步 TCP engine shutdown/join 和 malformed UDP 诊断脱敏，以及 malformed TCP 诊断脱敏和 payload-free IP trace summary。来源和同步办法记录在 `vendor/watfaq-netstack/UPSTREAM.md`。
 
-编译器保持无运行副作用；source 可以做 I/O，资源准备也可以做 I/O。对 geodata、自动设备名等依赖环境的结果，明确输入与解析阶段。不能以“纯编译”为由悄悄改变 `--check` 行为。
+安全核对发现公开基线在 malformed TCP/UDP 检查中曾格式化完整 segment，可能把异常包的应用数据写入日志。当前 vendored snapshot 已将这些诊断改为安全元数据，并把 IP packet TRACE summary 限制为端点、协议和长度；Client checkout 对应提交的 16 个 unit tests、28 个 integration tests 和 all-target/all-feature Clippy 均通过。Server 的 TUN 定向组和真实 namespace 双栈 smoke 也在 vendor snapshot 上通过。
 
-### 7.2 文件、检查与管理 API 的一致性
+公开 Git 基线的来源及资源行为已核查。当前 Server 使用可审查的 vendored snapshot，保留 Linux + optional feature 边界：MTU 默认 1500，`tunGateway.mtu` 可设为 1280–9000；packet/device RX queues 各 4096；TCP accept queue 128；最多 512 条 TCP stream；smoltcp 与应用 send/recv buffer 估算峰值约 512 MiB。Server 默认 TCP 并发 64（约 64 MiB socket 缓冲），上限 512；Dokodemo UDP 默认 256 sessions、上限 1024，且 session relay queue 有界。TUN service 退出时显式调用并 await `TcpListener::shutdown`，关闭 netstack 接受的 streams 并 join packet engine。仍待处理的是压力测试、production LAN/route policy 和更广的 malformed/fragment 行为；这不构成完整生产就绪声明。
 
-文件和 gRPC 使用各自适配器进入相同语义规则。protobuf 缺省与 JSON 省略值不总能直接等同；不要为省代码把所有 protobuf 请求绕成 JSON。
-
-查询、删除实例和简单管理命令不需要构建完整计划。用户更新复用协议用户校验及发布规则。控制适配器不直接操作 listener 来补齐自身缺少的业务入口。
-
-### 7.3 Plan 设计的收敛条件
-
-先让一个现有协议使用新边界，再用不同形态验证：RAW/TLS/REALITY、XHTTP 或 QUIC。仅为已需要的组合建立类型，不创建任意图形执行语言。旧类型可通过适配迁入，但每个适配器有清理条件。
-
-计划编译通过后必须知道：实际选用的 transport、安全层、协议、监听方式和需要准备的资源。不能到多个运行模块再次猜测同一组合。
-
-## 8. Transport、Security、Protocol 与 Outcome
-
-传输接口不能一律返回 TCP 字节流。根据实际用例保留字节流、消息通道、多路复用接入和请求关联等有限入口。后期包级能力只预留设计空间，当前不引入空实现。
-
-TransportContext 保存源/本地地址、SNI、ALPN 和已证明可用的传输能力。Protocol 产生认证身份与请求语义；SessionContext 持有执行该会话所需的有限能力。不要把它们统一成包含全局 RuntimeState 的万能 Context。
-
-ProtocolOutcome 建议表达互斥结果：TCP、固定目标 UDP、多目标 UDP、会话型 UDP、回落、可跟踪的专用执行结果。避免多个 Option 同时为空或同时有效。`Completed` 只表示同步处理结束，不能用它掩盖没有 owner 的后台任务。
-
-REALITY/Vision、HTTP keep-alive、SOCKS UDP_ASSOCIATE、QUIC stream/datagram 都可保留必要专用接口。统一的是生命周期和能力契约，不是所有协议必须共用一个 relay 循环。
-
-## 9. 生命周期、事务与任务所有权
-
-### 9.1 所有者、跟踪者、观察者
-
-一个资源需要唯一的生命周期决策者，但可以被多个层次跟踪。服务器统计任务与连接局部任务组同时记录同一任务，并不自动违反所有权规则。
-
-| 角色 | 可以做什么 |
-| --- | --- |
-| 所有者 | 决定结束、转移责任、协调清理 |
-| 跟踪者 | 等待完成，向上级提供 drain 依据 |
-| 观察者 | 获取状态或统计，不直接决定资源销毁 |
-
-每个任务必须说明：谁创建、谁取消、谁 await、失败由谁处理、父级取消时发生什么。`tokio::spawn`、Arc 和 Drop 都不是完整的答案。
-
-### 9.2 实例事务
-
-维护实例 ID/代次、外部 tag、生命周期状态和运行资源之间的一致性。已登记、已绑定、accept loop 健康、整体 ready 是不同事实，应明确各层判断依据。
-
-必须覆盖：启动中取消、部分 bind 成功、发布前取消、删除中取消、同 tag 重建、旧任务迟到结束。旧代次只能修改自己的实例；清理 guard 不应只更新状态而遗留占用端口的资源。
-
-高层管理器协调事务，资源构建器执行具体准备。不要把证书解析、QUIC 协议和 gRPC wire 都塞回 manager。
-
-### 9.3 关闭语义
-
-区分 listener 停止接入、connection 结束、logical session 结束和 server-wide drain。根据具体 Xray 行为确定顺序与期限，不使用“所有 remove 都 abort”或“所有会话永远 drain”的总规则。
-
-XHTTP 会话可以跨请求；GlobalID XUDP 可以跨连接；QUIC 的连接/设备退出可能影响全部子流。注册表与 task owner 在这些路径中必须协作，不能把物理连接结束作为通用的会话销毁条件。
-
-全局退出完成意味着资源已清理或失败已明确记录，不只是 cancellation token 已触发。避免持有阻塞锁 await；也不能通过后台 spawn 清理后立即声称释放完成。
-
-## 10. 身份、策略、路由与统计
-
-- 用户 ID/email/level、更新版本和统计身份可共享；UUID、password hash、SS key、Hysteria auth 的索引与算法按协议处理。
-- 初始用户来自计划，运行时快照属于实例或明确的 store。更新用户不应无故重置 replay、salt、UDP 会话或既有连接。
-- 每项更新定义生效边界：新握手、新 HTTP 请求、新 UDP 消息或已存在会话；按固定基线验证。
-- DataPlaneRuntime 的第一层目标是 API 无管理操作；第二层是实际持有状态也尽量不牵连完整管理器。按需要推进，不为一次重构引入一组空 trait。
-- 业务 routing 选择逻辑出口；outbound 根据该选择连接。域名解析时机应显式，保留原始目标、sniffed 名称及实际连接目标的必要区别。
-- 未来 outbound 链由显式依赖表达并检查循环，不通过重新路由隐藏递归。
-- 计量点固定，常规/快速路径、失败/回落路径不得重复或漏计；认证事实不能仅寄存在 TrafficContext。
-- 有损观测事件不能成为授权或生命周期事实源；慢订阅者不得阻塞转发。
-
-## 11. 控制面与 MCP 决策
-
-管理 gRPC 与 inbound 的 gRPC transport 是不同能力。前者负责外部管理接口，后者承载代理通信；目录和 feature 命名必须区分。
-
-MCP 不属于核心必须保留的能力。没有实际使用需求时可以不做；当前存在的实现仍需按任务范围处理，不能由一份规划自动删除。
-
-若决定保留，优先方向是独立可选 Adapter：
-
-```text
-AI/MCP client → MCP Adapter → 管理 gRPC → 内部管理服务
-```
-
-Adapter 不读取 RuntimeState，不直接访问用户表，不重新编写生命周期事务。进程内部署如果有明确需要，可以共用内部服务；通常不必通过本机 gRPC 绕回自身。
-
-迁移时做能力映射：活动连接数不等于在线用户数；现有 gRPC 没有等价能力时不能随意替代。需要扩展则使用独立命名空间，保留 Xray API 语义。订阅转轮询须记录频率、背压和失联处理。
-
-写操作超时可能已经执行成功，不得盲目重试。定义操作结果查询或已知的重试规则；管理操作按需要暴露，不自动将所有写接口转换成 AI 工具。MCP 失败不应拖垮核心转发，删除/迁出时间仍由实际任务确定。
-
-## 12. 为未来能力留下边界，不提前实现
-
-当前需要的是确认未来不会被现有模型排斥。不要为尚未启动的目标创建空 crate、空 trait、占位运行时、无使用方的 feature 或长期维护的依赖。
-
-### 12.1 Xray outbound
-
-未来 outbound 的目标仍是固定 Xray 基线下的配置与可观察行为兼容。保留以下分工：
-
-```text
-SessionRequest → Routing → RouteDecision → OutboundConnector
-                                             │
-                                             ├── 解析与目标连接策略
-                                             ├── 出站协议握手
-                                             └── 出站 transport / security
-```
-
-现在可以保护的边界：
-
-- `RouteDecision` 表达选中的出口及必要策略，不包含某个协议的 socket 实现。
-- Session 依赖目标连接能力；新增一种出站协议不应要求 inbound 识别它。
-- 出站配置最终使用自己的 compiler 和 plan，与入站共享适用的纯值对象和校验能力。
-- 入口方向和出口方向的握手、身份验证与生命周期不同；不能因为协议同名就强制共享整个 handler。
-- 可共享纯 codec、地址模型及确实对称的 I/O 原语；共享前先明确客户端和服务端的不变量。
-- 连接池、复用、探测任务属于明确的 outbound 实例或 Server owner，不应隐藏在一次 session 调用后永久存活。
-
-真正开始时，每次选一个出口协议及明确组合，验证 TCP/UDP、DNS、超时、路由选择、错误传播和统计。不得用“有通用 connector”代替某个 Xray outbound 的互通证据。
-
-2026-09-21 用户已明确启动 VLESS Reverse 专项。第一阶段采用 Portal-first：公网 Chimera 复用
-DokodemoDoor 和 routing 暴露固定 TCP 端口，内网侧暂由固定版本 Xray 作为主动 Bridge，从而不等待
-Chimera VLESS outbound、UDP/XUDP 或完整 transport 矩阵。2026-09-22 Batch A–E 已完成该 Portal-first
-TCP 里程碑：Xray-compatible VLESS `0x04`、Mux TCP、Reverse 控制 session、Portal registry/routing 和
-固定端口链路已落地，并用固定 Xray-core `v26.9.9` Bridge 验证 RAW 与 TLS。2026-09-23 Batch F 又完成
-受监督的 Chimera VLESS Reverse Bridge TCP RAW/TLS：2 秒 monitor、失败重试、worker 扩容/摘除、重连和
-shutdown 均进入现有 lifecycle，并以固定 Xray Portal 做双向互操作。UDP/XUDP、sniffing 和更广 transport
-矩阵仍后置。字段、owner、feature、阶段和验收边界见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)。
-
-### 12.2 WireGuard
-
-WireGuard 不适合直接塞入“接收一个字节流，然后解析代理目标地址”的模型。规划应区分加密隧道、peer 状态、IP packet 处理与代理会话衔接。
-
-```text
-UDP endpoint ↔ WireGuard peer/tunnel state ↔ IP packet path
-                                                  │
-                                     按使用方式接入网络栈或转发能力
-```
-
-后续立项前先确定具体角色：作为出站隧道、服务端接入、独立 endpoint，还是其中某一种。用户目前没有要求一次实现所有角色，也没有确定它与完整 outbound 的先后顺序。
-
-应预留的约束：
-
-| 关注点 | 设计要求 |
-| --- | --- |
-| 状态所有权 | endpoint、peer、握手计时器、重放窗口和会话关联均有明确 owner |
-| 地址语义 | 保留 IP packet 的源/目标信息，不把它硬编码成普通代理字节流 |
-| 路由 | peer 的地址选择规则与代理业务 routing 分别建模，不能混为一张万能规则表 |
-| 网络栈 | 需要时通过明确边界引入；不要求所有 inbound 依赖它 |
-| 配置 | peer/key/地址等配置先编译，绑定 socket 和启动任务在资源准备阶段 |
-| 生命周期 | 更新 peer、关闭 endpoint、旧会话排空与资源回收的语义单独定义 |
-| 可选依赖 | 实现阶段再隔离依赖，不因规划让最小代理服务端构建带上网络栈 |
-
-这些是后续完整实现的设计约束。2026-09-21 起项目已有一个受 `wireguard` feature 控制的 Linux 服务端 inbound system-TUN 切片，并已通过无特权 loopback UDP + 内存 TUN harness 验证握手、双向包路径和 task abort；真实 system TUN 权限/路由创建、`noKernelTun`、userspace IP stack、Xray routing/outbound 注入、跨平台后端或真实 Xray 客户端互操作仍未完成，因此仍不能视为完整 WireGuard 支持。
-
-### 12.3 TUN：可放在最后
-
-TUN 当前不进入近期任务、发布阻塞条件或架构完成条件。只保留一个关键认识：设备型接入与端口监听型接入的资源模型不同。
-
-```text
-TUN device → IP packet processing / network stack
-                         │
-                         ▼
-                 Logical Session → Routing → Outbound
-```
-
-这是候选处理路径，不要求所有 IP packet 必须转换成 TCP/UDP 代理会话。ICMP、分片、MTU 及其他包级行为必须在未来范围评审中明确，不能通过抽象名称暗示已经支持。
-
-未来兼容 Xray TUN 时，按以下步骤推进：
-
-1. 固定当时决定采用的 Xray 源码提交、二进制版本及目标操作系统，核对该版本实际存在的 TUN 配置和实现。
-2. 逐字段建立清单：省略值、显式值、校验失败、运行时用途、平台限制和测试证据。本文不预设尚未核验的字段名或默认值。
-3. 把配置兼容、设备创建、系统路由/DNS 集成、packet 行为、会话转发分别验证。配置名称相同不等于接口兼容。
-4. 根据实际需求引入设备型 ingress plan。由资源准备阶段打开设备，由实例管理生命周期；不伪造一个端口 listener 来适配所有接入。
-5. 将设备句柄、权限需求、接口标识及系统资源清理放在平台适配与 owner 内；纯 compiler 不更改系统网络状态。
-6. 若创建路由或调整 DNS，记录本实例实际创建/变更的资源，定义失败回滚和重启恢复；不能清理其他程序拥有的资源。
-7. 覆盖设备创建失败、路由安装部分失败、正常退出、异常取消、回环路由和跨平台差异，再声明对应范围兼容。
-
-WireGuard 和 TUN 可能复用包处理接口、网络栈适配代码或地址类型，但不能因此共享 peer 状态、设备生命周期或会话注册表。是否引入 `packet/`、`device/` 或独立 crate，应在真实需求出现时决定。
-
-### 12.4 未来能力进入当前设计的门槛
-
-只有出现以下情况之一，才在当前切片增加扩展点：现有实现已经有两个真实使用方；不修正某个边界将明显阻断既定后续能力；或当前任务本身需要该能力。否则记录设计约束即可。
-
-## 13. Feature 管理与构建隔离
-
-### 13.1 三个维度不能混淆
-
-| 维度 | 回答的问题 | 示例 |
-| --- | --- | --- |
-| Rust module | 谁负责这段行为和状态？ | transport、protocol、session |
-| Cargo feature | 这个二进制编译了哪些能力？ | vless、tls、grpc_transport、api |
-| Runtime config | 已编译能力如何启用与组合？ | inbound 协议、监听地址、用户及传输选项 |
-
-模块职责清晰是前提；feature 是构建选择工具，不能代替所有权设计，也不能精确证明线上故障来自哪个模块。
-
-### 13.2 当前可用的构建入口
-
-以下名称已核对当前 Cargo manifest；这里只说明配置入口，本次文档维护没有执行这些构建。
-
-| 入口 | 当前意义 |
-| --- | --- |
-| app 默认 feature | 启用 `full`，转发到 library 的 `full` |
-| app `minimal-vless` | 转发 library `vless` |
-| app `minimal-vless-tls` | 转发 library `vless`、`tls` |
-| library `grpc_transport` | gRPC 入站传输能力 |
-| library `api` | 管理 API 相关能力，与 `grpc_transport` 分开 |
-| `brutal-ack-batch-trace`、`brutal-pacing-trace` | 现有诊断 feature；不等同于默认 full 功能集合 |
-
-不能据此推断所有依赖都被彻底裁掉。可选依赖、默认依赖 feature、workspace feature unification、构建目标和 dev-dependencies 均须实际检查。
-
-已确认但尚未写入 manifest 的下一项能力是 additive `vless-reverse = ["vless"]`。实现后 library/app
-`full` 包含它，`minimal-vless` 与 `minimal-vless-tls` 保持现有基础语义。未实现前不能把它列为当前
-可用构建入口；详见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md#6-cargo-feature-设计)。
-
-### 13.3 新增或调整 feature 的记录模板
-
-```text
-能力名称与使用方：
-所属协议/传输/安全/控制面/诊断类别：
-为什么需要编译隔离，而不是仅运行时配置：
-直接依赖与共享依赖：
-library gate 与 app forwarding：
-默认/full 行为是否变化：
-支持的平台与互斥条件：
-运行时激活配置：
-未编译时的明确错误：
-最小、部署、默认/full、关键组合验证：
-```
-
-Feature 尽量 additive。不能设计“关闭鉴权”“关闭重放防护”之类的排障开关；不能因能力未编译而忽略配置、退回明文或换用不等价协议。
-
-只有具有实际使用价值的组合进入持续维护矩阵。无需为理论上所有布尔组合建立指数级 CI，但必须覆盖声明支持的部署组合、重要依赖交互和现有 all-feature gates。
-
-### 13.4 构建隔离不能替代运行时隔离
-
-同一二进制中，某个 inbound 握手拥塞、慢统计订阅或后台探测异常，仍需依靠资源限制、背压、owner 和取消边界处理。编译时裁剪不能解决这些运行时责任。
-
-## 14. 线上故障排查流程
-
-### 14.1 首先保存可比较的基线
-
-记录部署版本、源代码 SHA、实际二进制、平台、编译 feature、构建模式、脱敏配置、客户端版本、负载、时间段及可复现症状。工作区中的源码不一定就是线上二进制对应版本。
-
-禁止输出完整配置、认证包、私钥或 token。可以记录 inbound tag、generation、协议、传输、安全类型、处理阶段、错误类别和经过评估的目标信息。
-
-### 14.2 推荐顺序
-
-1. 用原部署组合复现，先确认故障条件。
-2. 在相同二进制上一次改变一个运行时变量；把每次观察写入记录。
-3. 根据症状定位 owner 和边界，检查错误、超时、取消、排空、队列及计量证据。
-4. 必要时用 minimal-feature 构建减少候选范围；保持版本、平台、负载和其他设置可比较。
-5. 找到具体失败路径，建立能区分正常/异常的回归用例。
-6. 修复后重新测试最小复现和原部署组合，确认没有把问题移到另一个路径。
-
-Feature 减少后故障消失，只说明条件发生改变。编译优化、线程调度、负载变化和共享依赖也可能影响结果，不能直接将剩余模块判为无责。
-
-### 14.3 症状与首查边界
-
-| 症状 | 首先检查 | 需要的证据 |
-| --- | --- | --- |
-| 配置检查通过但启动失败 | compiler 与 prepare 的职责、平台资源条件 | 相同输入的诊断、资源准备失败点 |
-| AddInbound 与文件配置表现不同 | adapter、默认值、共享 compiler | 等价 literal/plan 或明确 API 差异 |
-| 删除后端口仍占用 | listener owner、停止接入、task join | 关闭完成条件、剩余句柄 |
-| 同 tag 重建后旧任务影响新实例 | generation 和 registry key | 旧任务发布/注销的代次检查 |
-| 握手成功但无流量 | protocol outcome、session dispatch、routing、connector | 各阶段完成或失败证据 |
-| XHTTP/gRPC 流中断异常 | 物理连接与逻辑会话的映射 | 取消传播、半关闭、注册表清理 |
-| UDP 内存持续增长 | association/registry、TTL、队列与清理 | 活跃数量、过期路径、背压 |
-| 统计翻倍或丢失 | relay 包装层、快速路径、更新与 reset | 固定工作负载下的单一计量点 |
-| 管理调用导致转发抖动 | 锁范围、同步 I/O、订阅背压 | 等待时间、任务和队列证据 |
-
-这是定位入口，不是故障归因结论。实际部署开关、停服务和流量切换按任务授权执行，文档不自动授权更改线上环境。
-
-## 15. 每轮迭代如何选择任务
-
-### 15.1 任务优先级
-
-优先处理已证实的凭据暴露、静默配置失效、认证/协议错误及生命周期资源故障。之后选择当前部署组合的兼容缺口，再处理阻碍这些工作的小型架构问题。不要让目录迁移阻塞必要的正确性修复。
-
-### 15.2 用户说“继续”或“go”时的决策
-
-```text
-确认当前目标和最近一次完成记录
-    ↓
-读取 AGENTS / ARCHITECTURE / 本手册相关部分
-    ↓
-检查 git status、相关 diff、已有切片与并发修改
-    ↓
-核验支持矩阵、实现、固定参考中的真实缺口
-    ↓
-选择一个责任完整、能够验证的切片
-    ↓
-说明行为、owner、不变量、回退和检查
-    ↓
-实施 → 验证 → 同步文档 → 交接结果
-```
-
-逐项回答：
-
-1. 是否已有用户指定的待完成目标？不要被最新一个状态问题带偏。
-2. 相关文件是否包含未完成改动？是否有已知的其他 writer？脏文件本身不证明并发。
-3. 能否在保留这些改动的前提下继续？不重叠工作不必等整个仓库变干净。
-4. 当前文件是否混合多个责任，还是只有行数多？
-5. 本次移动或修复的完整责任是什么？其最终归属与 owner 是谁？
-6. 是否涉及配置、wire、超时、回落、统计或生命周期行为？
-7. 是否需要状态机，还是一个显式结果和局部函数已足够？
-8. 旧 API/facade 是否需要暂时保留？谁仍在调用？
-9. 哪些验证能直接证明本次结果？缺少哪些条件？
-10. 本轮结束时，下一位维护者能否理解完成与未完成的边界？
-
-### 15.3 切片大小与完成边界
-
-优先选择一个可独立验证的行为或责任迁移，不设置固定行数目标。以本轮开始时的 diff 为参照，
-不把他人的历史未提交改动计入本轮成果。切片是否继续拆分取决于责任是否单一、测试能否直接证明、
-失败能否回滚、审阅者能否区分行为变化与机械变化。文档、生成代码和机械移动应分别说明，不能为缩小
-表面 diff 省略必要的错误处理、测试或生命周期所有权。
-
-一次目录移动尽量不混入协议行为修改。无法分离时解释依赖和风险，保留可审阅证据。不要为了“干净提交”回退未知改动，也不要默认任务授权提交、推送或发布。
-
-## 16. 调整后的迁移路线
-
-原有 Phase 0–10 适合作为责任地图和候选顺序，不能成为每次重新开始的线性清单。[ARCHITECTURE.md 第 12 节](ARCHITECTURE.md#12-渐进迁移路线与验收)已有迁移记录，新的工作应在核验现状后继续。
-
-### 16.1 为什么调整原顺序
-
-- 不再要求先把所有生产大文件拆完，再允许稳定契约。文件规模不是必经门槛。
-- 不要求先清空所有工作区改动。只需识别重叠、归属及本轮验证边界。
-- Compiler、生命周期和数据面能力收敛若能解决当前问题，可以早于目录搬迁。
-- 每次通过一个代表性完整路径验证契约，避免一次设计覆盖所有协议的万能接口。
-- `beginning`、`handler` 的消失是迁移里程碑；依赖正确、owner 清晰和兼容证据才是验收依据。
-
-### 16.2 建议阶段与验收
-
-| 阶段 | 工作内容 | 进入条件 | 完成证据 |
-| --- | --- | --- | --- |
-| A：保护当前成果 | 审核相关未完成切片、接口和验证状态 | 本次任务涉及这些代码 | 相关 diff 可解释，所需检查明确；不要求全仓零脏改动 |
-| B：稳定必要契约 | Plan/Prepared、Context、Outcome、owner 边界 | 有真实混合职责或扩展阻碍 | 一个完整现有路径通过，失败路径不退化 |
-| C：迁移接入与会话 | beginning 中 listener、transport、session 逐个归位 | 边界已可独立搬迁 | 旧路径调用逐步归零，取消/半关闭/统计保持 |
-| D：迁移安全与协议 | handler 中 transport/security 先分离，再按协议迁移 | 组合和特殊路径有证据 | 单协议或单 wrapper 切片验证，facade 有退出条件 |
-| E：收口装配和控制面 | server、runtime、inbound、config、control 进一步对齐 | 不破坏已建立的管理/数据面边界 | 共享 compiler、单一事务 owner、无反向 API 依赖 |
-| F：收口横向能力 | routing、identity、policy、traffic、resolver、outbound | 实际依赖已明确 | 无万能 common、跨域能力窄、构建组合保持 |
-| G：评估 crate 隔离 | 按依赖、安全/API 或明确复用需求决定 | 模块边界稳定且成本可衡量 | 可解释的依赖减少或独立复用收益 |
-
-这些阶段允许按依赖交错推进。B/E 中已经完成的边界不应因目录尚未迁移而重写；后续新增 WireGuard/outbound/TUN 也不要求整个目录路线先全部完成，只要求其依赖边界已稳定且用户已调整开发优先级。
-
-### 16.3 每次路径迁移的操作准则
-
-1. 先确定归属，再确认 public API、内部调用、feature gate 和测试路径。
-2. 移动一个内聚模块，按需保留旧路径 re-export；不能把 facade 变成第二份实现。
-3. 检查资源 owner、错误转换和初始化顺序是否因移动而变化。
-4. 更新相关调用和文档链接，运行适用检查。
-5. 记录尚未迁移的调用方；全部归零且没有稳定外部 API 承诺后才删除 facade。
-
-Public facade 的删除可能是破坏性 API 变化，不能仅凭仓库内搜索没有调用就认定安全。必要时保留弃用周期并记录版本要求。
-
-## 17. 代表性路径与失败场景
-
-以下是选择验证切片的模板，不是当前支持声明或同时开发的任务列表。具体协议组合先查支持矩阵。
-
-### 17.1 普通 stream 与安全组合
-
-选择一个已实现组合，从文件/API 输入跟踪到 compiler、资源准备、握手、认证、session、routing、outbound、relay 和关闭。比较配置等价性、错误边界和统计口径。
-
-涉及 REALITY/Vision、回落或快速路径时，单独确认已有 specialized context、原始数据、探测表现和计量资源没有因“统一 stream”而丢失。
-
-### 17.2 HTTP 多请求与多路复用
-
-对 XHTTP、gRPC transport，区分 socket、HTTP connection、request/RPC、transport session 和代理 logical session。检查以下事件分别影响谁：单请求取消、连接断开、用户变更、inbound 删除、全局退出。
-
-不要用一个 TCP echo 成功覆盖整个生命周期声明。协议允许跨物理连接持续的状态，应按规定作用域存活，且具有超时、容量和最终清理条件。
-
-### 17.3 QUIC 与 UDP
-
-对已有 Hysteria2/TUIC 路径，检查 endpoint、connection、stream、UDP association 的 owner。消息队列须有背压/过载行为，单个会话退出不能错误关闭整个 endpoint。
-
-UDP 验证应覆盖目标关联、响应回送、过期、并发和消息边界。XUDP 的 framing 属于 wire，跨连接 registry 属于会话状态；二者可协作，但不应相互掌管生命周期。
-
-### 17.4 管理事务失败矩阵
-
-| 注入位置 | 要证明的结果 |
-| --- | --- |
-| 编译失败 | 未创建 listener 或发布实例；诊断不泄露凭据 |
-| 部分资源准备失败 | 本次已创建资源得到回收，旧实例保持规定状态 |
-| 就绪前任务异常 | 不发布虚假 Ready；失败可观测且任务可回收 |
-| 发布与取消竞争 | 结果有唯一事实源，不出现可访问但未受管实例 |
-| 同 tag 删除/新增竞争 | 旧 generation 不能注销或污染新 generation |
-| drain 超时 | 按策略取消并等待必要清理，不能无限悬挂 |
-| 用户更新与认证并发 | 按定义的快照/版本语义工作，不混合凭据状态 |
-| 统计订阅端阻塞 | 不阻塞数据面，也不无限积压 |
-
-只有修改相应路径时才补充相关测试，不为每次机械移动复制整套故障注入。
-
-## 18. 验证体系与命令
-
-### 18.1 三层兼容证据
-
-| 层次 | 回答的问题 | 不能证明什么 |
-| --- | --- | --- |
-| Unit / 模块测试 | codec、parser、状态转换和局部边界是否正确 | 不能单独证明真实客户端兼容 |
-| Compatibility behavior tests | 可观察行为是否符合固定 Xray 基线 | 模拟输入不能覆盖所有真实实现交互 |
-| 真实 interoperability | 指定客户端与 Chimera 在指定组合中是否互通 | 单个成功握手不能证明全部配置/错误/平台行为 |
-
-生命周期、资源上限和性能属于额外验证维度，按变更覆盖到上述合适层次。测试应针对不变量或真实回归，避免只镜像实现细节。
-
-### 18.2 根据变更选择检查
-
-| 变更 | 必要关注点 |
-| --- | --- |
-| 纯文档 | 路径、链接、命令、事实、diff；无需 Rust 构建 |
-| 模块移动/导入调整 | 格式、Clippy、受影响单测与 feature/平台编译；涉及运行路径时检查语义 |
-| 配置/default 改动 | 省略/显式/非法值、文件/API/--check 一致性、运行消费、支持矩阵 |
-| wire/auth/fallback 改动 | 正常与错误输入、截断、重放、取消、真实版本化客户端及必要基线对照 |
-| lifecycle/任务改动 | 启动失败、rollback、drain、取消、join、代次竞争与资源释放 |
-| feature/共享依赖改动 | 最小、部署、默认/full、关键组合和适用平台 |
-| 性能优化 | 相同安全和协议语义的对照负载，并验证正确性、CPU/内存/延迟等适用指标 |
-
-是否需要互通由受影响的兼容声明和运行路径决定，不仅看提交是否叫 refactor。条件不足时明确“未验证”，不能把编译通过写成行为兼容。
-
-### 18.3 当前通用命令
-
-从仓库根目录执行。代码任务遵循 AGENTS 的检查要求；不要在纯文档任务中无理由运行全量构建。
-
-```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p chimera_server_lib --lib
-```
-
-格式化后检查 diff，避免带入其他文件的格式变化。选择受影响的 integration/package 测试时，以任务实际路径代替无关测试。
-
-最小构建入口：
-
-```sh
-cargo check -p chimera_server_app --no-default-features --features minimal-vless
-cargo check -p chimera_server_app --no-default-features --features minimal-vless-tls
-```
-
-下面是需要替换占位符的命令模板，不能原样执行：
-
-```text
-cargo test -p chimera_server_lib --lib -- --list
-cargo test -p chimera_server_lib --lib <fully_qualified_test_name> -- --exact
-cargo test -p chimera_server_lib --test <integration_target>
-cargo test -p <package> <filter> -- --ignored
-cargo run -p chimera_server_app -- --config <existing_config_path> --check
-```
-
-`--exact` 必须使用完整测试名；零个匹配测试不是成功验证。Ignored 测试需要显式执行，并先核验其二进制、网络和环境前提。
-
-### 18.4 证据记录要求
-
-每条重要证据记录日期、源码 SHA/工作区状态、基线提交、客户端版本、平台、feature、命令、实际执行数量、结果与限制。测试环境缺失和代码测试失败分开记录。
-
-历史记录证明当时的状态，不自动证明当前脏工作树。源码快照与客户端二进制可能不一致，二者必须分别标注。不要把固定 `26.2.6` 之类的历史客户端版本写成永久要求；按已选基线说明使用版本和差异，不能无说明升级。
-
-## 19. 平台、依赖与性能维护
-
-### 19.1 平台边界
-
-涉及 `libc`、Unix fd/signal、socket options、设备句柄、进程调用及路径约定时，先判断跨平台契约。采用可移植封装或明确 `cfg`，不能让未运行的测试阻断另一平台编译。
-
-`#[ignore]` 只跳过执行，不跳过编译。Windows/Linux 等目标的测试辅助代码同样必须满足构建要求。未安装 target、linker 或运行环境时，报告验证限制；交叉编译通过也不等于目标平台运行验证。
-
-TUN、WireGuard 后续可能增加平台依赖，届时另建能力矩阵。当前规划不承诺操作系统支持范围。
-
-### 19.2 依赖和生成代码
-
-- 修改 feature 或依赖先看现有 manifest/lockfile 与依赖图，避免顺手升级。
-- `vendor/quinn-proto/` 是本地依赖补丁，变更需说明原因并验证相关传输行为。
-- 不手改生成的 protobuf bindings；从源 proto/build 配置处理。
-- `build.rs` 使用 vendored protoc，先看真实报错，不预设必须安装系统 protoc。
-- `cargo test --locked` 要求现有 lockfile 无需更新，它本身不会固定或更新依赖。
-
-### 19.3 性能判断
-
-先复现成本，再优化。基准需记录客户端/服务端版本、feature、构建模式、CPU、内存、网络、并发、包大小、运行时长和统计方式。安全层、压缩、流控、路由及统计语义应可比较。
-
-同时关注适用的吞吐、延迟、CPU、内存、握手成本和丢包恢复。单次峰值或不同配置下的数字不能证明架构优越。
-
-`bench/chimera_perf/` 是独立 Cargo workspace，根 workspace 检查不覆盖它。只在相关任务中阅读其 README，并使用 `--manifest-path bench/chimera_perf/Cargo.toml` 指定对应检查。
-
-## 20. 发布与部署维护
-
-本节解释当前发布纪律；具体授权和命令以 [AGENTS.md](AGENTS.md) 与实际 workflow 为准。架构讨论、代码完成或文档维护不自动授权发布。
-
-### 20.1 一个发布聚焦一个主要协议目标
-
-发布目标应形成纵向闭环：配置 → 校验/默认值 → 拥有状态 → 运行行为 → 相关测试 → 互通证据 → 支持矩阵。只有 parser/build、运行时未消费的字段不能被包装成协议支持完成。
-
-纯架构整理应保持既有行为，并记录适用验证。不要把多个无关协议缺口或未来 WireGuard/TUN 占位实现混入同一目标。
-
-### 20.2 当前稳定发布流程
-
-当前约定是手动触发 release workflow，选择 SemVer 增量，由流程准备临时 release-candidate 版本与 lockfile 提交，验证该精确提交，再推进稳定分支与版本标签。
-
-```text
-明确的手动发布 dispatch
-    ↓
-准备精确 candidate SHA（含版本 / lockfile）
-    ↓
-全部发布 gates + 正常 CI 所需跨平台检查
-    ↓
-成功后原子 fast-forward master 与新稳定 tag
-    ↓
-发布对应 Release / 产物
-    ↓
-部署并验证该版本，再开始下一主要协议目标
-```
-
-该手动 dispatch 按当前 AGENTS 授权已审定流程中的 candidate push、原子 master/tag 更新和 Release 发布。不能扩大解释为任意 force-push、移动/删除旧 tag 或删除 Release 的授权。
-
-### 20.3 发布门槛
-
-当前 AGENTS 要求的基础命令：
+本轮 Server 验证命令和结果：
 
 ```sh
 cargo fmt --all -- --check
-cargo build --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo test --locked
+git diff --check
+cargo check -p chimera_server_app --no-default-features --features tun-gateway --locked
+bash scripts/test_tun_gateway_netns.sh
+bash scripts/test_tun_gateway_duplicate_lan_netns.sh
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway --locked -- --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests::tun_udp_ipv4_fragments_reassemble_before_reverse_forwarding --locked -- --exact --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests::tun_udp_conflicting_ipv4_overlap_is_dropped_and_service_continues --locked -- --exact --nocapture
+cargo test -p chimera_server_lib --no-default-features --features vless-reverse --lib mux_io::tests --locked -- --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests::tun_tcp_connection_limit_does_not_dial_excess_flow --locked -- --exact
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests::tun_udp_session_limit_drops_new_flow_before_target_send --locked -- --exact
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib session::udp::dokodemo::tests::freedom_udp_idle_expiry_removes_session_and_releases_permit --locked -- --exact
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests::tun_routes_overlapping_lan_prefixes_to_distinct_reverse_sites --locked -- --exact --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib session::udp::dokodemo::tests::configured_udp_session_limit_is_enforced --locked -- --exact
+cargo test -p chimera_server_lib --lib dokodemo_udp_ --locked
+cargo test -p chimera_server_lib --lib server::tests::service_supervisor_records_the_joined_task --locked -- --exact --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib session::udp::dokodemo::tests::stale_udp_session_cleanup_keeps_replacement_channel --locked -- --exact --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests::global_xudp_reattach_reuses_reverse_site_session_and_edge_socket --locked -- --exact --nocapture
+cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib --locked
+cargo test -p chimera_server_lib --lib --locked
+cargo test -p chimera_server_app --test vless_reverse_xray_e2e xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse --locked -- --exact --nocapture
+cargo test -p chimera_server_app --test vless_reverse_xray_e2e xray_socks_udp_reattaches_global_id_after_vless_tcp_disconnect --locked -- --exact --nocapture
 ```
 
-此外，精确 candidate SHA 的正常 CI 所需平台/feature 检查必须通过，包括配置要求的 Windows tests。Linux 本地通过或 Ubuntu-only release gate 不能代替这些条件。发布检查范围与上述命令含义以实际 package/workspace 和 workflow 为准。
+本轮结果：格式与 diff 检查通过；TUN 定向测试组 19 passed（含 4 KiB UDP 乱序 IPv4 分片重组，以及截断/冲突重叠 IPv4 UDP 分片被拒绝且后续合法 UDP 可转发）；新增 Dokodemo VLESS UDP outbound 选择测试、VLESS response-header 顺序回归测试、stale UDP worker cleanup 测试和 GlobalID Reverse reattachment 集成测试均通过；`tun-gateway,vless-reverse` 精简 feature lib suite 848 passed，默认 feature lib suite 1630 passed；workspace all-feature Clippy 在 `-D warnings` 下通过，TUN+Reverse app check 通过。`bash scripts/test_tun_gateway_netns.sh` 使用 Chimera Server 0.9.1、Linux kernel 6.18.35 和 rustc 1.98.0，在一次性 user/network namespace 实际创建 MTU 1500 的 TUN、配置 IPv4 address 和 namespace-only UID policy route；direct Freedom TCP/UDP echo 通过，另一个真实 TUN 连接经 Office VLESS→Hub Reverse→Edge prefix map/ACL→loopback LAN TCP/UDP echo 通过，包含 4 KiB UDP 往返，UDP 回包源地址/端口为原 Overlay tuple；SIGTERM 后 TUN interface 消失。响应头与 session 清理改动后重跑 Xray 26.9.9 测试 `cargo test -p chimera_server_app --test vless_reverse_xray_e2e xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse --locked -- --exact --nocapture`，1 passed；新增 `xray_socks_udp_reattaches_global_id_after_vless_tcp_disconnect` 通过可控 TCP 代理切断 Xray→Hub VLESS 连接，验证同一 SOCKS UDP source/association 建立新 TCP、GlobalID 恢复、首个恢复包回显，并在恢复后的 association 内切换到第二目标且校验回复 source，1 passed。Xray 26.9.9 在重建后的首个 XUDP NEW 使用该 outbound 的原始目标，测试随后用 KEEP 验证多目标切换；未把客户端首次 NEW 的目标选择差异误记为服务端失败。更广泛的 malformed/overlap/drop/resource-pressure、8192-byte 上限以上 UDP 的 Mux 分片能力（当前未实现）、设备过载、生产物理 LAN/route policy 与 Xray client interoperability 的 TUN 出口组合仍未覆盖；route_local accept 与 rp_filter 调整也只用于隔离 loopback echo fixture。精简 feature 构建会有既有 unused/dead-code warnings；没有改动宿主路由或 sysctl。
 
-验证失败不应给 `master` 留下版本 bump 或创建稳定标签。不可先发 tag/Release，再补尚未通过的平台验证。
+2026-10-03 分片补充验证：`tun_udp_ipv4_fragments_reassemble_before_reverse_forwarding`（1 passed）把 4096-byte UDP 数据报切为 MTU 1500 内的 IPv4 fragments、以逆序注入内存 TUN，并确认 Reverse Portal 收到完整 datagram；更新后的 `bash scripts/test_tun_gateway_netns.sh` 也通过真实 TUN→Office VLESS→Hub Reverse→Edge LAN 的 4 KiB UDP 请求/响应往返。Reverse Xray interoperability suite `cargo test -p chimera_server_app --test vless_reverse_xray_e2e --locked` 为 24 passed，all-feature Clippy 通过。随后 `tun_udp_conflicting_ipv4_overlap_is_dropped_and_service_continues` 验证截断和冲突重叠 IPv4 UDP fragments 被丢弃、后续合法 UDP 仍可转发。该阶段尚未验证的 UDP Mux 超限行为已由后续 2026-10-03 边界记录补齐；IPv4/IPv6 其他异常与重叠策略、丢片及重组资源压力、设备过载、生产路由/物理 LAN 或 Xray TUN 出口互操作仍未全面验收。
 
-部署发现失败时，修复同一目标并发布后续 patch，再转入下一主要协议目标。部署行为仍须处于实际任务授权范围；本手册不触发 workflow 或更改部署。
+2026-10-03 多站点真实 namespace 验证：`bash scripts/test_tun_gateway_duplicate_lan_netns.sh` 通过。Hub 将 IPv4 `10.44.1.0/24` / `10.44.2.0/24` 和 IPv6 `fd18:44:1::/64` / `fd18:44:2::/64` 分别路由到两个 VLESS Reverse tag；两个 Edge Bridge 在各自独立 network namespace 中把这些 Overlay 前缀映射到相同 IPv4 `198.18.0.0/24` 与 IPv6 `fd18:198:18::/64` LAN，并运行相同 IP/端口但返回不同 site marker 的 TCP/UDP 服务。真实 TUN 流量对两个站点的双栈 Overlay 目标都正确选站，逐站覆盖 TCP、普通 UDP 与 4 KiB UDP，且 UDP source 还原为各自 Overlay target；额外的拒绝探测对两个站点和两种地址族分别发送 TCP 39643 / UDP 39644 marker，虽然底层 Freedom `finalRules` 放行这些端口，Edge `siteToSite` 仍拒绝，八个 IPv4/IPv6 LAN listener 均无 marker。扩展后隔离脚本连续两次通过；SIGTERM 后 TUN device 被删除。实验发现 Linux strict `rp_filter` 会影响该隔离返回路径；smoke 仅在 disposable namespace 关闭 `rp_filter`，没有修改宿主网络状态。此结果验证的是两个独立 namespace 中的虚拟重复 LAN，不是物理 LAN 设备、生产路由策略或过载行为。
 
-## 21. 任务、证据与交接模板
+2026-10-03 IPv4 分片拒绝路径：`tun_udp_conflicting_ipv4_overlap_is_dropped_and_service_continues` 通过。测试把被截断的 IPv4 UDP fragment 和内容冲突的重叠 fragment 注入内存 TUN，确认两者均未到达 Reverse；随后注入合法 UDP datagram，确认同一服务仍能正常转发。该证据只覆盖 IPv4 UDP 的截断/冲突重叠组合。Vendored netstack 每个重组器最多保留 64 组分片，状态 30 秒未更新后由活动期间每秒触发的 expiry scan 清理，并在上限淘汰最旧项；重组器为空时不周期性唤醒。UDP 与 TCP/ICMP 的 paused-time 单测验证静默期清理；真实 namespace 另覆盖 IPv4、IPv6 UDP 各 65 组进入且保留 64 组往返。更多异常组合、持续设备负载和内存测量仍未验收。
 
-### 21.1 开始一个切片
+2026-10-03 Reverse UDP Mux 长度边界：Xray 固定基线 `common/mux/reader.go` 以 `common/buf.Size`（8192 bytes）拒绝更大的 UDP packet。Server 现在对 Reverse packet session 的 `NEW` 和 `KEEP` 都应用相同单包上限；8192-byte TUN UDP 在 Reverse 中成功，8193-byte 后续 datagram 结束当前 packet session，新的合法 flow 仍能转发，TCP KEEP 不受 UDP 上限影响。`mux_io::tests` 7 passed；`tun_gateway` 定向组 19 passed；workspace all-feature Clippy、单站点和双站点隔离 namespace TUN smoke 均通过。该行为不实现大 UDP 的 Mux 层分片。
 
-```text
-目标：一个具体行为或责任边界
-现状证据：文件/符号/复现/矩阵条目
-当前用户优先级：为何本任务现在做
-范围：涉及的模块和调用路径
-Owner 与不变量：状态由谁管理、什么不能变化
-变更方式：保留现状 / 局部提取 / 新契约的选择理由
-兼容影响：配置、wire、生命周期、统计及平台
-现有改动：重叠 diff、已知 writer、保留方式
-验证：目标用例、feature、平台、必要真实客户端
-完成条件：可检查的结果
-回退方式：如何恢复本切片且保留其他工作
-```
+2026-10-03 netstack 分片重组上限验证：Server 当前使用的 vendored snapshot 保留了基线 commit `6e951d59976c22a65238e8a70069971a6dfea4ae` 的 reassembler 实现；在原 Client Cargo checkout 执行 `cargo test --manifest-path /home/si/.cargo/git/checkouts/chimera_client-b22319e19436c931/6e951d5/clash-netstack/Cargo.toml --lib fragment::tests --locked -- --nocapture`，6 passed。测试覆盖 IPv4/IPv6 header 重建语义、ECN、IPv4 protocol key 和 64 组 active-state 满载时淘汰 oldest。源码定义每个 reassembler 最多 64 组并有 30 秒 TTL；过期清理只在之后有 fragment push 时运行，不是定时器，因此完全静默时状态可能继续保留，但 active-state 数量仍有上限。持续负载下的清理延迟和真实 TUN 设备压力尚未验证。
 
-例行小修复可简化为数句，不必每次复制完整表单。复杂生命周期迁移则应保留足够证据。
+2026-10-03 TUN 启动回滚验证：`server::tests::tun_device_startup_failure_rolls_back_bound_inbound` 使用已占用的 Linux loopback 名称 `lo` 触发真实 TUN 创建错误。测试先让普通 SOCKS listener 正常启动，确认返回错误来自 TUN 创建，然后立即重新绑定同一端口，证明统一 startup rollback 已释放 listener。`cargo test -p chimera_server_lib --no-default-features --features tun-gateway --lib server::tests::tun_device_startup_failure_rolls_back_bound_inbound --locked -- --exact --nocapture` 与 `cargo test -p chimera_server_lib --all-features --lib server::tests::tun_device_startup_failure_rolls_back_bound_inbound --locked -- --exact --nocapture` 各 1 passed；测试仅编译于 Linux + `tun-gateway`。
 
-### 21.2 完成与交接
+2026-10-03 TUN 创建错误保真：`tun::create_as_async` 的 `tun::Error` 现在转换为带设备名上下文的 `std::io::Error`，保留原 error kind 和 source chain；安全日志额外记录接口名、kind 和 raw OS code。上面的 `lo` 冲突测试新增断言，确认包装后的 kind 与原始 OS error 一致且 source 可追溯，同时验证启动事务释放之前 bind 的 SOCKS listener。精简 `tun-gateway` 与 all-features 定向测试各 1 passed；workspace all-target/all-feature Clippy、`cargo fmt --all -- --check`、`git diff --check` 通过。精简 feature 构建中的既有 unused/dead-code warnings 与本切片无关。
 
-```text
-完成了什么，使用者或维护者能观察到什么：
-最终归属与 owner：
-变更文件与保留的 facade：
-运行过的命令及结果：
-未运行的验证及原因：
-已知兼容差异和限制：
-现有工作区中哪些改动不属于本轮：
-支持矩阵 / 架构决策 / 配置文档更新位置：
-下一轮唯一建议切片与进入条件：
-```
+2026-10-03 单站点 veth LAN 验证：更新后的 `bash scripts/test_tun_gateway_netns.sh` 在一次性 user/network namespace 中创建真实 TUN 和一对 veth；Edge 侧系统路由把映射目标 `198.18.0.20/32` 经 veth 送到独立 LAN namespace，echo 服务绑定在该 veth 接口地址上。真实 Office TUN→VLESS→Hub Reverse→Edge 映射/ACL TCP、普通 UDP、4 KiB UDP 均往返成功，UDP 回复源保留 Overlay 地址，且检查确认目标路由经过 `site-lan-host`。脚本同时保留 direct Freedom loopback TCP/UDP、MTU 1500 与 SIGTERM 移除 TUN 检查。`bash -n scripts/test_tun_gateway_netns.sh` 与 `bash scripts/test_tun_gateway_netns.sh` 均通过。这个 veth fixture 验证了独立 LAN namespace 的接口与路由路径，但仍不能代表真实物理 NIC、交换网络或生产路由策略。
 
-完成记录不能只写“重构完成，测试通过”。测试失败如被认为既有，须提供基线证据；无法确认归因时写“尚未确定”。
+2026-10-03 IPv6 Reverse 数据面验证：同一单站点 namespace smoke 已扩展到 IPv6。TUN namespace 在设备上外部配置 `fd00:254::1/64` 并把 Overlay `2001:db8:44::/64` 路由进 TUN；Edge 将其映射到 `fd18:198:18::/64`，再由静态路由经 veth 到 LAN namespace。真实 TCP、UDP 和 4 KiB UDP 均成功往返，UDP 回复 source 保持 Overlay 地址；该路径验证了 IPv6 packet→netstack→Dokodemo→VLESS→Reverse→Edge prefix map/ACL→veth LAN。`bash -n scripts/test_tun_gateway_netns.sh` 和完整脚本通过。此结果不验证 IPv6 地址/路由自动配置、IPv6-only TUN 配置、IPv6 分片异常、基于 TUN local-IP 的 routing rule 或物理 IPv6 LAN。
 
-### 21.3 兼容证据条目
+2026-10-03 TUN TCP 并发配额端到端验证：更新后的 `scripts/test_tun_gateway_netns.sh` 将 `maxTcpConnections` 设为 2，在真实 TUN→Office VLESS→Hub Reverse→Edge veth LAN 路径上保持两条 TCP 连接占满配额，确认第三条被服务端拒绝且未抵达 Edge echo，再关闭前两条并确认新连接成功。脚本检查目标端收到的请求与服务端 limit-reject 诊断；`bash -n` 通过，完整 namespace smoke 连续三次通过。这里证明的是 admission、超限隔离和 permit 回收，不代表长时间吞吐、峰值资源消耗或设备级压力已覆盖。
 
-| 字段 | 内容要求 |
-| --- | --- |
-| 范围 | protocol × transport × security × TCP/UDP，以及相关策略/平台 |
-| 基线 | Xray 源码提交、客户端名称和二进制版本 |
-| 状态 | 未支持 / parse-build only / runtime implemented / verified interop，必要时明确 partial |
-| 行为 | 正常流量与相关失败、回落、取消、统计条件 |
-| 证据 | 测试名称、命令、日期、实际结果和限制 |
-| 差异 | 明确缺口、安全加固或其他 intentional deviation |
+2026-10-03 TUN UDP session 配额与 idle recovery 端到端验证：namespace smoke 将 `maxUdpSessions` 设为 5；已有 direct Freedom、IPv4 Reverse 和 IPv6 Reverse session 占用三个 slot 后，两个新 source tuple 对已验证 Edge UDP endpoint 成功往返，第三个新 tuple 被 TUN forwarder 拒绝，Server 有 configured-limit warning，Edge 未收到该 marker。随后保持 UDP 流量静默 62 秒，再建立新的 Reverse source tuple；该 flow 成功到达 Edge 并收到正确 Overlay source 的回复，证明真实 TUN/Office VLESS/Hub Reverse/Edge 路径在 idle expiry 后可重新分配 session slot。加入这段等待后的完整 namespace smoke 连续通过两次；前置 admission/拒绝用例此前连续三次通过。`session::udp::dokodemo::tests::freedom_udp_idle_expiry_removes_session_and_releases_permit` 使用 paused-time 推进完整 60 秒 worker timer，确认 worker 移除 session map 项并归还 slot（1 passed）。该结果覆盖单次 expiry/recovery，不代表持续设备负载或长时间重复 session churn。
 
-条目维护在支持矩阵及相邻配置文档，本手册不复制不断变化的完整功能清单。
+2026-10-03 TUN UDP 关闭时的活跃任务收尾：`tun_gateway::tests::tun_udp_session_limit_drops_new_flow_before_target_send` 保留目标 UDP socket 和一个已响应但仍 idle 的 TUN UDP session，在取消 TUN packet service 后以零 drain grace 关闭 `ConnectionTaskOwner`，断言至少一个活跃 relay task 被取消且 task registry 归零（1 passed）。该内存设备测试验证 server shutdown 采用的 task-owner 清理边界，不替代真实进程 SIGTERM 与设备释放 smoke。
 
-### 21.4 避免文档成为新的维护负担
+2026-10-03 Reverse Bridge Hub/Edge restart 与活动 TCP 关闭验证：扩展后的 `bash scripts/test_tun_gateway_netns.sh` 在真实单站点 TUN→Office VLESS→Hub Reverse→Edge veth LAN 数据路径中，先保持一条已有 TCP flow 活跃，再对 Hub 发送 SIGTERM。Hub 配置显式设 `shutdown.gracePeriodSeconds: 1`；Hub 退出后，TUN 客户端在 8 秒读超时内观察到 EOF 或 reset。一个预先建立并保持打开的 UDP socket 在 Hub 重启及 Edge Bridge 重连后，从同一 source tuple 再发 datagram 并收到正确回包，Overlay source 仍匹配原目标；Hub 恢复后新建 TCP 与 UDP flow 也经 Edge LAN echo 成功往返。完整隔离 namespace smoke 已通过。该结果证明有界 Hub 关闭后的存量 TCP 被客户端感知为关闭，也证明 Hub/Edge 单独重启后同一 UDP 客户端 source tuple 最终可以恢复收发。一次 Edge restart smoke 中，首个新 UDP datagram 未被 Edge 收到、第二个才成功；这符合无连接 UDP 在故障窗口可能丢包的表现，当前不承诺重启期间无损续传，也还未确认 stale session 的具体清理时序。测试不覆盖任意网络分区、连续重启、长时间故障或多 Hub failover。
 
-AGENTS 放稳定工作规则；ARCHITECTURE 放设计与迁移状态；本手册放操作方法和需求优先级；支持矩阵放兼容证据。一次变更只同步受影响的事实，不把完整日志复制到每份文档。
+2026-10-03 netstack 安全与关闭切片：Server 从已验证的 Client `0.26.3` 候选快照 vendor `src/`、`tests/` 与 `examples/`，消除对未发布 Git 分支和相邻仓库路径的构建依赖。快照对畸形 TCP/UDP 错误和 TRACE packet summary 去除 payload，仅保留端点、协议及长度；TCP listener 新增异步 shutdown，`run_server` 在退出包循环后调用并等待内部 packet engine 结束。Vendor 套件 `cargo test --manifest-path vendor/watfaq-netstack/Cargo.toml` 通过（16 unit、28 integration），其 all-target/all-feature Clippy `-D warnings` 通过；Server TUN 定向组 19 passed，单站点双栈 veth smoke、重复 LAN 双站点 smoke、workspace all-feature Clippy 均通过。快照与来源提交逐文件核对，详细来源及回归命令见 `vendor/watfaq-netstack/UPSTREAM.md`。仍需在上游有可复现公开 revision 后重新评估恢复 Git dependency；当前 TUN capability 保持 feature-gated。
 
-长期证据可按日期/任务整理成独立记录并从架构状态链接。避免不断延长单行历史段落；迁移既有记录时保留原始证据，不用一句“已完成”替代。
+2026-10-03 Reverse UDP stale-worker 错误传播：Dokodemo Reverse UDP 的每个数据报现在等待本地 Reverse Mux session 的 send 完成；若当前 worker 已关闭，packet session 在写入前以 `BrokenPipe` 失败。Reverse UDP task 会先关闭 session、按 channel identity 移除旧 map entry、释放旧 session permit，再通知请求方，因此请求方只会在旧 slot 可用后尝试新 session，并对可确认的本地连接错误重试原数据报一次。非连接类错误（例如 Mux 单包长度超限）不重试。Xray 26.9.9 `xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse` 通过；库级 1635 tests、workspace all-target/all-feature Clippy `-D warnings`、真实 TUN/Reverse namespace smoke 均通过。该完成通知仅表示本地 Mux writer 接受了数据，不表示 Edge LAN 收到；重启窗口中一个无连接 UDP 包仍可能丢失，烟测确认同源下一包恢复，随后同一恢复会话的再下一包也成功；仍不宣称无损续传或 exactly-once。
 
-## 22. 架构质量与完成判定
+## 迭代批次与验收
 
-### 22.1 可检查的不变量
+| 批次 | 范围 | 完成证据 |
+|---|---|---|
+| 0 | 固定三节点拓扑、Xray/Client revisions、feature 与配置基线 | 脱敏配置、版本、平台、命令和支持矩阵范围可复核 |
+| 1 | 普通 VLESS UDP client packet session | **已实现** command `0x02`、response header、2-byte length framing、空包处理和长度边界；定向测试覆盖目标固定、最大合法帧、超长帧、空包和截断响应 |
+| 2 | Hub 普通 VLESS UDP 至 Reverse Portal | **基础路径已实现并部分实测**：固定 Xray 默认 XUDP/GlobalID 在同一 SOCKS UDP association 内经 VLESS inbound、Hub Reverse Portal 访问两个目标并校验两个回复来源；Reverse Mux 仍携带标准 source/local，GlobalID 留在 Hub 的会话 owner 内。另有 Server 内存集成测试覆盖 GlobalID detach/reattach 复用 Reverse Mux session 与 Edge UDP socket，并将回复投递到新 attachment；固定 Xray 26.9.9 RAW/TCP 故障注入覆盖 client→Hub VLESS TCP 断线后，同一 SOCKS UDP association 建立新 TCP 并重附着 GlobalID，随后再切换到第二目标并校验回复 source。Xray 重连后的首个 XUDP NEW 仍使用该 outbound 的初始目标，测试在后续 KEEP 中验证第二目标切换。真实网络故障、idle 清理、无 worker 和负向认证以及 TLS/XHTTP 等组合仍待验收 |
+| 3 | Linux TUN Gateway TCP ingress | **隔离 namespace 的真实 IPv4/IPv6 TCP Reverse 站点路径与连接配额恢复已验收**：内存测试覆盖 SYN/SYN-ACK、Freedom echo、超限 flow 不拨号，以及 Hub Reverse → Edge prefix map/allow ACL → loopback TCP LAN echo；`scripts/test_tun_gateway_netns.sh` 验证真实 Linux TUN→Office VLESS→Hub Reverse→Edge mapping/ACL→veth→独立 LAN namespace 接口 TCP echo 和 SIGTERM device cleanup。当前 smoke 将 TCP 配额设为 8，保持八条 Reverse TCP 流后确认第九条未抵达 Edge，关闭占用流后新连接成功并恢复配额。可选 IPv6 地址由 Server 配置、路由由测试外部配置；物理 LAN/生产 route policy、持续负载和设备级压力仍待验收；Server owner 已 await vendored netstack TCP engine shutdown |
+| 4 | Linux TUN Gateway UDP ingress | **隔离 namespace 的真实 IPv4/IPv6 UDP Reverse 站点路径和 session 上限拒绝已验收**：UDP 经 Freedom echo，以及 Hub Reverse → Edge prefix map/allow ACL → veth→独立 LAN namespace 接口 UDP echo；response IP/port 恢复为原始 Overlay target/client tuple。`scripts/test_tun_gateway_netns.sh` 当前将 `maxUdpSessions` 设为 8：保持 direct、IPv4 和 IPv6 三个基线 UDP sessions，再由 TUN-local client 保持两个 source tuple，并从两台独立 Office client namespace 并发建立三个 source tuple；第九个 tuple 被拒绝，服务端记录 limit warning 且 Edge 未收到超限 marker。初始 session 配额恢复后，客户端保持同一个 UDP socket 和 `10.44.0.53:53` 目标，连续三轮静默 62 秒再发 DNS A 查询；Edge 将每轮请求映射到独立 LAN namespace 的 `198.18.0.53:53` fixture，客户端逐轮验证 `example.test A 192.0.2.53` 响应及 Overlay source tuple。相同 UDP key 经历三次生产默认 60 秒 idle expiry 后都能重新建 session。同一 smoke 还从 ordinary Office client 通过 Overlay `10.44.0.20:5201` 运行 UDP iperf3，由 Edge 精确放行映射后的 UDP 目标端口；`--bandwidth 1M --length 1200 --time 3` 的记录为 sent/received 各 375,600 bytes、loss 0%。TCP 使用独立的 4 MiB deterministic echo 与 client write-half-close，在 Office 和 Edge 两端逐字节校验 4,194,328 bytes（含 marker），不把不稳定的 TCP iperf3 控制结果当作通过或吞吐证据。内存测试分别以逆序 IPv4/IPv6 fragments 重组 4 KiB UDP 后送到 Reverse；IPv4 与 IPv6 均覆盖截断/冲突重叠 fragment 丢弃及后续合法流量恢复，IPv6 用例还核对回复回到原源 tuple；另一条 TUN→Hub Reverse→Edge 用例从同一 client source port 访问两个 Overlay IP 的同一 UDP 端口，并核对 Edge 将其映射到不同 LAN loopback IP、回复 source 分别映回对应 Overlay；另验证 8192-byte Reverse UDP 单包边界、8193-byte 报文结束当前逻辑 session，以及同一 source/target tuple 的后续合法报文在新 Mux session 上恢复转发。活动 UDP worker 的 owner 取消与 registry 清空也有内存 TUN 测试。最新完整 namespace smoke 在 MTU 1280 的真实 TUN 与 Office routes 上验证双栈 4 KiB 往返、Overlay 回复源和 SIGTERM cleanup；单站点真实路径还覆盖普通 Office LAN host 使用同一个 UDP source port 访问两个不同 Overlay IP 的同一目标端口，并到达 Edge LAN 上分别绑定该端口的两个 IP。单站点真实 TUN 已分别验证 IPv4、IPv6 UDP 64-set 边界压力（每个地址族 65 组进入，最旧组淘汰且其余 64 个往返）；UDP 与 TCP/ICMP 重组器在有活动状态时每秒扫描 30 秒 TTL，paused-time 单测覆盖静默期回收。物理 LAN/生产 route、持续 session churn、持续 iperf/吞吐与设备级负载、其他异常/重叠分片组合及 UDP Mux 分片传输仍待验收；固定 netstack 的 active fragment set 上限为每重组器 64 组，且固定 revision 的满载淘汰单测通过 |
+| 5 | Site Edge 等长前缀映射和最终目标 ACL | **配置与转发基础已实现**：IPv4/IPv6 同族等长 prefix、source/destination 无重叠校验；只允许显式 TCP/UDP、映射后 IP 与端口；TCP/UDP 实际 socket 拨号和 UDP source 反向映射通过。真实 TUN namespace 到 Edge LAN 的 IPv4/IPv6 TCP/UDP 链路已验证；IPv6 的 TUN 地址/路由需外部设置，生产物理 LAN 尚未覆盖 |
+| 6 | 多站点与重复 LAN CIDR | **内存与隔离 network namespace 路径已验证**：Hub 根据不同 Overlay `/24` 选择两个 Reverse tag；两个运行中的 Edge Bridge 位于独立 namespace，各自映射到同一个 `198.18.0.0/24` LAN 前缀；相同 IP/端口上的站点专属 TCP/UDP echo（含每站点 4 KiB UDP）均返回对应 marker，UDP source 恢复为各自 Overlay tuple。物理 LAN、生产 route policy 与设备过载仍未覆盖 |
+| 7 | 生命周期、管理及运行文档收口 | 外层 TUN service cancellation、await、设备 drop、TUN 创建失败时已绑定 inbound rollback 已测试；活跃 UDP relay 在 owner drain deadline 后被取消且 task registry 清空已有内存 TUN 测试；vendored netstack 的 TCP packet engine 显式 shutdown/join 并由 Server owner await；配置文档和矩阵已同步。TUN 诊断日志脱敏已纳入 vendored snapshot。Linux 单站点和双站点 namespace smoke 通过；生产设备负载与物理 LAN 仍待测 |
 
-- 配置编译不绑定端口、不启动 task、不发布动态用户状态；外部资源读取有单独的 source/prepare 边界。
-- 文件输入、`--check`、startup 和适用管理创建输入共享同一套语义编译规则。
-- 一个实例的生命周期有唯一事实源，代次、资源准备、发布与回滚关系明确。
-- listener、connection、session 和后台任务都有 owner，取消与完成可观测。
-- transport 不执行代理业务路由；protocol 不操作全局管理状态。
-- session 不依赖管理 gRPC protobuf；control 不实现第二套生命周期事务。
-- routing 不建立具体协议连接；outbound 不重新执行路由规则来隐藏连接递归。
-- 数据面只持有需要的查询/执行能力；窄接口后面不能长期藏着任意管理入口。
-- 统计、日志和订阅不会成为授权事实源或阻塞转发的无界通道。
-- 当前声明的兼容组合、reduced-feature 构建和适用平台验证不倒退。
+| 10 | TUN Gateway 本机源地址策略路由 | **可选 Linux 能力已实现并经隔离 namespace 验证**：Overlay CIDR 路由写入独立表，Office `routeFrom` 源段与 `routeInputInterface` 入接口规则只把转发客户端送入 TUN；IPv4/IPv6 TCP/UDP echo 已真实穿过 TUN 到独立 LAN namespace；Server 用同源段 IPv4/IPv6 地址绑定真实 TCP/UDP socket 后仍经普通 LAN veth 收到 echo。默认路由被拒，`main` 表保持不变；优先级冲突与非空 route table 都验证了失败回滚，其中原有黑洞路由保留；SIGTERM 清理通过。上游路由器、防火墙/NAT、物理 LAN、Xray TUN schema 与跨平台仍不在此能力声明内 |
 
-### 22.2 结构性里程碑
+实现时每批应可编译且具备该边界的行为测试；协议批次要对固定 Xray 做真实互操作。Linux TUN 手工集成测试应明确权限和路由前提，不在普通测试中改写宿主机路由。未经实际验证的平台、传输、安全组合保持 Partial/Missing。
 
-`beginning/` 和万能 `handler/` 逐步消失、server/control/config 归位，是有价值的可视进展。但只有迁移后的依赖与 owner 满足上述不变量，才代表架构得到改善。
+本轮 Xray 端到端命令：`cargo test -p chimera_server_app --test xray_client_proxy_e2e xray_client_vless_freedom_final_rules_allow_and_block_tcp_targets -- --ignored --exact --nocapture`（Xray 26.9.9，1 passed），以及 `cargo test -p chimera_server_app --test vless_reverse_xray_e2e xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse -- --exact --nocapture`（1 passed）。后一个用例覆盖 Xray SOCKS UDP → Xray VLESS outbound → Chimera VLESS inbound → Reverse → 本地 UDP echo；同一个 SOCKS UDP association 向两个不同目标发送数据，并验证回复携带各自正确的源 IP/端口。范围限于 Linux、RAW Reverse 与当前 loopback 拓扑，不代表断线重附着、TUN 或其他传输/安全组合已通过。
 
-存在一个 950 行 codec 或 1100 行内聚加密实现，不阻止完成；到处是小文件但共享一个万能 RuntimeState，也不能算完成。新功能出现后仍应允许局部修订边界。
+## 暂不纳入
 
-### 22.3 如何审核而不制造形式指标
+多 Hub/HA、自动地址分配、控制面数据库/API/GUI、动态内核路由管理、TUN IPv6 静态路由自动配置、系统 DNS 更改、任意 IP protocol、ICMP转发、WireGuard peer与 TUN Gateway 共用运行态。IPv6 TCP/UDP 包转发已有隔离 namespace 证据，但上述管理和生产网络行为仍需单独设计验收。
 
-用真实调用链、类型持有关系、任务创建/回收路径和测试证据审核。文本搜索可以找到可疑反向依赖、`spawn` 或旧路径，但不能单独证明边界正确，也不能因为搜到 `spawn` 就判定无 owner。
+2026-10-03 普通 Office LAN client 与 UDP source fragmentation 切片：`scripts/test_tun_gateway_netns.sh` 新增独立 Office host namespace，不安装代理客户端；主机通过静态路由把 IPv4/IPv6 Overlay CIDR 发给 Gateway，Gateway 在一次性 namespace 内启用内核转发，流量完整经过 TUN→Office VLESS→Hub Reverse→Edge prefix map/ACL→veth LAN。双栈 TCP、普通 UDP 与 4 KiB UDP 请求/回包全部成功，且检查 UDP 回包源仍是 Overlay endpoint。该路径首次暴露 vendored `watfaq-netstack` 的 UDP `SplitWrite` 会输出单个超出 TUN MTU 的 IP packet：4 KiB TCP/UDP 本机流量可以过，但普通 LAN host 的大 UDP 回包在 MTU 1500 veth 上无法通过。Server 在 vendor `udp_socket.rs` 加入 IPv4/IPv6 源分片，分片按 MTU 对齐并用 `try_reserve_many` 一次预留全组队列容量；队列满时整笔 UDP datagram 非阻塞丢弃，不留下部分 IP fragments。新增 netstack 集成测试覆盖 IPv4/IPv6 4 KiB 数据报分片、逆序重组以及输出队列不足时完整丢弃。验证：`cargo test --manifest-path vendor/watfaq-netstack/Cargo.toml`（16 unit、31 integration passed）、vendor all-target/all-feature Clippy `-D warnings`、`bash scripts/test_tun_gateway_netns.sh`（通过；包含办公室普通主机双栈流量、Hub/Edge restart 与设备清理）、`bash -n scripts/test_tun_gateway_netns.sh`、`git diff --check`。该 fixture 只在 disposable user/network namespaces 设置 forwarding、route、veth 和 sysctl；物理路由器、生产 LAN 策略与真实负载仍未验收。详情见 `vendor/watfaq-netstack/UPSTREAM.md` 和配置 README。
 
-衡量维护收益时，可观察同类改动触及的责任中心数、共享状态数量、失败路径可测试性、回归定位时间和构建依赖变化。不规定必须增加多少 trait、减少多少行或获得未经测量的性能百分比。
+2026-10-03 Observatory 管理面健康状态切片：`probeURL`（Xray 常用拼写）和 `probeUrl` 均解析到同一字段；app e2e 使用本地 HTTP fixture，调用 `ObservatoryService.GetOutboundStatus` 并观察 alive→down→recovered。命令 `cargo test -p chimera_server_app --test grpc_all_interfaces_e2e observatory_grpc_reports_probe_health_transitions -- --exact --nocapture` 通过（1 passed）；完整 `scripts/test_tun_gateway_netns.sh` 单独通过真实 Reverse site endpoint 停止/恢复检查。此 API 提供 per-outbound probe 状态，不表示 Reverse Bridge/worker 列表或物理站点整体健康。
 
-架构主要目标可以在 TUN 未实现、MCP 未保留时完成。这两项不是当前主线验收门槛。
+2026-10-03 Reverse UDP oversized-datagram recovery regression: the in-memory TUN/Reverse test sends an 8192-byte packet, an 8193-byte packet, then a valid packet on the same source/target tuple with `maxUdpSessions` set to 1. It observes the Xray-compatible END for the over-limit logical packet session and a fresh NEW session carrying the later valid datagram. The focused command `cargo test -p chimera_server_lib --lib --features tun-gateway,vless-reverse tun_udp_ipv4_fragments_reassemble_before_reverse_forwarding --locked -- --nocapture` passed (1 test). This protects later traffic on the same tuple; the standard Xray Mux 8192-byte packet limit remains, and larger UDP datagrams are not fragmented across frames. TUN/site-gateway support remains Partial.
 
-## 23. 设计决策与独立审核
+2026-10-03 Repeated Edge restart UDP recovery verification: `bash scripts/test_tun_gateway_netns.sh` now keeps Hub/TUN Gateway and one UDP socket running while restarting only Edge three times. Each cycle sends distinct same-tuple datagrams every 500 ms, up to 12 attempts/6 seconds, requires the correct Overlay-source reply, then requires a stable follow-up echo. All three cycles passed; the final cycle recovered on attempt 6. The first cycle also checks new TCP after restart. The command passed in isolated Linux user/network namespaces; the feature-only build retained the pre-existing unused `AlterInboundError` warning. `bash -n scripts/test_tun_gateway_netns.sh`, embedded client Python syntax validation and `git diff --check` passed. The test establishes bounded eventual recovery under three controlled process restarts, not lossless UDP or arbitrary partition recovery; TUN/site-gateway support remains Partial.
 
-重大决策建议使用简短 ADR，至少包括：
+2026-10-03 IPv6 TUN fragment ingress regression: `tun_udp_ipv6_fragments_reassemble_and_invalid_fragments_are_dropped` injects a 4 KiB IPv6 UDP datagram as out-of-order MTU-sized fragments through the in-memory TUN and verifies one reassembled payload reaches Reverse and the reply is emitted to the original IPv6 source tuple. A truncated IPv6 fragment and a conflicting overlap are rejected before Reverse; a subsequent valid datagram from the overlapping case's source tuple reaches a fresh Reverse session. The TUN-gateway unit group passed (20 tests), along with formatting and diff checks. This is targeted IPv6 UDP behavior evidence only; it does not cover every extension-header or fragment variant, live reassembly pressure, physical LANs, production routes, or full Xray TUN compatibility. The support matrix remains Partial.
 
-```text
-标题 / 日期 / 关联目标：
-决策状态：候选、接受、替代或废弃
-实现状态：未开始、部分实现、已实现
-验证状态：已完成的证据与仍未验证的范围
-问题与现有成本：
-受影响的边界、状态 owner、不变量：
-备选：保留现状 / 参考方案 / 更简单的本地方案
-选择与理由：
-兼容、迁移、运行和维护代价：
-本次切片与不做的部分：
-证据和何时重新评估：
-```
+2026-10-03 Same-source-port multi-target UDP regression: `tun_tcp_and_udp_cross_hub_reverse_edge_mapping_to_loopback_lan` sends two UDP datagrams from one TUN client source IP/port to different Overlay IPs at the same destination port. The Edge prefix map translates them to two real loopback LAN UDP sockets bound to the same port; both replies return with their corresponding Overlay source and the original client port. The complete TUN-gateway group passed (20 tests), as did workspace all-target/all-feature Clippy, formatting and diff checks. This is in-memory TUN and Portal/Bridge transport evidence; a real namespace multi-target client run and DNS/iperf workloads remained open at that point; later namespace evidence is recorded below. Production routing and physical LAN behavior remain open. The site-gateway support matrix remains Partial.
 
-不要把“设计已接受”“代码已实现”“互通已验证”合并成一个完成标签。
+2026-10-03 Real namespace same-port multi-target UDP: `bash scripts/test_tun_gateway_netns.sh` now routes a normal Office LAN host's single UDP socket to Overlay `10.44.0.20:39642` and `10.44.0.21:39642`. The Edge maps these to separate live LAN services at `198.18.0.20:39642` and `198.18.0.21:39642`, both connected through the LAN veth; replies are checked against their matching Overlay sources. The full namespace smoke passed, including the existing UDP session-cap/idle-expiry checks, Hub restart, three Edge restarts, HTTP health transitions, held TCP close and SIGTERM cleanup. `bash -n` and `git diff --check` passed. The experiment runs only in disposable user/network namespaces; sustained iperf/throughput workloads, physical LAN and production route policy remain open, so support stays Partial.
 
-本手册的主要独立判断如下：
 
-| 判断 | 理由 | 需要持续检验的限制 |
-| --- | --- | --- |
-| 先职责与 owner，再目录与 crate | 减少无行为价值的大范围移动 | 不把“先契约”变成长期只设计不迁移 |
-| compiler / prepare / runtime 分离 | 便于复用校验、控制副作用和回滚 | 外部资源读取必须有实际落点，不能只是转移复杂度 |
-| 接入结果允许多种形态 | 避免把 UDP、QUIC、XHTTP 压成同一种 stream | 不发展成任意执行图或万能 outcome |
-| session 生命周期不强制依附连接树 | 支持跨连接状态和复用 | 脱离连接的状态仍须有唯一 owner 和有限清理 |
-| 内部管理服务承载事务 | 外部 API 能复用同一规则 | 服务层不能变成新的全局万能对象 |
-| MCP 可选，优先适配管理 gRPC | 减少核心耦合和重复实现 | 先核对能力等价性、超时和失败语义 |
-| WireGuard/TUN 暂存扩展约束 | 保护未来 packet/device 方向 | 不提前引入依赖、空模块或虚假支持声明 |
-| feature 用于能力裁剪和辅助定位 | 有助于构建成本与故障范围控制 | feature unification 和负载变化会干扰归因 |
+2026-10-03 Real namespace UDP DNS through TUN/Reverse: `bash scripts/test_tun_gateway_netns.sh` now starts a deterministic UDP DNS fixture at Edge LAN `198.18.0.53:53` and adds explicit `siteToSite` plus Freedom allow rules for UDP/53. After the existing 62-second `maxUdpSessions` idle-expiry check, the TUN-side test sends the exact `example.test A` query to Overlay `10.44.0.53:53`; the Edge maps it across the veth to the fixture, which returns `192.0.2.53`. The client verifies the complete DNS response bytes and that the reply source is the original Overlay endpoint. The complete Linux namespace smoke passed, including the prior dual-stack forwarding, multi-target UDP, restart, health and SIGTERM checks; `bash -n` and `git diff --check` passed. This validates UDP/53 forwarding, policy, mapping and idle-session recovery with a deterministic fixture. It does not test recursive resolver behavior, DNS proxy/interception, other record types, external resolver reliability, physical LANs or production routes; TUN/site-gateway support remains Partial.
 
-这些是架构建议和已确认需求的落实方式，后续可以用具体证据修订。参考项目架构只能提供选项，不能代替本项目的兼容和所有权验证。
+2026-10-03 Real namespace concurrent Office UDP clients: the smoke adds a second ordinary client namespace with its own static route to the Gateway. Before local test traffic, both LAN hosts concurrently send UDP to Overlay `10.44.0.20:39642`; the first host uses two source ports and the second uses its independent source IP. Both clients validate replies, retain sockets briefly to overlap, and Edge logs every marker. `maxUdpSessions` is raised to 8 for this fixture: three baseline sessions plus two held TUN-local sessions and the three LAN-client tuples fill all slots; the ninth tuple is rejected before Edge. The full namespace smoke passed with the later 62-second idle recovery, DNS A fixture, dual-stack forwarding, restart and shutdown checks. `bash -n` and `git diff --check` passed. This verifies concurrent UDP session isolation across two routed client IPs and admission at the configured boundary, not sustained throughput, packet-loss performance or production load; TUN/site-gateway support remains Partial.
 
-## 24. 后续使用方式与待定事项
+2026-10-03 Real namespace TCP and UDP iperf3 through TUN/Reverse: the smoke starts `iperf3` in server mode at Edge LAN `198.18.0.20:5201` and runs an ordinary Office-LAN client against Overlay `10.44.0.20:5201`. Edge `siteToSite` and Freedom rules explicitly permit TCP and UDP only for that mapped destination/port; iperf3 uses TCP control and UDP payload. The UDP client uses 1 Mbit/s, 1200-byte datagrams and a 3-second duration to stay below the 8192-byte Reverse packet bound; a separate 3-second TCP transfer runs over the same Overlay target/port. The recorded UDP run sent/received 375,600 bytes with 0% reported loss; TCP reported 62,128,128 bytes sent and 59,244,544 received. The test validates nonzero transferred bytes and, for UDP, packet counts plus a valid loss field. The full `bash scripts/test_tun_gateway_netns.sh` passed with DNS, two-client capacity, multi-target, restart and shutdown cases. `iperf3` is a required command for this manual smoke; `bash -n` and `git diff --check` passed. These are short functionality probes, not comparable performance benchmarks, sustained load, physical-LAN tests or production-route validation; TUN/site-gateway support remains Partial.
 
-### 24.1 开始下一轮之前
+2026-10-03 Reverse UDP session churn regression: `tun_gateway::tests::tun_reverse_udp_idle_expiry_reuses_single_session_slot_repeatedly` runs three consecutive UDP sessions over the in-memory TUN forwarder → Hub Reverse Portal/Mux → Edge `siteToSite` mapping/ACL → real loopback UDP socket path. The same source/target tuple is reused after each accelerated 250 ms idle expiry with `maxUdpSessions=1`; every echo returns with the original Overlay source, and the Hub task owner reaches zero before the next cycle. The targeted test passed, the full reduced-feature library suite passed (859 tests), default library tests passed (1635), all-feature Clippy and formatting checks passed, and the real `bash scripts/test_tun_gateway_netns.sh` smoke passed with its unchanged production 60-second idle timeout and 62-second post-idle DNS flow. This verifies bounded repeated cleanup/re-admission, not sustained load or long-term churn; support remains Partial.
 
-首先看本轮真实代码、相关未提交切片及历史验证，再选一个最有价值的目标。本次文档整理没有重新审计全部协议，因此不把历史“大文件热点”直接排序成当前必做清单。
+2026-10-03 Office VLESS TCP/TLS transport slice: ordinary static VLESS outbounds previously rejected all `streamSettings` even though the existing sender path could establish TLS; the compiler now permits only RAW/TCP + TLS in this ordinary outbound path, requires the `tls` feature, and rejects nonempty `tcpSettings`/`sockopt` fields instead of silently ignoring them. `tlsSettings.certificates` with `usage: verify` supplies explicit trust roots; `allowInsecure` remains rejected under the Xray 26.9.9 baseline. Focused TLS/no-TLS feature tests passed (2 and 1 tests), including `outbound_tls_rejects_untrusted_root_and_wrong_server_name`; it proves the trusted matching identity succeeds while wrong trust roots and wrong SNI fail before a TLS session completes. Unsupported TCP/header and socket options also fail closed. Default library tests passed (1638), the `tun-gateway,vless-reverse,tls` reduced-feature library suite passed (909), and workspace all-target/all-feature Clippy with `-D warnings` passed. `bash scripts/test_tun_gateway_xray_edge_netns.sh` passed with fixed Xray 26.9.9: certificate-checked Office Gateway→Hub and Xray Edge→Hub links, dual-stack TCP/UDP/4 KiB UDP, Edge `finalRules` denials, TCP/UDP recovery after TLS Hub restart and Reverse worker reattachment, and a second Xray Edge-only restart while Hub/Gateway remain active followed by Portal reattachment plus new dual-stack TCP/UDP recovery, and a wrong-SNI TUN negative case that blocks dual-stack TCP/UDP before the Edge LAN and recovers after restoring valid SNI. Formatting, shell syntax and diff checks passed. The test certificate is a local self-signed fixture, not a production trust/rotation procedure. Other ordinary VLESS transport/security combinations, production cert management, prefix translation on an Xray Edge and Xray TUN-inbound compatibility remain open; support stays Partial.
 
-近期推荐的决策方向是：核验当前拆分成果是否已有完整验证；在实际发现的混合职责中选一个完整接入路径，完善必要契约和 owner；随后再做对应目录迁移。发现更高优先级的兼容或资源故障时先修复它。
+2026-10-04 TUN Dokodemo UDP route ownership after policy replacement: `session::udp::dokodemo::tests::active_dokodemo_udp_flow_keeps_route_until_idle_cleanup` exercises the packet relay with a live routing-table replacement from Freedom to blackhole. The established source/target tuple still reaches its current UDP worker, a new source tuple and a changed target from the existing source are dropped by the new rule, and after the accelerated idle timeout the worker releases its channel-bound route pin so the old tuple is also dropped by the current rule. `stale_udp_worker_cleanup_keeps_replacement_route_pin` covers cleanup racing with a replacement worker on the same outbound. The five Dokodemo UDP unit tests passed under default features; the selected behavior follows Xray's per-client/original-destination UDP worker in `ref/xray-core/app/proxyman/inbound/worker.go`, but does not claim Xray TUN or live TUN management-API interoperability. TUN/site-gateway remains Partial; management-driven updates through a live TUN deployment and production LANs remain open.
 
-### 24.2 保留为后续决策的问题
+2026-10-04 Real TUN ingress with live Hub RoutingService revocation: `bash scripts/test_tun_gateway_netns.sh --hub-policy-only` configures the Hub's Xray-compatible API listener in an isolated Linux namespace. Ordinary Office-LAN TCP and UDP first reach Edge echo targets; a local prost/tonic probe then sends the pinned Xray `RoutingService.AddRule` request to deny the authenticated Hub identity's Overlay `/24` for both networks. The already-open TCP stream and same UDP source/target tuple continue to echo, while a new TCP connection, a changed UDP destination on the existing socket, and the original destination from a fresh UDP source get no reply and produce no Edge marker. The focused namespace mode passed after adding TCP coverage. The probe only builds with the current supported `full,tun-gateway` combination because `api` in isolation encounters unrelated existing feature-gate references to omitted VMess/WireGuard types; the code does not add an `api`-only app feature claim. The full namespace smoke separately passed three UDP expiry cycles, dual-stack 64-of-65 fragment pressure, UDP iperf3 (375,600 bytes sent/received, 0% loss), TCP iperf3 (63,700,992 sent / 60,162,048 received), Hub shutdown/reconnect, three Edge-only restarts, and TUN teardown. A further 62-second wait before the restart probes lets the deliberately small 8-session UDP cap release earlier probe tuples through the normal 60-second idle expiry. This adds live TUN management-plane evidence but does not establish physical-LAN, long-duration churn or Xray TUN compatibility.
 
-| 问题 | 当前状态 | 何时需要决定 |
-| --- | --- | --- |
-| WireGuard 与广泛 outbound 的顺序 | 尚未确定 | inbound 主线达到约定阶段、用户启动后续目标时 |
-| WireGuard 的具体角色 | 尚未确定 | WireGuard 立项时 |
-| TUN 的目标平台与基线 | 后置，可最后做 | TUN 立项前核对参考实现 |
-| MCP 是否保留、迁出或删除 | 可选；倾向保留时通过管理 gRPC 适配 | 有实际使用需求或明确清理任务时 |
-| 具体 crate 划分 | 尚未冻结 | 模块边界稳定且隔离收益明确时 |
-| 新 feature 的名称与默认集合 | 不预设未来能力 gate | 实现相应能力并检查依赖图时 |
-| 固定 Xray 基线是否升级 | 本文不升级 | 独立比较变更、更新证据并明确采用时 |
 
-这些问题不妨碍当前 inbound 维护，不需要为了完善文档提前作出全部技术承诺。
+2026-10-03 Server-managed TUN IPv6 address: `tunGateway.ipv6Address` now optionally configures the local IPv6 CIDR through Linux route-netlink after TUN creation. IPv6 static routes remain test/deployment managed. The full `bash scripts/test_tun_gateway_netns.sh` passed and verified the address on the actual TUN, dual-stack forwarding, UDP/TCP iperf3 completion, session limits, DNS idle recovery, restarts and shutdown. `cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway --locked` passed 24 TUN tests; formatting and diff checks passed. A repeat before the passing run had a transient iperf3 TCP result-channel EOF after payload transfer, so the probe was repeated; the passing run received a valid JSON report (62,259,200 bytes sent, 59,768,832 received). Local IPv6 assignment is verified, while IPv6-only operation, physical LANs and production route management remain open; support stays Partial.
 
-### 24.3 维护入口
 
-- [AGENTS.md](AGENTS.md)：贡献与验证规则，后续 AI 的入口。
-- [ARCHITECTURE.md](ARCHITECTURE.md)：内部设计规范、既有迁移状态与参考体系。
-- [Xray 兼容矩阵](examples/xray-compatible/README.md)：具体支持范围与证据。
-- [配置说明](chimera_server_lib/src/config/README.md)：用户可见配置语义。
-- [Library manifest](chimera_server_lib/Cargo.toml)、[App manifest](chimera_server_app/Cargo.toml)：实际 feature 和依赖声明。
-- [.github/workflows](.github/workflows/)：实际 CI 与发布执行入口，使用前检查当前内容。
+2026-10-03 VLESS Reverse TCP 半关闭与 iperf3 控制面回归：真实 namespace 的 TCP iperf3 曾在约 57 MiB 数据传输后因控制连接结果阶段 EOF 失败。检查确认 Portal/Bridge 把所有 Mux END 都作为整会话关闭，无法在客户端写侧 FIN 后继续回传 Edge 最终结果。新增 Chimera-only 的 Mux END option bit `0x04`：有该位时只关闭 TCP 一个方向，仍转发反向数据；两方向都关闭后回收 session。无该位的标准 Xray END 仍按 Xray `v26.9.9` 行为关闭整个 session。Xray 对端忽略此扩展位并保留整流关闭语义，因此只承诺 Chimera-to-Chimera 半关闭。Portal 与 Bridge 定向单测均覆盖“请求端 FIN、远端收到 EOF 后返回最终响应”；Reverse 组 65 tests passed。完整 `bash scripts/test_tun_gateway_netns.sh` 通过，TCP iperf3 获得有效 JSON（63,963,136 bytes sent / 60,293,120 received），UDP 375,600 bytes 双向、0% 报告丢包；固定 Xray 26.9.9 TLS Edge namespace smoke 通过双栈 TCP/UDP 与 Hub/Edge restart recovery，但不覆盖 Xray 半关闭。新增状态机下的 `bash scripts/test_tun_gateway_duplicate_lan_netns.sh` 也通过，覆盖两个 Edge worker 的双栈 TCP/UDP/4 KiB UDP 选站路径。功能仍为 Partial，物理 LAN、生产负载和 Xray 半关闭扩展仍未验收。
 
-本手册本次建立的是完整维护方法与演进约束，没有执行代码迁移、新增协议、删除 MCP、修改默认 feature 或运行发布。后续维护应把设计意图、实现状态和验证证据持续分开记录。
+2026-10-03 TUN IPv6 netlink 失败启动回滚：单站点隔离 namespace smoke 先启动并 bind SOCKS inbound，再创建 TUN，随后故意配置内核拒绝的 multicast `ff02::1/64`。服务退出并记录 `stopped_inbounds=1`；脚本确认 TUN 消失并能重新 bind 原 listener port。完整 TUN smoke 与双栈 TCP/UDP iperf3 一并通过。该场景验证的是地址配置阶段的真实 rollback，区别于更早的 TUN 设备创建失败用例。
+
+2026-10-03 Reverse UDP idle-expiry test tightened: the three-cycle in-memory TUN/Portal/Bridge test now asserts one tracked relay remains active through each echo, waits for its 250 ms test-only idle expiry and task removal, then reuses the sole session slot for the same source/target tuple. The focused test and full 24-test TUN gateway group passed; workspace all-feature Clippy, formatting and diff checks passed. The real namespace still verifies one recovery using the unchanged 60-second production timeout; repeated real-time churn and sustained device load remain unverified.
+
+2026-10-03 Real TUN UDP idle-expiry churn: `bash scripts/test_tun_gateway_netns.sh` now retains one DNS UDP socket and repeats three full 62-second idle intervals on the same client source/Overlay target tuple. Each `example.test A` query reaches the Edge veth LAN fixture and gets an exact response with the correct Overlay source, exercising real expiry and re-admission on the production 60-second timer. The complete smoke passed, the TUN unit group is recorded separately; live run results were UDP iperf3 375,600 bytes each way at 0% loss, TCP 61,472,768 sent / 58,851,328 received, all restart and teardown checks. This remains controlled churn rather than a sustained or high-rate load test; physical LAN and production routes remain unverified.
+
+2026-10-03 三轮真实 TUN UDP idle-expiry 回收：`bash scripts/test_tun_gateway_netns.sh` 保持同一个 Office UDP socket 和 Overlay DNS target，在每次 DNS A 往返后静默 62 秒，再发送下一轮请求；三轮均通过真实 TUN、`watfaq-netstack`、Office VLESS、Hub Reverse、Edge 映射/ACL 和 LAN veth fixture，验证默认 60 秒 idle timer 后同一 session key 再次建立并恢复 Overlay source。完整单站点 smoke 中其余双栈流量、并发配额、TCP/UDP iperf3、Hub/Edge restart 与 SIGTERM teardown 均通过；本轮 iperf3 UDP 375,600 bytes 双向、0% loss，TCP 61,472,768 sent / 58,851,328 received。该证据覆盖三轮受控默认超时 churn，不是高频/长时压力、物理 LAN 或生产路由验收；站点网关支持仍为 Partial。
+
+2026-10-03 三轮真实 TUN UDP idle-expiry 回收：`bash scripts/test_tun_gateway_netns.sh` 保持同一个 Office UDP socket 和 Overlay DNS target，在每次 DNS A 往返后静默 62 秒，再发送下一轮请求；三轮均通过真实 TUN、`watfaq-netstack`、Office VLESS、Hub Reverse、Edge 映射/ACL 和 LAN veth fixture，验证默认 60 秒 idle timer 后同一 session key 再次建立并恢复 Overlay source。完整单站点 smoke 中其余双栈流量、并发配额、TCP/UDP iperf3、Hub/Edge restart 与 SIGTERM teardown 均通过；本轮 iperf3 UDP 375,600 bytes 双向、0% loss，TCP 61,472,768 sent / 58,851,328 received。该证据覆盖三轮受控默认超时 churn，不是高频/长时压力、物理 LAN 或生产路由验收；站点网关支持仍为 Partial。
+
+
+2026-10-03 Real TUN IPv4 UDP fragment-set admission boundary: the namespace smoke injects 65 incomplete IPv4 UDP fragment sets through the routed Office client and actual TUN, then completes retained IDs 64 through 1. All 64 returned 1,192-byte payloads and Overlay source tuples matched, and the `watfaq_netstack` oldest-entry eviction warning was captured at the configured 64-set bound. The complete `bash scripts/test_tun_gateway_netns.sh` passed with three 62-second DNS idle recoveries, dual-stack TCP/UDP, UDP iperf3 375,600 bytes each way at 0% loss, TCP iperf3 63,832,064 sent / 59,899,904 received, restarts and SIGTERM teardown. `bash -n` and `git diff --check` passed. This is a live IPv4 UDP capacity-boundary probe, not sustained load; IPv6 pressure, other malformed/overlapping patterns, quiet-period expiry, physical LAN and production routes remain unverified. Support remains Partial.
+
+
+2026-10-04 双栈真实分片压力与静默期回收：vendored watfaq-netstack 的 UDP SplitRead 与 TCP/ICMP packet loop 新增活动期 1 秒 expiry scan；每个重组器仍保留最多 64 组、30 秒 TTL，空重组器禁用定时分支，避免普通 UDP session 周期性唤醒。两个 Tokio paused-time 单测证明输入队列静默 31 秒后，UDP 与 ICMP 不完整分片不能再与后来片段拼成数据报。真实 Linux namespace 分别向 IPv4、IPv6 UDP reassembler 注入 65 组首片，再仅补齐 ID 64 到 1；两个地址族均观察到 oldest eviction，64 个 1,192-byte payload 和 Overlay source tuple 全部正确往返。验证：vendor 全部测试 18 unit + 31 integration passed；vendor all-target/all-feature Clippy -D warnings、Server TUN 定向组 24 passed、全工作区 fmt check 和 shell syntax check 通过；首次全量 smoke 在 TCP iperf3 数据传输已完成后遇到结果 JSON 通道 EOF，完整重跑通过（三轮 62 秒 DNS expiry、双栈分片压力、UDP 375,600 bytes 双向/0% loss、TCP 62,390,272 sent / 59,113,472 received、Hub/Edge 恢复、SIGTERM TUN cleanup）。这两次都不是持续压力或内存基准；物理 LAN、生产路由、长期设备负载、更多异常分片和 Xray TUN inbound 兼容仍待验证，支持保持 Partial。
+
+2026-10-05 Office VLESS XHTTP/TLS through TUN: enabled the existing static VLESS XHTTP/H2 sender for TLS profiles; XHTTP uses the already-compiled transport path and has no separate Cargo feature. Reduced builds need `tls`, and non-H2 ALPN, Xray `finalmask`, nonempty `tcpSettings`, and `sockopt` remain rejected. Focused compiler tests passed for packet-up settings, explicit CA trust, unsupported fields, and a missing-TLS error. The fixed Xray 26.9.9 Hub/Portal namespace probe verifies separate IPv4 Overlay targets over XHTTP/TLS `packet-up`, `stream-up`, and `auto` for TCP, UDP, and 4 KiB UDP, plus wrong-SNI and unknown-UUID denial before live Edge LAN targets; RAW/TLS IPv4 and WebSocket/TLS IPv6 paths remain in the same run. Exact command `bash scripts/test_tun_gateway_xray_hub_netns.sh` passed. This verifies all three XHTTP/H2 modes on Linux namespaces; H3, physical LAN, and production routes remain outside this evidence. TUN/site-gateway support remains Partial.
+
+2026-10-05 Ordinary VLESS XHTTP/3 over the Office TUN: explicit TLS ALPN `h3` now selects a UDP/QUIC + HTTP/3 transport and cannot silently fall back to H2. Static VLESS XHTTP supports `packet-up`, `stream-up`, and `auto` on this path; `auto` follows the Xray H3 packet-up choice. The fixed Xray `26.9.9 Custom (go1.27rc2 linux/amd64)` namespace script passed H3 TCP, UDP, and 4 KiB UDP for all three modes through Hub Reverse Portal, Edge mapping/ACL and LAN; wrong SNI and unknown UUID probes for both packet-up and stream-up did not reach explicitly permitted LAN targets. Exact command: `XRAY_BIN=./xray bash scripts/test_tun_gateway_xray_hub_netns.sh`; Xray source baseline `ref/xray-core` commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`. Config acceptance is covered by `outbound::tests::static_vless_xhttp_tls_accepts_h3_alpn_without_falling_back_to_h2`. Validation also passed: `cargo test -p chimera_server_lib --lib xhttp --locked` (130 passed), `cargo test -p chimera_server_lib --lib --locked` (1,650 passed), both reduced TUN/VLESS checks with and without TLS, all-target/all-feature workspace Clippy with warnings denied, formatter, diff check, and shell syntax. Nondefault QUIC parameters, the separate VLESS Reverse Bridge role, physical LAN, production routing and Xray TUN inbound remain unverified. Site-gateway support remains Partial.
+
+
+2026-10-05 VLESS Reverse TCP/REALITY bidirectional interop slice: pinned Xray `26.9.9 Custom (go1.27rc2 linux/amd64)` now passes Xray Bridge → Chimera Portal (including wrong-shortId denial before target dispatch) and Chimera Bridge → Xray Portal (wrong-shortId denial, TCP echo, plus Bridge reconnect after Portal restart). The Chimera client advertises X25519MLKEM768 plus X25519 fallback and parses hybrid ServerHello; pinned XTLS/REALITY `v0.0.0-20260908062103-8cdf7bf9c7f0` requires the hybrid share during admission. Source baseline: `ref/xray-core` commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`. The app feature `vless-reverse-reality` enables this path in reduced builds. Exact e2e commands: `XRAY_BIN=./xray cargo test -p chimera_server_app --test vless_reverse_xray_e2e --all-features --locked xray_bridge_round_trips_chimera_portal_over_reality_vless_reverse -- --nocapture` and the same command with `chimera_bridge_round_trips_xray_portal_over_reality_vless_reverse`; overall site-gateway support remains Partial.
+
+2026-10-05 XHTTP/TLS H3 client ingress for Hub Overlay authorization: extended the fixed-Xray Hub policy matrix with a Chimera UDP/QUIC XHTTP `packet-up` inbound and pinned-certificate Xray H3 clients. The Edge Reverse Bridge remains RAW, isolating the client-to-Hub H3 ingress boundary. The IPv6-required namespace run passed TCP and SOCKS UDP/VLESS-UDP requests across two IPv4 `/24` prefixes and one IPv6 `/64`; valid but unauthorized identity/ports and an unregistered UUID remained absent at Edge for TCP/UDP. Live RoutingService CIDR replacement and removal allow/revoke IPv4/IPv6 for H3, and an IPv6 UDP association keeps its selected target after removal while a fresh association and a new target on the existing association are denied. Exact command: `bash scripts/test_hub_overlay_ipv6_xray_netns.sh` (1 passed, 55.29 s), pinned Xray `26.9.9 Custom (go1.27rc2 linux/amd64)`, reference commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`. The e2e target compiled with `cargo test -p chimera_server_app --test vless_reverse_xray_e2e --no-run --locked`. This adds interoperability evidence and test/config documentation; no forwarding implementation change was needed. Only H3 packet-up is covered; H3 stream-up/auto, nondefault QUIC tuning, physical LAN, the separate Reverse Bridge H3 role and Xray TUN inbound remain outside this result. Hub/site-gateway support stays Partial.
+2026-10-05 XHTTP/TLS H3 `stream-up` and `auto` Hub Overlay ingress: added matching Chimera H3 inbounds and pinned Xray clients to the existing `packet-up` policy matrix. Static identity/port rules and live IPv4/IPv6 AddRule/RemoveRule policy cover TCP and VLESS UDP over each mode; established IPv6 UDP sessions retain their target after revocation while fresh sessions and new targets are denied before Edge. The disposable namespace Xray test passed (1 passed, 67.86 s) with Xray `26.9.9 Custom (go1.27rc2 linux/amd64)`, reference commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`. A prior run exposed the fixture's 12-second UDP idle timeout expiring during the longer negative-policy sequence; raising this test fixture timeout to 90 seconds fixed the harness lifecycle. H3 unknown-UUID denial is still verified only for packet-up. H3-specific nondefault QUIC tuning, Reverse Bridge H3, physical LAN/production routes remain open; support stays Partial.
+2026-10-05 H3 identity failure handling across all Hub XHTTP modes: added unregistered-UUID Xray clients for `packet-up`, `stream-up`, and `auto`. TCP and UDP probes in every mode stayed upstream of Edge; valid clients had already passed the same mode's authorization case and all Xray client processes remained healthy. `bash scripts/test_hub_overlay_ipv6_xray_netns.sh` passed (1 passed, 69.19 s) with Xray `26.9.9 Custom (go1.27rc2 linux/amd64)`, reference commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`. This closes the H3 UUID-authentication gap for these three XHTTP modes; other inbound/security combinations, physical LAN and production routing remain open. Support stays Partial.
+
+2026-10-05 VLESS Reverse Bridge over XHTTP/TLS H3 remains fail-closed: an experimental fixed-Xray `26.9.9 Custom (go1.27rc2 linux/amd64)` run against `ref/xray-core` commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120` exercised `packet-up`, `stream-up`, and `auto`. Xray Bridge → Chimera Portal succeeded, but Chimera Bridge → Xray Portal failed in all three modes: the HTTP/3 request was accepted and the target received the payload, while the Xray-side client received no echo and reset on timeout. Bridge logs showed the returned target bytes and a Mux KEEP being written, so the remaining fault is at or after Xray Portal's Reverse session/downlink handling; its exact cause is not yet established. The temporary H3 Reverse e2e variants were removed, and both runtime planning and connection setup explicitly reject this role. The retained focused unit test `plan_rejects_xhttp_h3_until_reverse_runtime_is_implemented` verifies fail-closed behavior; `cargo test -p chimera_server_lib --lib --all-features --locked plan_rejects_xhttp_h3_until_reverse_runtime_is_implemented` passed. Regression command `XRAY_BIN=./xray cargo test -p chimera_server_app --test vless_reverse_xray_e2e --all-features --locked xhttp_tls_packet_up_vless_reverse -- --nocapture` passed both H2 directions. XHTTP H3 is supported for ordinary static VLESS and Hub ingress only; Reverse Bridge H3 remains unsupported pending Portal downlink diagnosis and fixed-Xray bidirectional verification. Site-gateway support remains Partial.
+
+
+2026-10-05 TUN MTU became configurable: the Chimera-only `tunGateway.mtu` defaults to 1500 and validates 1280–9000. The validated value is shared by the Linux TUN device, receive buffer, vendored smoltcp device capability and IPv4/IPv6 UDP output fragmenter. Server memory tests cover 4 KiB IPv4/IPv6 UDP fragmentation at 1280; the vendor suite confirms both-family output fragmentation and the reported smoltcp MTU. A real Linux TUN in a disposable namespace passed with MTU 1280, including IPv4/IPv6 TCP/UDP route traffic and preservation of the Server-local route. Validation: `cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway::tests --locked` (24 passed); `cargo test -p chimera_server_lib --no-default-features --features tun-gateway,vless-reverse --lib tun_gateway_mtu --locked` (1 passed); `cargo test --manifest-path vendor/watfaq-netstack/Cargo.toml` (19 unit + 34 integration passed); `cargo clippy --manifest-path vendor/watfaq-netstack/Cargo.toml --all-targets --all-features -- -D warnings` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed; `TUN_GATEWAY_MTU=1280 bash scripts/test_tun_gateway_managed_routes_netns.sh`, `cargo fmt --all -- --check`, `git diff --check` and `bash -n scripts/test_tun_gateway_managed_routes_netns.sh` passed. This remains the Chimera site-gateway extension; Xray TUN inbound compatibility is still unimplemented and the support matrix remains Partial.
+
+2026-10-05 Full site-gateway namespace revalidation at MTU 1280: `TUN_GATEWAY_MTU=1280 bash scripts/test_tun_gateway_netns.sh` passed with the live Linux TUN and Office routes at MTU 1280. The run covered dual-stack TCP/UDP and 4 KiB UDP, IPv4/IPv6 fragment admission pressure, three production-timeout UDP idle recoveries, UDP iperf3 (375,600 bytes sent/received, 0% loss), Hub reconnect, three Edge-only restarts (same-tuple UDP stable after each; final reconnect on retry 6), and SIGTERM TUN cleanup. The TCP admission check held eight flows, rejected the ninth before Edge and confirmed recovery. A deterministic 4 MiB TCP echo then matched byte-for-byte on Office and Edge and returned EOF after client write-half-close: 4,194,328 bytes including marker, SHA-256 `4b7d55b3179211492095a48e98d3e3175c48a0f4ba9e27b934cd15a10f7d3f99`. TCP iperf3 had previously produced a control-result EOF despite Edge receiving payload, so the smoke no longer gates on that control result and makes no TCP throughput claim. The upper MTU bound also passed `TUN_GATEWAY_MTU=9000 bash scripts/test_tun_gateway_managed_routes_netns.sh` for managed dual-stack routes, Office TCP/UDP, Server-local route preservation, cleanup and rollback; the full Reverse topology was not run at 9000. This is isolated Linux namespace evidence; physical LAN, production routes/load and Xray TUN inbound remain open. Support remains Partial.
+
+2026-10-05 Reverse Bridge stale-session isolation: the intermittently missing TCP iperf3 control result was a Mux lifecycle bug. `run_physical_reader` treated a failed channel send after a logical-session task had exited as a physical-link failure. A stale KEEP now returns a per-session END like Xray v26.9.9 `ref/xray-core` `common/mux/server.go::handleStatusKeep` (baseline commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`); a failed Chimera directional half-close likewise closes only that logical session. A deterministic unit regression exercises both stale frame types and then verifies the same physical Mux still dispatches and transfers a valid TCP session. Validation: `cargo test -p chimera_server_lib --lib --all-features --locked mux_` (40 passed), all-target/all-feature workspace Clippy with `-D warnings`, format, shell syntax and diff checks passed. Five separate `bash scripts/test_tun_gateway_netns.sh --tcp-iperf-diagnostic` runs passed with iperf3 3.20. The full MTU-1280 smoke now gates on valid TCP iperf3 JSON and passed: 59,899,904 bytes sent, 58,064,896 received at 154.1 Mbit/s, alongside the existing UDP, dual-stack, capacity, restart and cleanup checks. These values are a functional probe, not a benchmark. Site-gateway support remains Partial; physical LAN, production route/load and Xray TUN compatibility remain open.
+
+2026-10-05 Full Reverse path at MTU 9000: the first attempt exposed a test-fixture mismatch: the Office route advertised MTU 9000 while its veth pair remained at 1500, so the 4 KiB Office-LAN UDP request timed out before reaching the Gateway. The namespace setup now applies the configured MTU to both veth endpoints and asserts the client endpoint value. `TUN_GATEWAY_MTU=9000 bash scripts/test_tun_gateway_netns.sh --hub-policy-only` passed the focused dual-stack, 4 KiB UDP and dynamic-policy path; the full `TUN_GATEWAY_MTU=9000 bash scripts/test_tun_gateway_netns.sh` then passed the full path, including TCP/UDP iperf3, fragment pressure, expiry, restarts and teardown. TCP iperf3 sent 69,861,376 bytes and received 67,895,296 bytes (180.9 Mbit/s receiver rate); UDP iperf3 had 0% loss. The 9000 case simulates an Office jumbo link and does not verify physical PMTU or mixed-MTU deployment behavior. Site-gateway support remains Partial.
+
+After the Bridge session fix, `XRAY_BIN=./xray bash scripts/test_tun_gateway_xray_hub_netns.sh` passed with Xray `26.9.9 Custom (go1.27rc2 linux/amd64)` against the recorded `ref/xray-core` v26.9.9 commit `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`. The fixed-Xray Hub/Portal topology again carried TCP, UDP and 4 KiB UDP over RAW/TLS, REALITY, XHTTP/TLS H2/H3 and WebSocket/TLS, with prefix mapping, security denials and ACL denials intact. It does not establish Xray interoperability for Chimera's reserved directional-half-close bit.
+
+2026-10-05 Reverse task-handle retention fix: Portal and Bridge session spawns now register through shared `session_core::track_task`, which drops finished handles before each new TCP/UDP task is recorded. Previously completed JoinHandles accumulated until the physical Mux closed. `completed_task_handles_are_reaped_when_new_tasks_are_tracked` creates 512 sequential completed tasks and confirms tracked-handle count stays at 1; the repeated 16-session final-response/half-close regression passed. The 40-test Mux group, minimal `vless-reverse` app check, workspace all-target/all-feature Clippy, fmt and whitespace checks passed. The fixed-Xray namespace suite also passed after this change. Active handles remain owned for worker shutdown; memory retention is bounded by peak task concurrency, not lifetime session count. This does not claim an active-session cap or production-load measurement.
+
+2026-10-05 Reverse site ACL and destination sniffing: `siteToSite` maps and checks a literal target before TCP dispatch, while non-route-only HTTP/TLS `destOverride` can replace the dial target later. Compilation now rejects that combination unless `routeOnly: true`; route-only sniffing keeps the mapped IP checked by the Edge ACL. `static_vless_reverse_site_to_site_rejects_target_override_without_route_only` passed with `--all-features` and with reduced `--no-default-features --features vless-reverse`; workspace formatting and diff checks passed. Site-gateway support stays Partial.
+
+2026-10-05 Hub/Edge/Office deploy templates: added `examples/site-to-site/{hub,edge,office-gateway}.yaml` plus role and deployment-boundary notes. The sample Hub authenticates separate Edge/Office IDs, routes the authorized Office identity by original dual-stack Overlay CIDR and port, and blackholes the protected prefixes after those allows. The Edge applies dual-stack prefix mapping, mapped-target allow rules, and matching Freedom final rules; the Office sample configures Linux `tunGateway`, TLS-verified VLESS egress, Overlay routing, and optional source/ingress-scoped routes. All three passed application `--check` with `tun-gateway,vless-reverse-tls`; `cargo test -p chimera_server_app --no-default-features --features tun-gateway,vless-reverse-tls --test site_to_site_examples --locked` passed (1 test) and will guard template validity. The placeholder IDs, Hub name and certificate paths are not deployment credentials or physical-LAN evidence; the compatibility matrix remains Partial.

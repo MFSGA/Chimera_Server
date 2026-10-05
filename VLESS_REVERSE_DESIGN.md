@@ -1,7 +1,9 @@
 # VLESS Reverse 支持设计与实施计划
 
-- 状态：Batch A–I 已实现，Batch J 收口进行中；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。RAW 双向互操作现额外锁定 256 KiB 连续回显、4 路并发 TCP session 和 Xray Mux `END` 的整会话关闭语义；Xray Bridge -> Chimera Portal 还验证错误 UUID 不会建立 Reverse worker 或拨号目标，listener 保持健康并可随后接受正确 Bridge。XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
-- 更新日期：2026-10-01
+> 站点到站点 TUN Gateway 是 2026-10-03 新启动的独立纵向专项，依赖这里已有的 Reverse Portal/Bridge 能力；其 TUN、VLESS UDP 出站、Overlay 映射与验收状态统一维护于 [SITE_TO_SITE_DESIGN.md](SITE_TO_SITE_DESIGN.md)。该专项为 Chimera-to-Chimera TCP 增加了 Mux option bit `0x04` 的方向性 half-close 扩展；Xray 标准 END 语义不变，且不宣称 Xray peer 支持该扩展。本文件其余 Reverse wire/role 兼容范围不会因新专项自动扩大。
+
+- 状态：Batch A–I 已实现，Batch J 收口进行中；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。普通静态 VLESS outbound 另已支持并通过 TUN→固定 Xray Hub 的 XHTTP/TLS H3 `packet-up`/`stream-up`/`auto` 验证；这不扩展本文件的 Reverse Bridge 主动拨号组合。RAW 双向互操作现额外锁定 256 KiB 连续回显、4 路并发 TCP session 和 Xray Mux `END` 的整会话关闭语义；Xray Bridge -> Chimera Portal 还验证错误 UUID 不会建立 Reverse worker 或拨号目标，listener 保持健康并可随后接受正确 Bridge。VLESS Reverse Bridge 的 XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
+- 更新日期：2026-10-03
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
 - 最新字段复核：Xray-core 官方 `main` 提交
@@ -434,9 +436,9 @@ Reverse 是 VLESS account/command 能力，物理连接继续使用 VLESS outbou
 | --- | --- |
 | RAW + `encryption: none` + empty flow | 第一阶段 loopback 开发与 wire 互操作基线 |
 | RAW/TLS | 第一阶段部署验收；Chimera 只需已有 inbound TLS，主动拨号由 Xray Bridge 完成 |
-| REALITY | Portal 侧可在现有 inbound 能力上追加验证；Chimera Bridge 方向后续单独验证 |
+| TCP/REALITY | 固定 Xray 26.9.9 双向互通通过：Xray Bridge → Chimera Portal 与 Chimera Bridge → Xray Portal。Bridge client 发送 X25519MLKEM768 + X25519 fallback，并解析 hybrid ServerHello；其他 REALITY transport/security 组合仍需逐项验证 |
 | WebSocket | Chimera Bridge -> Xray Portal 已验证（无 early data） |
-| XHTTP `auto` / `stream-up` / `packet-up` + TLS/H2 | 三种配置 mode 均完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；当前 Xray TLS/H2 `auto` 在运行时选择 packet-up。显式 packet-up 另验证自定义 header 序号、header payload 分块与 `uplinkChunkSize`。既有 stream-up 用例验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。request-shape/config 回归覆盖 session path/query/header/cookie、seq/data header/cookie 与 padding placements；显式非 `h2` ALPN 在 H1/H3 client 未实现前 fail closed；`stream-one`、xmux、`downloadSettings`、H1/H3 暂不声明 |
+| XHTTP `auto` / `stream-up` / `packet-up` + TLS/H2 | 三种配置 mode 均完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；当前 Xray TLS/H2 `auto` 在运行时选择 packet-up。显式 packet-up 另验证自定义 header 序号、header payload 分块与 `uplinkChunkSize`。既有 stream-up 用例验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。request-shape/config 回归覆盖 session path/query/header/cookie、seq/data header/cookie 与 padding placements。普通静态 VLESS outbound 的 H3 `packet-up`/`stream-up` 互通不构成本 Reverse Bridge 组合的支持证据；该角色的 H1/H3 ALPN fail closed，`stream-one`、xmux、`downloadSettings` 仍暂不声明 |
 | HTTPUpgrade / gRPC | 按现有 feature 和 connector 能力分别验证 |
 | Vision | 独立 VLESS flow 能力，不因 Reverse 自动宣称支持 |
 | ML-KEM VLESS Encryption | 独立加密能力，不因当前字段存在而静默接受 |
@@ -518,7 +520,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 已实现 standalone `MuxClientWorker`、session manager、least-loaded picker 和有界逻辑 session stream；单物理 Mux 连接可复用多个 TCP session，frame writer/reader 与每-session channel 都有固定容量并形成真实背压。
 - control session 目标固定为当前 Xray 的 `udp://reverse:0`；只有成功记录 ACTIVE control 的 worker 才进入 picker，DRAIN 为单向状态，DRAIN/CLOSED/PENDING worker 都不得接收新 session，control session 关闭会传播关闭 worker。
 - session allocator 覆盖并发上限、累计连接上限、session ID 冲突与关闭；Portal 的 Xray 阈值 `total_connections > 256` 暴露为 drain 判定，但周期 heartbeat/registry owner 留给 Batch E。
-- TCP EOF 行为按固定 Xray Mux 实现锁定：应用写侧 EOF/shutdown 会发送 `SessionStatusEnd`，远端和本地都把它视为整个逻辑 session 结束，而不是保留 raw TCP 式单向 half-close；孤儿 KEEP 会回 END。
+- Xray 标准 TCP EOF 行为按固定 Xray Mux 实现锁定：应用写侧 EOF/shutdown 会发送不带扩展位的 `SessionStatusEnd`，远端和本地都把它视为整个逻辑 session 结束；孤儿 KEEP 会回 END。2026-10-03 站点网关切片新增 Chimera-only `END` option bit `0x04`，让 Chimera Portal/Bridge 可保留反向 TCP 数据直到另一方向结束；Xray peer 忽略此位并继续整会话关闭；不带此位的标准 `END` 语义保持不变。详见 `SITE_TO_SITE_DESIGN.md`。
 - 物理 Mux EOF/写失败会关闭 worker 并唤醒逻辑 session；测试覆盖 payload roundtrip、source/local metadata、picker、control lifecycle、关闭传播、并发限制和 bounded-queue backpressure。
 - Batch D 仍是 standalone session core：认证后的 VLESS `0x04` handler 还没有把物理连接注册进 Reverse registry，DokodemoDoor/routing 也尚不能选择这些 worker；这些属于 Batch E。
 
