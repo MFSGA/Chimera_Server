@@ -1,0 +1,54 @@
+# Hub / Reverse Portal. Replace the placeholder IDs and certificate paths.
+log:
+  loglevel: warning
+
+inbounds:
+  - tag: hub-vless
+    listen: 0.0.0.0
+    port: 443
+    protocol: vless
+    settings:
+      clients:
+        - id: 11111111-1111-4111-8111-111111111111
+          email: edge-a@example.invalid
+          reverse:
+            tag: edge-a
+        - id: 22222222-2222-4222-8222-222222222222
+          email: office-gateway@example.invalid
+      decryption: none
+    streamSettings:
+      network: tcp
+      security: tls
+      tlsSettings:
+        certificates:
+          - certificateFile: /etc/chimera/tls/fullchain.pem
+            keyFile: /etc/chimera/tls/private-key.pem
+
+outbounds:
+  - tag: direct
+    protocol: freedom
+  - tag: overlay-deny
+    protocol: blackhole
+
+# The allow rules must precede the protected-prefix deny rules.
+# Use the original Overlay destinations here; Edge translates them later.
+routing:
+  rules:
+    - type: field
+      inboundTag: [hub-vless]
+      user: [office-gateway@example.invalid]
+      network: [tcp]
+      ip: [10.44.0.0/24, fd44:44:0::/64]
+      port: [22, 443]
+      outboundTag: edge-a
+    - type: field
+      inboundTag: [hub-vless]
+      user: [office-gateway@example.invalid]
+      network: [tcp, udp]
+      ip: [10.44.0.0/24, fd44:44:0::/64]
+      port: 53
+      outboundTag: edge-a
+    - type: field
+      inboundTag: [hub-vless]
+      ip: [10.44.0.0/24, fd44:44:0::/64]
+      outboundTag: overlay-deny

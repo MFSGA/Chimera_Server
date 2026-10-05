@@ -91,7 +91,17 @@ fn run_xhttp_case(case: XhttpCase) {
                     }
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": ["tcp"],
+                        "ip": ["127.0.0.0/8"]
+                    }]
+                }
+            }]
         }),
     );
     write_json(

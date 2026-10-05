@@ -217,7 +217,17 @@ fn write_xhttp_config(path: &Path, port: u16, cert_path: &Path, key_path: &Path)
                     }
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": ["tcp"],
+                        "ip": ["127.0.0.0/8"]
+                    }]
+                }
+            }]
         }),
     );
 }

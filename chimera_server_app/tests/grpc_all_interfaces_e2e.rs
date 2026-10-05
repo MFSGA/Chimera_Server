@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -1985,4 +1985,126 @@ fn observatory_get_outbound_status_executes() {
         .collect::<HashSet<_>>();
     assert!(tags.contains(DIRECT_TAG));
     assert!(tags.contains(BACKUP_TAG));
+}
+
+#[test]
+fn observatory_grpc_reports_probe_health_transitions() {
+    trace_step("==== test observatory probe health transitions start ====");
+    let fixture =
+        HttpHealthFixture::start().expect("failed to start HTTP health fixture");
+    let probe_url = format!("http://{}/health", fixture.address);
+    let harness = Harness::start_with_config_builder(|grpc_port, socks_port| {
+        let mut config: serde_json::Value =
+            serde_json::from_str(&build_config(grpc_port, socks_port))
+                .expect("base gRPC config should be valid JSON");
+        config["observatory"] = serde_json::json!({
+            "subjectSelector": [DIRECT_TAG],
+            "probeURL": probe_url,
+            "probeInterval": "100ms"
+        });
+        serde_json::to_string(&config).expect("observatory config should serialize")
+    })
+    .expect("failed to start observatory status test harness");
+
+    wait_for_outbound_health(&harness, true);
+    fixture.set_available(false);
+    wait_for_outbound_health(&harness, false);
+    fixture.set_available(true);
+    wait_for_outbound_health(&harness, true);
+    trace_step("ObservatoryService reported alive → down → recovered");
+}
+
+struct HttpHealthFixture {
+    address: SocketAddr,
+    available: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    task: Option<thread::JoinHandle<()>>,
+}
+
+impl HttpHealthFixture {
+    fn start() -> io::Result<Self> {
+        use std::io::ErrorKind;
+        use std::sync::atomic::AtomicBool;
+
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let available = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task_available = available.clone();
+        let task_shutdown = shutdown.clone();
+        let task = thread::spawn(move || {
+            let mut request = [0; 2048];
+            while !task_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        if stream.read(&mut request).is_ok()
+                            && task_available.load(Ordering::Acquire)
+                        {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            );
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            available,
+            shutdown,
+            task: Some(task),
+        })
+    }
+
+    fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::Release);
+    }
+}
+
+impl Drop for HttpHealthFixture {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ =
+            TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+fn wait_for_outbound_health(harness: &Harness, expected_alive: bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response: GetOutboundStatusResponse = harness.expect_ok(
+            harness.unary(
+                PATH_OBSERVATORY_GET_OUTBOUND_STATUS,
+                GetOutboundStatusRequest {},
+            ),
+            "ObservatoryService/GetOutboundStatus health transition",
+        );
+        let status = response
+            .status
+            .expect("observatory response should include status")
+            .status
+            .into_iter()
+            .find(|status| status.outbound_tag == DIRECT_TAG)
+            .expect("direct outbound status should be present");
+        if status.alive == expected_alive {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected outbound {DIRECT_TAG} alive={expected_alive}, got alive={}; logs:\n{}",
+            status.alive,
+            harness.logs()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }

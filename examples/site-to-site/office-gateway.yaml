@@ -1,0 +1,61 @@
+# Office TUN Gateway. Replace the Hub name and CA path before deployment.
+log:
+  loglevel: warning
+
+inbounds: []
+
+outbounds:
+  - tag: office-to-hub
+    protocol: vless
+    settings:
+      vnext:
+        - address: hub.example.net
+          port: 443
+          users:
+            - id: 22222222-2222-4222-8222-222222222222
+              email: office-gateway@example.invalid
+              encryption: none
+    streamSettings:
+      network: tcp
+      security: tls
+      tlsSettings:
+        serverName: hub.example.net
+
+  - tag: direct
+    protocol: freedom
+  - tag: overlay-deny
+    protocol: blackhole
+
+routing:
+  rules:
+    - type: field
+      inboundTag: [office-tun]
+      network: [tcp]
+      ip: [10.44.0.0/24, fd44:44:0::/64]
+      port: [22, 443]
+      outboundTag: office-to-hub
+    - type: field
+      inboundTag: [office-tun]
+      network: [tcp, udp]
+      ip: [10.44.0.0/24, fd44:44:0::/64]
+      port: 53
+      outboundTag: office-to-hub
+    - type: field
+      inboundTag: [office-tun]
+      ip: [10.44.0.0/24, fd44:44:0::/64]
+      outboundTag: overlay-deny
+
+tunGateway:
+  name: chimera-office
+  address: 10.254.0.1/24
+  ipv6Address: fd00:254::1/64
+  mtu: 1500
+  routes: [10.44.0.0/24, fd44:44:0::/64]
+  routeFrom: [10.80.0.0/24, fd80:80::/64]
+  routeInputInterface: br-office
+  routeTable: 10001
+  routeRulePriority: 10001
+  inboundTag: office-tun
+  userLevel: 0
+  maxTcpConnections: 64
+  maxUdpSessions: 256

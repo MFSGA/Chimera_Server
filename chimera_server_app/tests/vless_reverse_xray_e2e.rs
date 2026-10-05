@@ -2,19 +2,28 @@ mod xhttp_support;
 
 use std::{
     fs::{self, File},
-    io::{BufReader, Read, Write},
-    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    io::{self, BufReader, Read, Write},
+    net::{
+        IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
 use aws_lc_rs::digest::{SHA256, digest};
+use prost::Message;
 use rustls_pemfile::certs;
 use serde_json::json;
+use tonic::{
+    Request, Status,
+    codegen::http::uri::PathAndQuery,
+    transport::{Channel, Endpoint},
+};
 use xhttp_support::{
     TEST_UUID, create_test_dir, free_localhost_port, serial_xray_guard,
     start_chimera, start_xray, wait_for_tcp, workspace_root, write_json,
@@ -24,12 +33,26 @@ use xhttp_support::{
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const REVERSE_READY_TIMEOUT: Duration = Duration::from_secs(12);
+// The Hub policy matrix has rejection-only phases longer than the regular
+// readiness timeout between allowed UDP probes. Keep these test fixtures alive
+// through the later dynamic IPv6 checks.
+const UDP_ECHO_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const WRONG_TEST_UUID: &str = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+const HUB_OVERLAY_PROTECTED_PREFIXES: [&str; 3] =
+    ["10.200.1.0/24", "10.200.2.0/24", "2001:db8:30::/64"];
+const ROUTING_ADD_RULE_PATH: &str =
+    "/xray.app.router.command.RoutingService/AddRule";
+const ROUTING_REMOVE_RULE_PATH: &str =
+    "/xray.app.router.command.RoutingService/RemoveRule";
+const ROUTING_LIST_RULE_PATH: &str =
+    "/xray.app.router.command.RoutingService/ListRule";
 
 #[derive(Clone, Copy)]
 enum ReverseSecurity {
     Raw,
     Tls,
+    #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+    Reality,
     Websocket,
     XhttpTls,
     XhttpTlsAuto,
@@ -42,11 +65,22 @@ impl ReverseSecurity {
         match self {
             Self::Raw => "raw",
             Self::Tls => "tls",
+            #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+            Self::Reality => "reality",
             Self::Websocket => "websocket",
             Self::XhttpTls => "xhttp-tls",
             Self::XhttpTlsAuto => "xhttp-tls-auto",
             Self::XhttpTlsPacketUp => "xhttp-tls-packet-up",
             Self::XhttpTlsObfs => "xhttp-tls-obfs",
+        }
+    }
+
+    fn has_negative_auth_case(self) -> bool {
+        match self {
+            Self::Raw => true,
+            #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+            Self::Reality => true,
+            _ => false,
         }
     }
 }
@@ -87,6 +121,18 @@ fn chimera_bridge_preserves_reverse_routing_user_over_raw_vless_reverse() {
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_tls_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Tls, None);
+}
+
+#[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_reality_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::Reality);
+}
+
+#[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+#[test]
+fn chimera_bridge_round_trips_xray_portal_over_reality_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::Reality, None);
 }
 
 #[test]
@@ -199,12 +245,3080 @@ fn chimera_bridge_reverse_sniffing_honors_ip_exclusions() {
 
 #[test]
 fn xray_bridge_round_trips_public_dokodemo_udp_over_raw_vless_reverse() {
-    run_reverse_udp_interop();
+    run_reverse_udp_interop(false);
+}
+
+#[test]
+fn xray_socks_udp_reattaches_global_id_after_vless_tcp_disconnect() {
+    run_reverse_udp_interop(true);
+}
+
+#[test]
+fn xray_clients_are_isolated_by_hub_overlay_access_rules_before_edge_dispatch() {
+    run_hub_overlay_access_interop();
 }
 
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_udp_over_raw_vless_reverse() {
     run_chimera_bridge_udp_interop();
+}
+
+struct HubOverlayEchoTarget {
+    overlay_prefix: &'static str,
+    overlay_ip: IpAddr,
+    tcp_allowed: SocketAddr,
+    tcp_allowed_bytes: Arc<AtomicUsize>,
+    tcp_denied: SocketAddr,
+    tcp_denied_bytes: Arc<AtomicUsize>,
+    udp_allowed: SocketAddr,
+    udp_allowed_bytes: Arc<AtomicUsize>,
+    udp_denied: SocketAddr,
+    udp_denied_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicRouterConfig {
+    #[prost(int32, tag = "1")]
+    domain_strategy: i32,
+    #[prost(message, repeated, tag = "2")]
+    rule: Vec<DynamicRoutingRule>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicRoutingRule {
+    #[prost(oneof = "dynamic_routing_rule::TargetTag", tags = "1, 12")]
+    target_tag: Option<dynamic_routing_rule::TargetTag>,
+    #[prost(string, tag = "19")]
+    rule_tag: String,
+    #[prost(message, repeated, tag = "10")]
+    ip: Vec<DynamicIpRule>,
+    #[prost(int32, repeated, tag = "13")]
+    networks: Vec<i32>,
+    #[prost(string, repeated, tag = "7")]
+    user_email: Vec<String>,
+    #[prost(string, repeated, tag = "8")]
+    inbound_tag: Vec<String>,
+}
+
+mod dynamic_routing_rule {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum TargetTag {
+        #[prost(string, tag = "1")]
+        Tag(String),
+        #[prost(string, tag = "12")]
+        BalancingTag(String),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicIpRule {
+    #[prost(message, optional, tag = "2")]
+    custom: Option<DynamicCidrRule>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicCidrRule {
+    #[prost(message, optional, tag = "1")]
+    cidr: Option<DynamicCidr>,
+    #[prost(bool, tag = "2")]
+    reverse_match: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicCidr {
+    #[prost(bytes = "vec", tag = "1")]
+    ip: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    prefix: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicTypedMessage {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(bytes = "vec", tag = "2")]
+    value: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicAddRuleRequest {
+    #[prost(message, optional, tag = "1")]
+    config: Option<DynamicTypedMessage>,
+    #[prost(bool, tag = "2")]
+    should_append: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicAddRuleResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicRemoveRuleRequest {
+    #[prost(string, tag = "1")]
+    rule_tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicRemoveRuleResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicListRuleRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicListRuleItem {
+    #[prost(string, tag = "1")]
+    tag: String,
+    #[prost(string, tag = "2")]
+    rule_tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DynamicListRuleResponse {
+    #[prost(message, repeated, tag = "1")]
+    rules: Vec<DynamicListRuleItem>,
+}
+
+impl HubOverlayEchoTarget {
+    fn new(
+        overlay_prefix: &'static str,
+        overlay_ip: IpAddr,
+        edge_ip: IpAddr,
+    ) -> Self {
+        let (tcp_allowed, tcp_allowed_bytes) =
+            start_observed_echo_server_on(edge_ip);
+        let (tcp_denied, tcp_denied_bytes) = start_observed_echo_server_on(edge_ip);
+        let (udp_allowed, udp_allowed_bytes) =
+            start_observed_udp_echo_server_on(edge_ip);
+        let (udp_denied, udp_denied_bytes) =
+            start_observed_udp_echo_server_on(edge_ip);
+        Self {
+            overlay_prefix,
+            overlay_ip,
+            tcp_allowed,
+            tcp_allowed_bytes,
+            tcp_denied,
+            tcp_denied_bytes,
+            udp_allowed,
+            udp_allowed_bytes,
+            udp_denied,
+            udp_denied_bytes,
+        }
+    }
+
+    fn overlay_target(&self, port: u16) -> SocketAddr {
+        SocketAddr::new(self.overlay_ip, port)
+    }
+
+    fn edge_ports(&self) -> [u16; 4] {
+        [
+            self.tcp_allowed.port(),
+            self.tcp_denied.port(),
+            self.udp_allowed.port(),
+            self.udp_denied.port(),
+        ]
+    }
+}
+
+fn run_hub_overlay_access_interop() {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping Hub Overlay access interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir("vless-reverse-hub-overlay-access");
+    let hub_dir = work_dir.join("hub");
+    let edge_dir = work_dir.join("edge");
+    let allowed_client_dir = work_dir.join("allowed-client");
+    let denied_client_dir = work_dir.join("denied-client");
+    let allowed_tls_client_dir = work_dir.join("allowed-tls-client");
+    let denied_tls_client_dir = work_dir.join("denied-tls-client");
+    let allowed_ws_client_dir = work_dir.join("allowed-ws-client");
+    let denied_ws_client_dir = work_dir.join("denied-ws-client");
+    let allowed_xhttp_client_dir = work_dir.join("allowed-xhttp-client");
+    let denied_xhttp_client_dir = work_dir.join("denied-xhttp-client");
+    let allowed_xhttp_stream_up_client_dir =
+        work_dir.join("allowed-xhttp-stream-up-client");
+    let denied_xhttp_stream_up_client_dir =
+        work_dir.join("denied-xhttp-stream-up-client");
+    let allowed_xhttp_auto_client_dir = work_dir.join("allowed-xhttp-auto-client");
+    let denied_xhttp_auto_client_dir = work_dir.join("denied-xhttp-auto-client");
+    let allowed_xhttp_h3_client_dir = work_dir.join("allowed-xhttp-h3-client");
+    let denied_xhttp_h3_client_dir = work_dir.join("denied-xhttp-h3-client");
+    let unauthenticated_xhttp_h3_client_dir =
+        work_dir.join("unauthenticated-xhttp-h3-client");
+    let unauthenticated_xhttp_h3_stream_up_client_dir =
+        work_dir.join("unauthenticated-xhttp-h3-stream-up-client");
+    let unauthenticated_xhttp_h3_auto_client_dir =
+        work_dir.join("unauthenticated-xhttp-h3-auto-client");
+    let allowed_xhttp_h3_stream_up_client_dir =
+        work_dir.join("allowed-xhttp-h3-stream-up-client");
+    let denied_xhttp_h3_stream_up_client_dir =
+        work_dir.join("denied-xhttp-h3-stream-up-client");
+    let allowed_xhttp_h3_auto_client_dir =
+        work_dir.join("allowed-xhttp-h3-auto-client");
+    let denied_xhttp_h3_auto_client_dir =
+        work_dir.join("denied-xhttp-h3-auto-client");
+    let allowed_reality_client_dir = work_dir.join("allowed-reality-client");
+    let denied_reality_client_dir = work_dir.join("denied-reality-client");
+    for directory in [
+        &hub_dir,
+        &edge_dir,
+        &allowed_client_dir,
+        &denied_client_dir,
+        &allowed_tls_client_dir,
+        &denied_tls_client_dir,
+        &allowed_ws_client_dir,
+        &denied_ws_client_dir,
+        &allowed_xhttp_client_dir,
+        &denied_xhttp_client_dir,
+        &allowed_xhttp_stream_up_client_dir,
+        &denied_xhttp_stream_up_client_dir,
+        &allowed_xhttp_auto_client_dir,
+        &denied_xhttp_auto_client_dir,
+        &allowed_xhttp_h3_client_dir,
+        &denied_xhttp_h3_client_dir,
+        &unauthenticated_xhttp_h3_client_dir,
+        &unauthenticated_xhttp_h3_stream_up_client_dir,
+        &unauthenticated_xhttp_h3_auto_client_dir,
+        &allowed_xhttp_h3_stream_up_client_dir,
+        &denied_xhttp_h3_stream_up_client_dir,
+        &allowed_xhttp_h3_auto_client_dir,
+        &denied_xhttp_h3_auto_client_dir,
+        &allowed_reality_client_dir,
+        &denied_reality_client_dir,
+    ] {
+        fs::create_dir_all(directory).expect("create isolated process directory");
+    }
+
+    let mut targets = vec![
+        HubOverlayEchoTarget::new(
+            "10.200.1.0/24",
+            Ipv4Addr::new(10, 200, 1, 20).into(),
+            Ipv4Addr::new(127, 0, 0, 20).into(),
+        ),
+        HubOverlayEchoTarget::new(
+            "10.200.1.0/24",
+            Ipv4Addr::new(10, 200, 1, 21).into(),
+            Ipv4Addr::new(127, 0, 0, 21).into(),
+        ),
+        HubOverlayEchoTarget::new(
+            "10.200.2.0/24",
+            Ipv4Addr::new(10, 200, 2, 30).into(),
+            Ipv4Addr::new(127, 0, 1, 30).into(),
+        ),
+    ];
+    let ipv6_probe = TcpListener::bind(SocketAddr::new(
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        0,
+    ));
+    match ipv6_probe {
+        Ok(listener) => {
+            drop(listener);
+            targets.push(HubOverlayEchoTarget::new(
+                "2001:db8:30::/64",
+                "2001:db8:30::20"
+                    .parse()
+                    .expect("parse IPv6 Overlay target"),
+                "::1".parse().expect("parse IPv6 Edge target"),
+            ));
+        }
+        Err(error) => {
+            assert!(
+                std::env::var_os("REQUIRE_HUB_IPV6_OVERLAY").is_none(),
+                "IPv6 Overlay test was required but IPv6 loopback is unavailable: {error}"
+            );
+            eprintln!(
+                "skipping IPv6 Overlay CIDR subcase because IPv6 loopback is unavailable: {error}"
+            );
+        }
+    }
+    let hub_grpc_port = free_localhost_port();
+    let hub_port = free_localhost_port();
+    let hub_tls_port = free_localhost_port();
+    let hub_ws_port = free_localhost_port();
+    let hub_xhttp_port = free_localhost_port();
+    let hub_xhttp_stream_up_port = free_localhost_port();
+    let hub_xhttp_auto_port = free_localhost_port();
+    let hub_xhttp_h3_port = free_localhost_udp_port();
+    let hub_xhttp_h3_stream_up_port = free_localhost_udp_port();
+    let hub_xhttp_h3_auto_port = free_localhost_udp_port();
+    let hub_reality_port = free_localhost_port();
+    let allowed_client_socks = free_localhost_port();
+    let denied_client_socks = free_localhost_port();
+    let allowed_tls_client_socks = free_localhost_port();
+    let denied_tls_client_socks = free_localhost_port();
+    let allowed_ws_client_socks = free_localhost_port();
+    let denied_ws_client_socks = free_localhost_port();
+    let allowed_xhttp_client_socks = free_localhost_port();
+    let denied_xhttp_client_socks = free_localhost_port();
+    let allowed_xhttp_stream_up_client_socks = free_localhost_port();
+    let denied_xhttp_stream_up_client_socks = free_localhost_port();
+    let allowed_xhttp_auto_client_socks = free_localhost_port();
+    let denied_xhttp_auto_client_socks = free_localhost_port();
+    let allowed_xhttp_h3_client_socks = free_localhost_port();
+    let denied_xhttp_h3_client_socks = free_localhost_port();
+    let unauthenticated_xhttp_h3_client_socks = free_localhost_port();
+    let unauthenticated_xhttp_h3_stream_up_client_socks = free_localhost_port();
+    let unauthenticated_xhttp_h3_auto_client_socks = free_localhost_port();
+    let allowed_xhttp_h3_stream_up_client_socks = free_localhost_port();
+    let denied_xhttp_h3_stream_up_client_socks = free_localhost_port();
+    let allowed_xhttp_h3_auto_client_socks = free_localhost_port();
+    let denied_xhttp_h3_auto_client_socks = free_localhost_port();
+    let allowed_reality_client_socks = free_localhost_port();
+    let denied_reality_client_socks = free_localhost_port();
+    let hub_config = work_dir.join("hub.json");
+    let edge_config = work_dir.join("edge.json");
+    let allowed_client_config = work_dir.join("allowed-client.json");
+    let denied_client_config = work_dir.join("denied-client.json");
+    let allowed_tls_client_config = work_dir.join("allowed-tls-client.json");
+    let denied_tls_client_config = work_dir.join("denied-tls-client.json");
+    let allowed_ws_client_config = work_dir.join("allowed-ws-client.json");
+    let denied_ws_client_config = work_dir.join("denied-ws-client.json");
+    let allowed_xhttp_client_config = work_dir.join("allowed-xhttp-client.json");
+    let denied_xhttp_client_config = work_dir.join("denied-xhttp-client.json");
+    let allowed_xhttp_stream_up_client_config =
+        work_dir.join("allowed-xhttp-stream-up-client.json");
+    let denied_xhttp_stream_up_client_config =
+        work_dir.join("denied-xhttp-stream-up-client.json");
+    let allowed_xhttp_auto_client_config =
+        work_dir.join("allowed-xhttp-auto-client.json");
+    let denied_xhttp_auto_client_config =
+        work_dir.join("denied-xhttp-auto-client.json");
+    let allowed_xhttp_h3_client_config =
+        work_dir.join("allowed-xhttp-h3-client.json");
+    let denied_xhttp_h3_client_config = work_dir.join("denied-xhttp-h3-client.json");
+    let unauthenticated_xhttp_h3_client_config =
+        work_dir.join("unauthenticated-xhttp-h3-client.json");
+    let unauthenticated_xhttp_h3_stream_up_client_config =
+        work_dir.join("unauthenticated-xhttp-h3-stream-up-client.json");
+    let unauthenticated_xhttp_h3_auto_client_config =
+        work_dir.join("unauthenticated-xhttp-h3-auto-client.json");
+    let allowed_xhttp_h3_stream_up_client_config =
+        work_dir.join("allowed-xhttp-h3-stream-up-client.json");
+    let denied_xhttp_h3_stream_up_client_config =
+        work_dir.join("denied-xhttp-h3-stream-up-client.json");
+    let allowed_xhttp_h3_auto_client_config =
+        work_dir.join("allowed-xhttp-h3-auto-client.json");
+    let denied_xhttp_h3_auto_client_config =
+        work_dir.join("denied-xhttp-h3-auto-client.json");
+    let allowed_reality_client_config = work_dir.join("allowed-reality-client.json");
+    let denied_reality_client_config = work_dir.join("denied-reality-client.json");
+    let (hub_tls_cert, hub_tls_key) = generate_test_certificate(&hub_dir);
+    let hub_tls_cert_sha256 = first_cert_sha256_hex(&hub_tls_cert);
+
+    const EDGE_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb7271";
+    const ALLOWED_OFFICE_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb7272";
+    const DENIED_OFFICE_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb7273";
+    const UNREGISTERED_OFFICE_UUID: &str = "3ac9b383-75a1-431c-8184-106c80eb7274";
+    const REALITY_PRIVATE_KEY: &str = "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI";
+    const REALITY_PUBLIC_KEY: &str = "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg";
+    const REALITY_SHORT_ID: &str = "4ac97aaf8b9b0356";
+
+    let mut hub_rules = Vec::new();
+    for target in &targets {
+        hub_rules.push(json!({
+            "type": "field",
+            "inboundTag": ["hub-vless-in", "hub-vless-tls-in", "hub-vless-ws-in", "hub-vless-xhttp-in", "hub-vless-xhttp-stream-up-in", "hub-vless-xhttp-auto-in", "hub-vless-xhttp-h3-in", "hub-vless-xhttp-h3-stream-up-in", "hub-vless-xhttp-h3-auto-in", "hub-vless-reality-in"],
+            "user": ["office-allowed@example.test"],
+            "network": ["tcp"],
+            "ip": [target.overlay_prefix],
+            "port": target.tcp_allowed.port().to_string(),
+            "outboundTag": "site-edge"
+        }));
+        hub_rules.push(json!({
+            "type": "field",
+            "inboundTag": ["hub-vless-in", "hub-vless-tls-in", "hub-vless-ws-in", "hub-vless-xhttp-in", "hub-vless-xhttp-stream-up-in", "hub-vless-xhttp-auto-in", "hub-vless-xhttp-h3-in", "hub-vless-xhttp-h3-stream-up-in", "hub-vless-xhttp-h3-auto-in", "hub-vless-reality-in"],
+            "user": ["office-allowed@example.test"],
+            "network": ["udp"],
+            "ip": [target.overlay_prefix],
+            "port": target.udp_allowed.port().to_string(),
+            "outboundTag": "site-edge"
+        }));
+    }
+    for prefix in HUB_OVERLAY_PROTECTED_PREFIXES {
+        hub_rules.push(json!({
+            "type": "field",
+            "inboundTag": ["hub-vless-in", "hub-vless-tls-in", "hub-vless-ws-in", "hub-vless-xhttp-in", "hub-vless-xhttp-stream-up-in", "hub-vless-xhttp-auto-in", "hub-vless-xhttp-h3-in", "hub-vless-xhttp-h3-stream-up-in", "hub-vless-xhttp-h3-auto-in", "hub-vless-reality-in"],
+            "ip": [prefix],
+            "outboundTag": "overlay-default-deny"
+        }));
+    }
+    let edge_ports = targets
+        .iter()
+        .flat_map(HubOverlayEchoTarget::edge_ports)
+        .map(|port| port.to_string())
+        .collect::<Vec<_>>();
+
+    write_json(
+        &hub_config,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": EDGE_UUID,
+                                "email": "site-edge@example.test",
+                                "reverse": {"tag": "site-edge"}
+                            },
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_tls_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-tls-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_ws_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-ws-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "ws",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "wsSettings": {"path": "/hub-ws"}
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_xhttp_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-xhttp-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "path": "/hub-xhttp",
+                            "mode": "packet-up",
+                            "noGRPCHeader": true,
+                            "noSSEHeader": true,
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_xhttp_stream_up_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-xhttp-stream-up-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "path": "/hub-xhttp-stream-up",
+                            "mode": "stream-up",
+                            "noGRPCHeader": true,
+                            "noSSEHeader": true,
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_xhttp_auto_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-xhttp-auto-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "path": "/hub-xhttp-auto",
+                            "mode": "auto",
+                            "noGRPCHeader": true,
+                            "noSSEHeader": true,
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_xhttp_h3_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-xhttp-h3-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "alpn": ["h3"],
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "path": "/hub-xhttp-h3",
+                            "mode": "packet-up",
+                            "noGRPCHeader": true,
+                            "noSSEHeader": true,
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_xhttp_h3_stream_up_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-xhttp-h3-stream-up-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "alpn": ["h3"],
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "path": "/hub-xhttp-h3-stream-up",
+                            "mode": "stream-up",
+                            "noGRPCHeader": true,
+                            "noSSEHeader": true,
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_xhttp_h3_auto_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-xhttp-h3-auto-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "alpn": ["h3"],
+                            "certificates": [{
+                                "certificateFile": hub_tls_cert,
+                                "keyFile": hub_tls_key
+                            }]
+                        },
+                        "xhttpSettings": {
+                            "path": "/hub-xhttp-h3-auto",
+                            "mode": "auto",
+                            "noGRPCHeader": true,
+                            "noSSEHeader": true,
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": hub_reality_port,
+                    "protocol": "vless",
+                    "tag": "hub-vless-reality-in",
+                    "settings": {
+                        "clients": [
+                            {
+                                "id": ALLOWED_OFFICE_UUID,
+                                "email": "office-allowed@example.test"
+                            },
+                            {
+                                "id": DENIED_OFFICE_UUID,
+                                "email": "office-unprivileged@example.test"
+                            }
+                        ],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "reality",
+                        "realitySettings": {
+                            "dest": format!("127.0.0.1:{hub_tls_port}"),
+                            "serverNames": ["site-reality.test"],
+                            "privateKey": REALITY_PRIVATE_KEY,
+                            "shortIds": [REALITY_SHORT_ID]
+                        }
+                    }
+                }
+            ],
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "overlay-default-deny", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": hub_rules},
+            "api": {
+                "listen": format!("127.0.0.1:{hub_grpc_port}"),
+                "services": ["RoutingService"]
+            }
+        }),
+    );
+
+    write_json(
+        &edge_config,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "site-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": hub_port,
+                        "id": EDGE_UUID,
+                        "encryption": "none",
+                        "reverse": {
+                            "tag": "site-edge",
+                            "siteToSite": {
+                                "prefixMaps": [
+                                    {
+                                        "from": "10.200.1.0/24",
+                                        "to": "127.0.0.0/24"
+                                    },
+                                    {
+                                        "from": "10.200.2.0/24",
+                                        "to": "127.0.1.0/24"
+                                    },
+                                    {
+                                        "from": "2001:db8:30::20/128",
+                                        "to": "::1/128"
+                                    }
+                                ],
+                                "allow": [{
+                                    "network": ["tcp", "udp"],
+                                    "ip": ["127.0.0.0/24", "127.0.1.0/24", "::1/128"],
+                                    "ports": edge_ports.clone()
+                                }]
+                            }
+                        }
+                    }
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {
+                        "finalRules": [{
+                            "action": "allow",
+                            "network": ["tcp", "udp"],
+                            "ip": ["127.0.0.0/8", "::1/128"],
+                            "port": edge_ports.join(",")
+                        }]
+                    }
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["site-edge"],
+                    "network": ["tcp", "udp"],
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    for (path, socks_port, user_id, server_port, tls) in [
+        (
+            &allowed_client_config,
+            allowed_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_port,
+            false,
+        ),
+        (
+            &denied_client_config,
+            denied_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_port,
+            false,
+        ),
+        (
+            &allowed_tls_client_config,
+            allowed_tls_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_tls_port,
+            true,
+        ),
+        (
+            &denied_tls_client_config,
+            denied_tls_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_tls_port,
+            true,
+        ),
+    ] {
+        let stream_settings = if tls {
+            json!({
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "localhost",
+                    "pinnedPeerCertSha256": hub_tls_cert_sha256
+                }
+            })
+        } else {
+            json!({"network": "tcp", "security": "none"})
+        };
+        write_json(
+            path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": socks_port,
+                    "protocol": "socks",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-hub",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": server_port,
+                            "users": [{"id": user_id, "encryption": "none"}]
+                        }]
+                    },
+                    "streamSettings": stream_settings
+                }]
+            }),
+        );
+    }
+
+    for (path, socks_port, user_id) in [
+        (
+            &allowed_ws_client_config,
+            allowed_ws_client_socks,
+            ALLOWED_OFFICE_UUID,
+        ),
+        (
+            &denied_ws_client_config,
+            denied_ws_client_socks,
+            DENIED_OFFICE_UUID,
+        ),
+    ] {
+        write_json(
+            path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": socks_port,
+                    "protocol": "socks",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-hub-ws",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": hub_ws_port,
+                            "users": [{"id": user_id, "encryption": "none"}]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "ws",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "serverName": "localhost",
+                            "pinnedPeerCertSha256": hub_tls_cert_sha256
+                        },
+                        "wsSettings": {"path": "/hub-ws"}
+                    }
+                }]
+            }),
+        );
+    }
+
+    for (path, socks_port, user_id, server_port, xhttp_path, mode, http3) in [
+        (
+            &allowed_xhttp_client_config,
+            allowed_xhttp_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_xhttp_port,
+            "/hub-xhttp",
+            "packet-up",
+            false,
+        ),
+        (
+            &denied_xhttp_client_config,
+            denied_xhttp_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_xhttp_port,
+            "/hub-xhttp",
+            "packet-up",
+            false,
+        ),
+        (
+            &allowed_xhttp_stream_up_client_config,
+            allowed_xhttp_stream_up_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_xhttp_stream_up_port,
+            "/hub-xhttp-stream-up",
+            "stream-up",
+            false,
+        ),
+        (
+            &denied_xhttp_stream_up_client_config,
+            denied_xhttp_stream_up_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_xhttp_stream_up_port,
+            "/hub-xhttp-stream-up",
+            "stream-up",
+            false,
+        ),
+        (
+            &allowed_xhttp_auto_client_config,
+            allowed_xhttp_auto_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_xhttp_auto_port,
+            "/hub-xhttp-auto",
+            "auto",
+            false,
+        ),
+        (
+            &denied_xhttp_auto_client_config,
+            denied_xhttp_auto_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_xhttp_auto_port,
+            "/hub-xhttp-auto",
+            "auto",
+            false,
+        ),
+        (
+            &allowed_xhttp_h3_client_config,
+            allowed_xhttp_h3_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_xhttp_h3_port,
+            "/hub-xhttp-h3",
+            "packet-up",
+            true,
+        ),
+        (
+            &denied_xhttp_h3_client_config,
+            denied_xhttp_h3_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_xhttp_h3_port,
+            "/hub-xhttp-h3",
+            "packet-up",
+            true,
+        ),
+        (
+            &unauthenticated_xhttp_h3_client_config,
+            unauthenticated_xhttp_h3_client_socks,
+            UNREGISTERED_OFFICE_UUID,
+            hub_xhttp_h3_port,
+            "/hub-xhttp-h3",
+            "packet-up",
+            true,
+        ),
+        (
+            &unauthenticated_xhttp_h3_stream_up_client_config,
+            unauthenticated_xhttp_h3_stream_up_client_socks,
+            UNREGISTERED_OFFICE_UUID,
+            hub_xhttp_h3_stream_up_port,
+            "/hub-xhttp-h3-stream-up",
+            "stream-up",
+            true,
+        ),
+        (
+            &unauthenticated_xhttp_h3_auto_client_config,
+            unauthenticated_xhttp_h3_auto_client_socks,
+            UNREGISTERED_OFFICE_UUID,
+            hub_xhttp_h3_auto_port,
+            "/hub-xhttp-h3-auto",
+            "auto",
+            true,
+        ),
+        (
+            &allowed_xhttp_h3_stream_up_client_config,
+            allowed_xhttp_h3_stream_up_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_xhttp_h3_stream_up_port,
+            "/hub-xhttp-h3-stream-up",
+            "stream-up",
+            true,
+        ),
+        (
+            &denied_xhttp_h3_stream_up_client_config,
+            denied_xhttp_h3_stream_up_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_xhttp_h3_stream_up_port,
+            "/hub-xhttp-h3-stream-up",
+            "stream-up",
+            true,
+        ),
+        (
+            &allowed_xhttp_h3_auto_client_config,
+            allowed_xhttp_h3_auto_client_socks,
+            ALLOWED_OFFICE_UUID,
+            hub_xhttp_h3_auto_port,
+            "/hub-xhttp-h3-auto",
+            "auto",
+            true,
+        ),
+        (
+            &denied_xhttp_h3_auto_client_config,
+            denied_xhttp_h3_auto_client_socks,
+            DENIED_OFFICE_UUID,
+            hub_xhttp_h3_auto_port,
+            "/hub-xhttp-h3-auto",
+            "auto",
+            true,
+        ),
+    ] {
+        let tls_settings = if http3 {
+            json!({
+                "serverName": "localhost",
+                "pinnedPeerCertSha256": hub_tls_cert_sha256,
+                "alpn": ["h3"]
+            })
+        } else {
+            json!({
+                "serverName": "localhost",
+                "pinnedPeerCertSha256": hub_tls_cert_sha256
+            })
+        };
+        write_json(
+            path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": socks_port,
+                    "protocol": "socks",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-hub",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": server_port,
+                            "users": [{"id": user_id, "encryption": "none"}]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "xhttp",
+                        "security": "tls",
+                        "tlsSettings": tls_settings,
+                        "xhttpSettings": {
+                            "path": xhttp_path,
+                            "mode": mode,
+                            "noGRPCHeader": true,
+                            "sessionPlacement": "header",
+                            "sessionKey": "X-Session",
+                            "sessionIDPlacement": "header",
+                            "sessionIDKey": "X-Session",
+                            "seqPlacement": "header",
+                            "seqKey": "X-Seq",
+                            "uplinkDataPlacement": "body"
+                        }
+                    }
+                }]
+            }),
+        );
+    }
+
+    for (path, socks_port, user_id) in [
+        (
+            &allowed_reality_client_config,
+            allowed_reality_client_socks,
+            ALLOWED_OFFICE_UUID,
+        ),
+        (
+            &denied_reality_client_config,
+            denied_reality_client_socks,
+            DENIED_OFFICE_UUID,
+        ),
+    ] {
+        write_json(
+            path,
+            json!({
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "listen": "127.0.0.1",
+                    "port": socks_port,
+                    "protocol": "socks",
+                    "settings": {"auth": "noauth", "udp": true}
+                }],
+                "outbounds": [{
+                    "tag": "to-hub-reality",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": hub_reality_port,
+                            "users": [{"id": user_id, "encryption": "none"}]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "reality",
+                        "realitySettings": {
+                            "serverName": "site-reality.test",
+                            "fingerprint": "chrome",
+                            "publicKey": REALITY_PUBLIC_KEY,
+                            "shortId": REALITY_SHORT_ID
+                        }
+                    }
+                }]
+            }),
+        );
+    }
+
+    let mut hub = start_chimera(&workspace, &hub_dir, &hub_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_tls_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_ws_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_xhttp_port)));
+    wait_for_tcp(SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        hub_xhttp_stream_up_port,
+    )));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_xhttp_auto_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_reality_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, hub_grpc_port)));
+    let grpc_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create dynamic routing gRPC client runtime");
+    let grpc_channel = grpc_runtime.block_on(connect_grpc_channel(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, hub_grpc_port)),
+    ));
+    let mut edge = start_chimera(&workspace, &edge_dir, &edge_config);
+    let mut allowed_client =
+        start_xray(&workspace, &allowed_client_dir, &allowed_client_config);
+    let mut denied_client =
+        start_xray(&workspace, &denied_client_dir, &denied_client_config);
+    let mut allowed_tls_client = start_xray(
+        &workspace,
+        &allowed_tls_client_dir,
+        &allowed_tls_client_config,
+    );
+    let mut denied_tls_client = start_xray(
+        &workspace,
+        &denied_tls_client_dir,
+        &denied_tls_client_config,
+    );
+    let mut allowed_ws_client = start_xray(
+        &workspace,
+        &allowed_ws_client_dir,
+        &allowed_ws_client_config,
+    );
+    let mut denied_ws_client =
+        start_xray(&workspace, &denied_ws_client_dir, &denied_ws_client_config);
+    let mut allowed_xhttp_client = start_xray(
+        &workspace,
+        &allowed_xhttp_client_dir,
+        &allowed_xhttp_client_config,
+    );
+    let mut denied_xhttp_client = start_xray(
+        &workspace,
+        &denied_xhttp_client_dir,
+        &denied_xhttp_client_config,
+    );
+    let mut allowed_xhttp_stream_up_client = start_xray(
+        &workspace,
+        &allowed_xhttp_stream_up_client_dir,
+        &allowed_xhttp_stream_up_client_config,
+    );
+    let mut denied_xhttp_stream_up_client = start_xray(
+        &workspace,
+        &denied_xhttp_stream_up_client_dir,
+        &denied_xhttp_stream_up_client_config,
+    );
+    let mut allowed_xhttp_auto_client = start_xray(
+        &workspace,
+        &allowed_xhttp_auto_client_dir,
+        &allowed_xhttp_auto_client_config,
+    );
+    let mut denied_xhttp_auto_client = start_xray(
+        &workspace,
+        &denied_xhttp_auto_client_dir,
+        &denied_xhttp_auto_client_config,
+    );
+    let mut allowed_xhttp_h3_client = start_xray(
+        &workspace,
+        &allowed_xhttp_h3_client_dir,
+        &allowed_xhttp_h3_client_config,
+    );
+    let mut denied_xhttp_h3_client = start_xray(
+        &workspace,
+        &denied_xhttp_h3_client_dir,
+        &denied_xhttp_h3_client_config,
+    );
+    let mut unauthenticated_xhttp_h3_client = start_xray(
+        &workspace,
+        &unauthenticated_xhttp_h3_client_dir,
+        &unauthenticated_xhttp_h3_client_config,
+    );
+    let mut unauthenticated_xhttp_h3_stream_up_client = start_xray(
+        &workspace,
+        &unauthenticated_xhttp_h3_stream_up_client_dir,
+        &unauthenticated_xhttp_h3_stream_up_client_config,
+    );
+    let mut unauthenticated_xhttp_h3_auto_client = start_xray(
+        &workspace,
+        &unauthenticated_xhttp_h3_auto_client_dir,
+        &unauthenticated_xhttp_h3_auto_client_config,
+    );
+    let mut allowed_xhttp_h3_stream_up_client = start_xray(
+        &workspace,
+        &allowed_xhttp_h3_stream_up_client_dir,
+        &allowed_xhttp_h3_stream_up_client_config,
+    );
+    let mut denied_xhttp_h3_stream_up_client = start_xray(
+        &workspace,
+        &denied_xhttp_h3_stream_up_client_dir,
+        &denied_xhttp_h3_stream_up_client_config,
+    );
+    let mut allowed_xhttp_h3_auto_client = start_xray(
+        &workspace,
+        &allowed_xhttp_h3_auto_client_dir,
+        &allowed_xhttp_h3_auto_client_config,
+    );
+    let mut denied_xhttp_h3_auto_client = start_xray(
+        &workspace,
+        &denied_xhttp_h3_auto_client_dir,
+        &denied_xhttp_h3_auto_client_config,
+    );
+    let mut allowed_reality_client = start_xray(
+        &workspace,
+        &allowed_reality_client_dir,
+        &allowed_reality_client_config,
+    );
+    let mut denied_reality_client = start_xray(
+        &workspace,
+        &denied_reality_client_dir,
+        &denied_reality_client_config,
+    );
+    let allowed_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_client_socks));
+    let denied_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_client_socks));
+    let allowed_tls_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_tls_client_socks));
+    let denied_tls_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_tls_client_socks));
+    let allowed_ws_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_ws_client_socks));
+    let denied_ws_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_ws_client_socks));
+    let allowed_xhttp_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_xhttp_client_socks));
+    let denied_xhttp_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_xhttp_client_socks));
+    let allowed_xhttp_stream_up_socks_addr = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        allowed_xhttp_stream_up_client_socks,
+    ));
+    let denied_xhttp_stream_up_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_xhttp_stream_up_client_socks));
+    let allowed_xhttp_auto_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_xhttp_auto_client_socks));
+    let denied_xhttp_auto_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_xhttp_auto_client_socks));
+    let allowed_xhttp_h3_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_xhttp_h3_client_socks));
+    let denied_xhttp_h3_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_xhttp_h3_client_socks));
+    let unauthenticated_xhttp_h3_socks_addr = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        unauthenticated_xhttp_h3_client_socks,
+    ));
+    let unauthenticated_xhttp_h3_stream_up_socks_addr = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        unauthenticated_xhttp_h3_stream_up_client_socks,
+    ));
+    let unauthenticated_xhttp_h3_auto_socks_addr = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        unauthenticated_xhttp_h3_auto_client_socks,
+    ));
+    let allowed_xhttp_h3_stream_up_socks_addr = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        allowed_xhttp_h3_stream_up_client_socks,
+    ));
+    let denied_xhttp_h3_stream_up_socks_addr = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        denied_xhttp_h3_stream_up_client_socks,
+    ));
+    let allowed_xhttp_h3_auto_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_xhttp_h3_auto_client_socks));
+    let denied_xhttp_h3_auto_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_xhttp_h3_auto_client_socks));
+    let allowed_reality_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, allowed_reality_client_socks));
+    let denied_reality_socks_addr =
+        SocketAddr::from((Ipv4Addr::LOCALHOST, denied_reality_client_socks));
+    wait_for_tcp(allowed_socks_addr);
+    wait_for_tcp(denied_socks_addr);
+    wait_for_tcp(allowed_tls_socks_addr);
+    wait_for_tcp(denied_tls_socks_addr);
+    wait_for_tcp(allowed_ws_socks_addr);
+    wait_for_tcp(denied_ws_socks_addr);
+    wait_for_tcp(allowed_xhttp_socks_addr);
+    wait_for_tcp(denied_xhttp_socks_addr);
+    wait_for_tcp(allowed_xhttp_stream_up_socks_addr);
+    wait_for_tcp(denied_xhttp_stream_up_socks_addr);
+    wait_for_tcp(allowed_xhttp_auto_socks_addr);
+    wait_for_tcp(denied_xhttp_auto_socks_addr);
+    wait_for_tcp(allowed_xhttp_h3_socks_addr);
+    wait_for_tcp(denied_xhttp_h3_socks_addr);
+    wait_for_tcp(unauthenticated_xhttp_h3_socks_addr);
+    wait_for_tcp(unauthenticated_xhttp_h3_stream_up_socks_addr);
+    wait_for_tcp(unauthenticated_xhttp_h3_auto_socks_addr);
+    wait_for_tcp(allowed_xhttp_h3_stream_up_socks_addr);
+    wait_for_tcp(denied_xhttp_h3_stream_up_socks_addr);
+    wait_for_tcp(allowed_xhttp_h3_auto_socks_addr);
+    wait_for_tcp(denied_xhttp_h3_auto_socks_addr);
+    wait_for_tcp(allowed_reality_socks_addr);
+    wait_for_tcp(denied_reality_socks_addr);
+
+    for (index, target) in targets.iter().enumerate() {
+        let marker = format!("hub-multi-prefix-tcp-allow-{index}");
+        assert_socks5_echo_with_retry(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            marker.as_bytes(),
+            &target.tcp_allowed_bytes,
+        );
+    }
+    let allowed_tcp_bytes_before_denials = targets
+        .iter()
+        .map(|target| target.tcp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        assert_socks5_target_denied(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_denied.port()),
+            format!("hub-prefix-tcp-port-denial-{index}").as_bytes(),
+        );
+        assert_socks5_target_denied(
+            denied_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            format!("hub-prefix-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            allowed_tcp_bytes_before_denials[index],
+            "unauthorized Hub TCP requests must not reach target {index}"
+        );
+        assert_eq!(
+            target.tcp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "Hub must deny an unlisted TCP port before Edge dispatch for target {index}"
+        );
+    }
+
+    // The same identity and CIDR policy must apply to Office clients using
+    // the Hub's TLS-protected VLESS listener.
+    let tls_tcp_before = targets
+        .iter()
+        .map(|target| target.tcp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        assert_socks5_echo_with_retry(
+            allowed_tls_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-tls-static-tcp",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_target_denied(
+            allowed_tls_socks_addr,
+            target.overlay_target(target.tcp_denied.port()),
+            format!("hub-tls-tcp-port-denial-{index}").as_bytes(),
+        );
+        assert_socks5_target_denied(
+            denied_tls_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            format!("hub-tls-tcp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            tls_tcp_before[index] + b"hub-tls-static-tcp".len(),
+            "TLS-authorized TCP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.tcp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "TLS Hub must deny an unlisted TCP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let ws_tcp_before = targets
+        .iter()
+        .map(|target| target.tcp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        assert_socks5_echo_with_retry(
+            allowed_ws_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-ws-static-tcp",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_target_denied(
+            allowed_ws_socks_addr,
+            target.overlay_target(target.tcp_denied.port()),
+            format!("hub-ws-tcp-port-denial-{index}").as_bytes(),
+        );
+        assert_socks5_target_denied(
+            denied_ws_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            format!("hub-ws-tcp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            ws_tcp_before[index] + b"hub-ws-static-tcp".len(),
+            "WebSocket/TLS-authorized TCP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.tcp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "WebSocket/TLS Hub must deny an unlisted TCP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let allowed_udp_association =
+        XraySocksUdpAssociation::connect(allowed_socks_addr);
+    let denied_udp_association = XraySocksUdpAssociation::connect(denied_socks_addr);
+    for (index, target) in targets.iter().enumerate() {
+        let marker = format!("hub-multi-prefix-udp-allow-{index}");
+        allowed_udp_association.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            marker.as_bytes(),
+        );
+    }
+    let allowed_udp_bytes_before_denials = targets
+        .iter()
+        .map(|target| target.udp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        allowed_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            format!("hub-prefix-udp-port-denial-{index}").as_bytes(),
+        );
+        denied_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            format!("hub-prefix-udp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            allowed_udp_bytes_before_denials[index],
+            "unauthorized Hub UDP requests must not reach target {index}"
+        );
+        assert_eq!(
+            target.udp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "Hub must deny an unlisted UDP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let tls_udp_before = targets
+        .iter()
+        .map(|target| target.udp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let allowed_tls_udp_association =
+        XraySocksUdpAssociation::connect(allowed_tls_socks_addr);
+    let denied_tls_udp_association =
+        XraySocksUdpAssociation::connect(denied_tls_socks_addr);
+    for (index, target) in targets.iter().enumerate() {
+        allowed_tls_udp_association.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-tls-static-udp",
+        );
+        allowed_tls_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            format!("hub-tls-udp-port-denial-{index}").as_bytes(),
+        );
+        denied_tls_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            format!("hub-tls-udp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            tls_udp_before[index] + b"hub-tls-static-udp".len(),
+            "TLS-authorized UDP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.udp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "TLS Hub must deny an unlisted UDP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let ws_udp_before = targets
+        .iter()
+        .map(|target| target.udp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let allowed_ws_udp_association =
+        XraySocksUdpAssociation::connect(allowed_ws_socks_addr);
+    let denied_ws_udp_association =
+        XraySocksUdpAssociation::connect(denied_ws_socks_addr);
+    for (index, target) in targets.iter().enumerate() {
+        allowed_ws_udp_association.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-ws-static-udp",
+        );
+        allowed_ws_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            format!("hub-ws-udp-port-denial-{index}").as_bytes(),
+        );
+        denied_ws_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            format!("hub-ws-udp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            ws_udp_before[index] + b"hub-ws-static-udp".len(),
+            "WebSocket/TLS-authorized UDP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.udp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "WebSocket/TLS Hub must deny an unlisted UDP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let reality_tcp_before = targets
+        .iter()
+        .map(|target| target.tcp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        assert_socks5_echo_with_retry(
+            allowed_reality_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-reality-static-tcp",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_target_denied(
+            allowed_reality_socks_addr,
+            target.overlay_target(target.tcp_denied.port()),
+            format!("hub-reality-tcp-port-denial-{index}").as_bytes(),
+        );
+        assert_socks5_target_denied(
+            denied_reality_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            format!("hub-reality-tcp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            reality_tcp_before[index] + b"hub-reality-static-tcp".len(),
+            "REALITY-authorized TCP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.tcp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "REALITY Hub must deny an unlisted TCP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let reality_udp_before = targets
+        .iter()
+        .map(|target| target.udp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let allowed_reality_udp_association =
+        XraySocksUdpAssociation::connect(allowed_reality_socks_addr);
+    let denied_reality_udp_association =
+        XraySocksUdpAssociation::connect(denied_reality_socks_addr);
+    for (index, target) in targets.iter().enumerate() {
+        allowed_reality_udp_association.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-reality-static-udp",
+        );
+        allowed_reality_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            format!("hub-reality-udp-port-denial-{index}").as_bytes(),
+        );
+        denied_reality_udp_association.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            format!("hub-reality-udp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            reality_udp_before[index] + b"hub-reality-static-udp".len(),
+            "REALITY-authorized UDP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.udp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "REALITY Hub must deny an unlisted UDP port before Edge dispatch for target {index}"
+        );
+    }
+
+    let xhttp_tcp_before = targets
+        .iter()
+        .map(|target| target.tcp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.iter().enumerate() {
+        assert_socks5_echo_with_retry(
+            allowed_xhttp_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-static-tcp",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_target_denied(
+            allowed_xhttp_socks_addr,
+            target.overlay_target(target.tcp_denied.port()),
+            format!("hub-xhttp-tcp-port-denial-{index}").as_bytes(),
+        );
+        assert_socks5_target_denied(
+            denied_xhttp_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            format!("hub-xhttp-tcp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            xhttp_tcp_before[index] + b"hub-xhttp-static-tcp".len(),
+            "XHTTP-authorized TCP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.tcp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "XHTTP Hub must deny an unlisted TCP port before Edge dispatch for target {index}"
+        );
+    }
+    let xhttp_udp_before = targets
+        .iter()
+        .map(|target| target.udp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let allowed_xhttp_udp =
+        XraySocksUdpAssociation::connect(allowed_xhttp_socks_addr);
+    let denied_xhttp_udp = XraySocksUdpAssociation::connect(denied_xhttp_socks_addr);
+    for (index, target) in targets.iter().enumerate() {
+        allowed_xhttp_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-static-udp",
+        );
+        allowed_xhttp_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            format!("hub-xhttp-udp-port-denial-{index}").as_bytes(),
+        );
+        denied_xhttp_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            format!("hub-xhttp-udp-identity-denial-{index}").as_bytes(),
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            xhttp_udp_before[index] + b"hub-xhttp-static-udp".len(),
+            "XHTTP-authorized UDP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.udp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "XHTTP Hub must deny an unlisted UDP port before Edge dispatch for target {index}"
+        );
+    }
+    assert_hub_xhttp_profile_static_policy(
+        "stream-up",
+        allowed_xhttp_stream_up_socks_addr,
+        denied_xhttp_stream_up_socks_addr,
+        &targets,
+    );
+    assert_hub_xhttp_profile_static_policy(
+        "auto",
+        allowed_xhttp_auto_socks_addr,
+        denied_xhttp_auto_socks_addr,
+        &targets,
+    );
+    assert_hub_xhttp_profile_static_policy(
+        "h3-packet-up",
+        allowed_xhttp_h3_socks_addr,
+        denied_xhttp_h3_socks_addr,
+        &targets,
+    );
+    assert_hub_xhttp_profile_static_policy(
+        "h3-stream-up",
+        allowed_xhttp_h3_stream_up_socks_addr,
+        denied_xhttp_h3_stream_up_socks_addr,
+        &targets,
+    );
+    assert_hub_xhttp_profile_static_policy(
+        "h3-auto",
+        allowed_xhttp_h3_auto_socks_addr,
+        denied_xhttp_h3_auto_socks_addr,
+        &targets,
+    );
+    let h3_auth_target = &targets[0];
+    let h3_tcp_bytes_before_bad_auth =
+        h3_auth_target.tcp_allowed_bytes.load(Ordering::SeqCst);
+    let h3_udp_bytes_before_bad_auth =
+        h3_auth_target.udp_allowed_bytes.load(Ordering::SeqCst);
+    assert_socks5_target_denied(
+        unauthenticated_xhttp_h3_socks_addr,
+        h3_auth_target.overlay_target(h3_auth_target.tcp_allowed.port()),
+        b"hub-xhttp-h3-unregistered-uuid-tcp",
+    );
+    let unauthenticated_h3_udp =
+        XraySocksUdpAssociation::connect(unauthenticated_xhttp_h3_socks_addr);
+    unauthenticated_h3_udp.send_and_expect_no_response(
+        h3_auth_target.overlay_target(h3_auth_target.udp_allowed.port()),
+        b"hub-xhttp-h3-unregistered-uuid-udp",
+    );
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        h3_auth_target.tcp_allowed_bytes.load(Ordering::SeqCst),
+        h3_tcp_bytes_before_bad_auth,
+        "unregistered H3 VLESS UUID must not reach the TCP target"
+    );
+    assert_eq!(
+        h3_auth_target.udp_allowed_bytes.load(Ordering::SeqCst),
+        h3_udp_bytes_before_bad_auth,
+        "unregistered H3 VLESS UUID must not reach the UDP target"
+    );
+    for (profile, socks_addr) in [
+        ("stream-up", unauthenticated_xhttp_h3_stream_up_socks_addr),
+        ("auto", unauthenticated_xhttp_h3_auto_socks_addr),
+    ] {
+        let tcp_bytes_before =
+            h3_auth_target.tcp_allowed_bytes.load(Ordering::SeqCst);
+        let udp_bytes_before =
+            h3_auth_target.udp_allowed_bytes.load(Ordering::SeqCst);
+        assert_socks5_target_denied(
+            socks_addr,
+            h3_auth_target.overlay_target(h3_auth_target.tcp_allowed.port()),
+            format!("hub-xhttp-h3-{profile}-unregistered-uuid-tcp").as_bytes(),
+        );
+        let association = XraySocksUdpAssociation::connect(socks_addr);
+        association.send_and_expect_no_response(
+            h3_auth_target.overlay_target(h3_auth_target.udp_allowed.port()),
+            format!("hub-xhttp-h3-{profile}-unregistered-uuid-udp").as_bytes(),
+        );
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            h3_auth_target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            tcp_bytes_before,
+            "unregistered H3 {profile} VLESS UUID must not reach the TCP target"
+        );
+        assert_eq!(
+            h3_auth_target.udp_allowed_bytes.load(Ordering::SeqCst),
+            udp_bytes_before,
+            "unregistered H3 {profile} VLESS UUID must not reach the UDP target"
+        );
+    }
+
+    let target_two_tcp_before_dynamic =
+        targets[2].tcp_allowed_bytes.load(Ordering::SeqCst);
+    let target_two_udp_before_dynamic =
+        targets[2].udp_allowed_bytes.load(Ordering::SeqCst);
+
+    replace_dynamic_hub_policy(&grpc_runtime, &grpc_channel, &["10.200.1.0/24"]);
+    let listed_rules = grpc_runtime
+        .block_on(
+            grpc_unary::<DynamicListRuleRequest, DynamicListRuleResponse>(
+                grpc_channel.clone(),
+                ROUTING_LIST_RULE_PATH,
+                DynamicListRuleRequest {},
+            ),
+        )
+        .expect("list runtime Hub authorization rules");
+    assert!(listed_rules.rules.iter().any(|rule| {
+        rule.rule_tag == "hub-site-allow-prefix-0" && rule.tag == "site-edge"
+    }));
+
+    for target in &targets[..2] {
+        let marker = b"hub-dynamic-prefix-allow";
+        assert_socks5_echo_with_retry(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            marker,
+            &target.tcp_allowed_bytes,
+        );
+    }
+    for target in &targets[..2] {
+        assert_socks5_echo_with_retry(
+            allowed_tls_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-tls-dynamic-prefix-allow",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_echo_with_retry(
+            allowed_ws_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-ws-dynamic-prefix-allow",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_echo_with_retry(
+            allowed_xhttp_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-dynamic-prefix-allow",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_echo_with_retry(
+            allowed_xhttp_h3_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-prefix-allow",
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_echo_with_retry(
+            allowed_reality_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-reality-dynamic-prefix-allow",
+            &target.tcp_allowed_bytes,
+        );
+    }
+    for (profile, socks_addr) in [
+        ("stream-up", allowed_xhttp_stream_up_socks_addr),
+        ("auto", allowed_xhttp_auto_socks_addr),
+        ("h3-stream-up", allowed_xhttp_h3_stream_up_socks_addr),
+        ("h3-auto", allowed_xhttp_h3_auto_socks_addr),
+    ] {
+        let marker = format!("hub-xhttp-{profile}-dynamic-prefix-allow");
+        for target in &targets[..2] {
+            assert_socks5_echo_with_retry(
+                socks_addr,
+                target.overlay_target(target.tcp_allowed.port()),
+                marker.as_bytes(),
+                &target.tcp_allowed_bytes,
+            );
+        }
+        assert_socks5_target_denied(
+            socks_addr,
+            targets[2].overlay_target(targets[2].tcp_allowed.port()),
+            format!("hub-xhttp-{profile}-dynamic-prefix-deny").as_bytes(),
+        );
+        let association = XraySocksUdpAssociation::connect(socks_addr);
+        let udp_marker = format!("hub-xhttp-{profile}-dynamic-prefix-udp-allow");
+        for target in &targets[..2] {
+            association.send_and_expect_echo(
+                target.overlay_target(target.udp_allowed.port()),
+                udp_marker.as_bytes(),
+            );
+        }
+        association.send_and_expect_no_response(
+            targets[2].overlay_target(targets[2].udp_allowed.port()),
+            format!("hub-xhttp-{profile}-dynamic-prefix-udp-deny").as_bytes(),
+        );
+    }
+    assert_socks5_target_denied(
+        allowed_socks_addr,
+        targets[2].overlay_target(targets[2].tcp_allowed.port()),
+        b"hub-dynamic-prefix-deny",
+    );
+    assert_socks5_target_denied(
+        allowed_tls_socks_addr,
+        targets[2].overlay_target(targets[2].tcp_allowed.port()),
+        b"hub-tls-dynamic-prefix-deny",
+    );
+    assert_socks5_target_denied(
+        allowed_ws_socks_addr,
+        targets[2].overlay_target(targets[2].tcp_allowed.port()),
+        b"hub-ws-dynamic-prefix-deny",
+    );
+    assert_socks5_target_denied(
+        allowed_xhttp_socks_addr,
+        targets[2].overlay_target(targets[2].tcp_allowed.port()),
+        b"hub-xhttp-dynamic-prefix-deny",
+    );
+    assert_socks5_target_denied(
+        allowed_xhttp_h3_socks_addr,
+        targets[2].overlay_target(targets[2].tcp_allowed.port()),
+        b"hub-xhttp-h3-dynamic-prefix-deny",
+    );
+    assert_socks5_target_denied(
+        allowed_reality_socks_addr,
+        targets[2].overlay_target(targets[2].tcp_allowed.port()),
+        b"hub-reality-dynamic-prefix-deny",
+    );
+    assert_socks5_target_denied(
+        denied_socks_addr,
+        targets[0].overlay_target(targets[0].tcp_allowed.port()),
+        b"hub-dynamic-identity-deny",
+    );
+
+    let dynamic_udp = XraySocksUdpAssociation::connect(allowed_socks_addr);
+    let dynamic_tls_udp = XraySocksUdpAssociation::connect(allowed_tls_socks_addr);
+    let dynamic_ws_udp = XraySocksUdpAssociation::connect(allowed_ws_socks_addr);
+    let dynamic_xhttp_udp =
+        XraySocksUdpAssociation::connect(allowed_xhttp_socks_addr);
+    let dynamic_xhttp_h3_udp =
+        XraySocksUdpAssociation::connect(allowed_xhttp_h3_socks_addr);
+    let dynamic_reality_udp =
+        XraySocksUdpAssociation::connect(allowed_reality_socks_addr);
+    for target in &targets[..2] {
+        dynamic_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-dynamic-prefix-udp-allow",
+        );
+        dynamic_tls_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-tls-dynamic-prefix-udp-allow",
+        );
+        dynamic_ws_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-ws-dynamic-prefix-udp-allow",
+        );
+        dynamic_xhttp_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-dynamic-prefix-udp-allow",
+        );
+        dynamic_xhttp_h3_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-prefix-udp-allow",
+        );
+        dynamic_reality_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-reality-dynamic-prefix-udp-allow",
+        );
+    }
+    dynamic_udp.send_and_expect_no_response(
+        targets[2].overlay_target(targets[2].udp_allowed.port()),
+        b"hub-dynamic-prefix-udp-deny",
+    );
+    dynamic_tls_udp.send_and_expect_no_response(
+        targets[2].overlay_target(targets[2].udp_allowed.port()),
+        b"hub-tls-dynamic-prefix-udp-deny",
+    );
+    dynamic_ws_udp.send_and_expect_no_response(
+        targets[2].overlay_target(targets[2].udp_allowed.port()),
+        b"hub-ws-dynamic-prefix-udp-deny",
+    );
+    dynamic_xhttp_udp.send_and_expect_no_response(
+        targets[2].overlay_target(targets[2].udp_allowed.port()),
+        b"hub-xhttp-dynamic-prefix-udp-deny",
+    );
+    dynamic_xhttp_h3_udp.send_and_expect_no_response(
+        targets[2].overlay_target(targets[2].udp_allowed.port()),
+        b"hub-xhttp-h3-dynamic-prefix-udp-deny",
+    );
+    dynamic_reality_udp.send_and_expect_no_response(
+        targets[2].overlay_target(targets[2].udp_allowed.port()),
+        b"hub-reality-dynamic-prefix-udp-deny",
+    );
+    let denied_identity_udp = XraySocksUdpAssociation::connect(denied_socks_addr);
+    denied_identity_udp.send_and_expect_no_response(
+        targets[0].overlay_target(targets[0].udp_allowed.port()),
+        b"hub-dynamic-identity-udp-deny",
+    );
+    if let Some(target) = targets.get(3) {
+        assert_socks5_target_denied(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-dynamic-ipv6-deny",
+        );
+        dynamic_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-dynamic-ipv6-udp-deny",
+        );
+        assert_socks5_target_denied(
+            allowed_tls_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-tls-dynamic-ipv6-deny",
+        );
+        dynamic_tls_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-tls-dynamic-ipv6-udp-deny",
+        );
+        assert_socks5_target_denied(
+            allowed_ws_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-ws-dynamic-ipv6-deny",
+        );
+        dynamic_ws_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-ws-dynamic-ipv6-udp-deny",
+        );
+        assert_socks5_target_denied(
+            allowed_xhttp_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-dynamic-ipv6-deny",
+        );
+        assert_socks5_target_denied(
+            allowed_xhttp_h3_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-ipv6-deny",
+        );
+        dynamic_xhttp_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-dynamic-ipv6-udp-deny",
+        );
+        dynamic_xhttp_h3_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-ipv6-udp-deny",
+        );
+        for (profile, socks_addr) in [
+            ("stream-up", allowed_xhttp_stream_up_socks_addr),
+            ("auto", allowed_xhttp_auto_socks_addr),
+            ("h3-stream-up", allowed_xhttp_h3_stream_up_socks_addr),
+            ("h3-auto", allowed_xhttp_h3_auto_socks_addr),
+        ] {
+            assert_socks5_target_denied(
+                socks_addr,
+                target.overlay_target(target.tcp_allowed.port()),
+                format!("hub-xhttp-{profile}-dynamic-ipv6-deny").as_bytes(),
+            );
+            let association = XraySocksUdpAssociation::connect(socks_addr);
+            association.send_and_expect_no_response(
+                target.overlay_target(target.udp_allowed.port()),
+                format!("hub-xhttp-{profile}-dynamic-ipv6-udp-deny").as_bytes(),
+            );
+        }
+        assert_socks5_target_denied(
+            allowed_reality_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-reality-dynamic-ipv6-deny",
+        );
+        dynamic_reality_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-reality-dynamic-ipv6-udp-deny",
+        );
+    }
+
+    replace_dynamic_hub_policy(
+        &grpc_runtime,
+        &grpc_channel,
+        &["10.200.1.0/24", "2001:db8:30::/64"],
+    );
+    if let Some(target) = targets.get(3) {
+        assert_socks5_echo_with_retry(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-dynamic-ipv6-allow",
+            &target.tcp_allowed_bytes,
+        );
+        let ipv6_udp = XraySocksUdpAssociation::connect(allowed_socks_addr);
+        ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-dynamic-ipv6-udp-allow",
+        );
+        assert_socks5_echo_with_retry(
+            allowed_tls_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-tls-dynamic-ipv6-allow",
+            &target.tcp_allowed_bytes,
+        );
+        let tls_ipv6_udp = XraySocksUdpAssociation::connect(allowed_tls_socks_addr);
+        tls_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-tls-dynamic-ipv6-udp-allow",
+        );
+        assert_socks5_echo_with_retry(
+            allowed_ws_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-ws-dynamic-ipv6-allow",
+            &target.tcp_allowed_bytes,
+        );
+        let ws_ipv6_udp = XraySocksUdpAssociation::connect(allowed_ws_socks_addr);
+        ws_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-ws-dynamic-ipv6-udp-allow",
+        );
+        assert_socks5_echo_with_retry(
+            allowed_xhttp_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-dynamic-ipv6-allow",
+            &target.tcp_allowed_bytes,
+        );
+        let xhttp_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_xhttp_socks_addr);
+        xhttp_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-dynamic-ipv6-udp-allow",
+        );
+        assert_socks5_echo_with_retry(
+            allowed_xhttp_h3_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-ipv6-allow",
+            &target.tcp_allowed_bytes,
+        );
+        let h3_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_xhttp_h3_socks_addr);
+        h3_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-ipv6-udp-allow",
+        );
+        let mut xhttp_stream_up_ipv6_tcp = connect_socks5_target_for_vless(
+            allowed_xhttp_stream_up_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+        )
+        .expect("establish XHTTP stream-up IPv6 TCP before rule removal");
+        let mut xhttp_auto_ipv6_tcp = connect_socks5_target_for_vless(
+            allowed_xhttp_auto_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+        )
+        .expect("establish XHTTP auto IPv6 TCP before rule removal");
+        for (stream, profile) in [
+            (&mut xhttp_stream_up_ipv6_tcp, "stream-up"),
+            (&mut xhttp_auto_ipv6_tcp, "auto"),
+        ] {
+            stream
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .expect("set XHTTP IPv6 TCP read timeout");
+            stream
+                .set_write_timeout(Some(IO_TIMEOUT))
+                .expect("set XHTTP IPv6 TCP write timeout");
+            let marker = format!("hub-xhttp-{profile}-dynamic-ipv6-allow");
+            stream
+                .write_all(marker.as_bytes())
+                .expect("write XHTTP IPv6 TCP");
+            let mut response = vec![0; marker.len()];
+            stream
+                .read_exact(&mut response)
+                .expect("read XHTTP IPv6 TCP echo");
+            assert_eq!(response, marker.as_bytes());
+        }
+        let xhttp_stream_up_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_xhttp_stream_up_socks_addr);
+        xhttp_stream_up_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-stream-up-dynamic-ipv6-udp-allow",
+        );
+        let xhttp_auto_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_xhttp_auto_socks_addr);
+        xhttp_auto_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-auto-dynamic-ipv6-udp-allow",
+        );
+        let mut h3_mode_ipv6_udp = Vec::new();
+        for (profile, socks_addr) in [
+            ("h3-stream-up", allowed_xhttp_h3_stream_up_socks_addr),
+            ("h3-auto", allowed_xhttp_h3_auto_socks_addr),
+        ] {
+            assert_socks5_echo_with_retry(
+                socks_addr,
+                target.overlay_target(target.tcp_allowed.port()),
+                format!("hub-xhttp-{profile}-dynamic-ipv6-allow").as_bytes(),
+                &target.tcp_allowed_bytes,
+            );
+            let association = XraySocksUdpAssociation::connect(socks_addr);
+            association.send_and_expect_echo(
+                target.overlay_target(target.udp_allowed.port()),
+                format!("hub-xhttp-{profile}-dynamic-ipv6-udp-allow").as_bytes(),
+            );
+            h3_mode_ipv6_udp.push((profile, association));
+        }
+        assert_socks5_echo_with_retry(
+            allowed_reality_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-reality-dynamic-ipv6-allow",
+            &target.tcp_allowed_bytes,
+        );
+        let reality_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_reality_socks_addr);
+        reality_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-reality-dynamic-ipv6-udp-allow",
+        );
+        let mut established_ipv6_tcp = connect_socks5_target_for_vless(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+        )
+        .expect("establish IPv6 TCP flow before rule removal");
+        established_ipv6_tcp
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set established IPv6 TCP read timeout");
+        established_ipv6_tcp
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("set established IPv6 TCP write timeout");
+        let before_update_marker = b"established flow before route update";
+        established_ipv6_tcp
+            .write_all(before_update_marker)
+            .expect("write on established flow before rule removal");
+        let mut before_update_echo = vec![0; before_update_marker.len()];
+        established_ipv6_tcp
+            .read_exact(&mut before_update_echo)
+            .expect("read established flow before rule removal");
+        assert_eq!(before_update_echo, before_update_marker);
+        let ipv6_tcp_before_removal =
+            target.tcp_allowed_bytes.load(Ordering::SeqCst);
+        let ipv6_udp_before_removal =
+            target.udp_allowed_bytes.load(Ordering::SeqCst);
+
+        remove_dynamic_hub_rule(
+            &grpc_runtime,
+            &grpc_channel,
+            "hub-site-allow-prefix-1",
+        );
+        // Xray routing selects an outbound when it dispatches the UDP session.
+        // Removing the rule blocks new sessions but must not silently tear down
+        // packets already attached to the selected Reverse target.
+        let active_raw_udp = b"established raw UDP survives route removal";
+        let active_tls_udp = b"established TLS UDP survives route removal";
+        let active_ws_udp = b"established WebSocket UDP survives route removal";
+        let active_xhttp_udp = b"established XHTTP UDP survives route removal";
+        let active_xhttp_h3_udp = b"established XHTTP H3 UDP survives route removal";
+        let active_xhttp_stream_up_udp =
+            b"established XHTTP stream-up UDP survives route removal";
+        let active_xhttp_auto_udp =
+            b"established XHTTP auto UDP survives route removal";
+        let mut active_h3_mode_udp_bytes = 0;
+        for (profile, association) in &h3_mode_ipv6_udp {
+            let marker = format!("established {profile} UDP survives route removal");
+            association.send_and_expect_echo(
+                target.overlay_target(target.udp_allowed.port()),
+                marker.as_bytes(),
+            );
+            active_h3_mode_udp_bytes += marker.len();
+        }
+        let active_reality_udp = b"established REALITY UDP survives route removal";
+        ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_raw_udp,
+        );
+        tls_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_tls_udp,
+        );
+        ws_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_ws_udp,
+        );
+        xhttp_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_xhttp_udp,
+        );
+        h3_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_xhttp_h3_udp,
+        );
+        xhttp_stream_up_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_xhttp_stream_up_udp,
+        );
+        xhttp_auto_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_xhttp_auto_udp,
+        );
+        reality_ipv6_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            active_reality_udp,
+        );
+        let ipv6_udp_after_active_echo =
+            target.udp_allowed_bytes.load(Ordering::SeqCst);
+        assert_eq!(
+            ipv6_udp_after_active_echo,
+            ipv6_udp_before_removal
+                + active_raw_udp.len()
+                + active_tls_udp.len()
+                + active_ws_udp.len()
+                + active_xhttp_udp.len()
+                + active_xhttp_h3_udp.len()
+                + active_xhttp_stream_up_udp.len()
+                + active_xhttp_auto_udp.len()
+                + active_h3_mode_udp_bytes
+                + active_reality_udp.len(),
+            "existing RAW/TLS/WebSocket/all XHTTP/REALITY UDP sessions continue after rule removal"
+        );
+        let active_marker = b"established flow survives route update";
+        established_ipv6_tcp
+            .write_all(active_marker)
+            .expect("write on established flow after rule removal");
+        let mut active_echo = vec![0; active_marker.len()];
+        established_ipv6_tcp
+            .read_exact(&mut active_echo)
+            .expect("read established flow response after rule removal");
+        assert_eq!(active_echo, active_marker);
+        let ipv6_tcp_after_active_echo =
+            target.tcp_allowed_bytes.load(Ordering::SeqCst);
+
+        assert_socks5_target_denied(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-dynamic-ipv6-removed",
+        );
+        assert_socks5_target_denied(
+            allowed_tls_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-tls-dynamic-ipv6-removed",
+        );
+        assert_socks5_target_denied(
+            allowed_ws_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-ws-dynamic-ipv6-removed",
+        );
+        assert_socks5_target_denied(
+            allowed_xhttp_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-dynamic-ipv6-removed",
+        );
+        assert_socks5_target_denied(
+            allowed_xhttp_h3_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-ipv6-removed",
+        );
+        for (profile, socks_addr) in [
+            ("stream-up", allowed_xhttp_stream_up_socks_addr),
+            ("auto", allowed_xhttp_auto_socks_addr),
+            ("h3-stream-up", allowed_xhttp_h3_stream_up_socks_addr),
+            ("h3-auto", allowed_xhttp_h3_auto_socks_addr),
+        ] {
+            assert_socks5_target_denied(
+                socks_addr,
+                target.overlay_target(target.tcp_allowed.port()),
+                format!("hub-xhttp-{profile}-dynamic-ipv6-removed").as_bytes(),
+            );
+            let removed_udp = XraySocksUdpAssociation::connect(socks_addr);
+            removed_udp.send_and_expect_no_response(
+                target.overlay_target(target.udp_allowed.port()),
+                format!("hub-xhttp-{profile}-dynamic-ipv6-udp-removed").as_bytes(),
+            );
+        }
+        let removed_ipv6_udp = XraySocksUdpAssociation::connect(allowed_socks_addr);
+        removed_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-dynamic-ipv6-udp-removed",
+        );
+        let removed_tls_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_tls_socks_addr);
+        removed_tls_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-tls-dynamic-ipv6-udp-removed",
+        );
+        let removed_ws_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_ws_socks_addr);
+        removed_ws_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-ws-dynamic-ipv6-udp-removed",
+        );
+        let removed_xhttp_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_xhttp_socks_addr);
+        removed_xhttp_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-dynamic-ipv6-udp-removed",
+        );
+        let removed_xhttp_h3_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_xhttp_h3_socks_addr);
+        removed_xhttp_h3_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-xhttp-h3-dynamic-ipv6-udp-removed",
+        );
+        assert_socks5_target_denied(
+            allowed_reality_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            b"hub-reality-dynamic-ipv6-removed",
+        );
+        let removed_reality_ipv6_udp =
+            XraySocksUdpAssociation::connect(allowed_reality_socks_addr);
+        removed_reality_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            b"hub-reality-dynamic-ipv6-udp-removed",
+        );
+        ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established UDP association is denied after rule removal",
+        );
+        tls_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established TLS UDP association is denied after rule removal",
+        );
+        ws_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established WebSocket UDP association is denied after rule removal",
+        );
+        xhttp_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established XHTTP UDP association is denied after rule removal",
+        );
+        h3_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established XHTTP H3 UDP association is denied after rule removal",
+        );
+        xhttp_stream_up_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established XHTTP stream-up UDP association is denied after rule removal",
+        );
+        xhttp_auto_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established XHTTP auto UDP association is denied after rule removal",
+        );
+        for (profile, association) in &h3_mode_ipv6_udp {
+            association.send_and_expect_no_response(
+                target.overlay_target(target.udp_denied.port()),
+                format!(
+                    "new target on established XHTTP {profile} UDP association is denied after rule removal"
+                )
+                .as_bytes(),
+            );
+        }
+        reality_ipv6_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            b"new target on established REALITY UDP association is denied after rule removal",
+        );
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            ipv6_tcp_after_active_echo,
+            "new TCP requests after rule removal must not reach Edge"
+        );
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            ipv6_udp_after_active_echo,
+            "new UDP sessions after rule removal must not reach Edge"
+        );
+        assert!(
+            ipv6_tcp_after_active_echo > ipv6_tcp_before_removal,
+            "the established TCP session must continue after route removal"
+        );
+    }
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        targets[2].tcp_allowed_bytes.load(Ordering::SeqCst),
+        target_two_tcp_before_dynamic,
+        "dynamically denied IPv4 prefix must not reach Edge"
+    );
+    assert_eq!(
+        targets[2].udp_allowed_bytes.load(Ordering::SeqCst),
+        target_two_udp_before_dynamic,
+        "dynamically denied IPv4 UDP prefix must not reach Edge"
+    );
+    hub.assert_running();
+    edge.assert_running();
+    allowed_client.assert_running();
+    denied_client.assert_running();
+    allowed_tls_client.assert_running();
+    denied_tls_client.assert_running();
+    allowed_ws_client.assert_running();
+    denied_ws_client.assert_running();
+    allowed_xhttp_client.assert_running();
+    denied_xhttp_client.assert_running();
+    allowed_xhttp_stream_up_client.assert_running();
+    denied_xhttp_stream_up_client.assert_running();
+    allowed_xhttp_auto_client.assert_running();
+    denied_xhttp_auto_client.assert_running();
+    allowed_xhttp_h3_client.assert_running();
+    denied_xhttp_h3_client.assert_running();
+    unauthenticated_xhttp_h3_stream_up_client.assert_running();
+    unauthenticated_xhttp_h3_auto_client.assert_running();
+    allowed_xhttp_h3_stream_up_client.assert_running();
+    denied_xhttp_h3_stream_up_client.assert_running();
+    allowed_xhttp_h3_auto_client.assert_running();
+    denied_xhttp_h3_auto_client.assert_running();
+    unauthenticated_xhttp_h3_client.assert_running();
+    allowed_reality_client.assert_running();
+    denied_reality_client.assert_running();
+
+    verify_reference_xray_udp_route_persistence(&workspace, &work_dir);
+}
+
+fn verify_reference_xray_udp_route_persistence(workspace: &Path, parent_dir: &Path) {
+    let server_dir = parent_dir.join("reference-xray-server");
+    let client_dir = parent_dir.join("reference-xray-client");
+    fs::create_dir_all(&server_dir).expect("create reference Xray server directory");
+    fs::create_dir_all(&client_dir).expect("create reference Xray client directory");
+
+    let server_port = free_localhost_port();
+    let api_port = free_localhost_port();
+    let socks_port = free_localhost_port();
+    let server_config = server_dir.join("server.json");
+    let client_config = client_dir.join("client.json");
+    let (echo_addr, echo_bytes) = start_observed_udp_echo_server();
+    let user_id = "3ac9b383-75a1-431c-8184-106c80eb7291";
+    let user_email = "reference-udp@example.test";
+
+    let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind reference UDP echo fixture probe");
+    probe
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set reference UDP echo fixture probe timeout");
+    probe
+        .send_to(b"reference UDP echo fixture probe", echo_addr)
+        .expect("send reference UDP echo fixture probe");
+    let mut probe_response = [0u8; 128];
+    let (probe_length, _) = probe
+        .recv_from(&mut probe_response)
+        .expect("read reference UDP echo fixture probe");
+    assert_eq!(
+        &probe_response[..probe_length],
+        b"reference UDP echo fixture probe"
+    );
+
+    write_json(
+        &server_config,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": server_port,
+                "protocol": "vless",
+                "tag": "reference-vless-in",
+                "settings": {
+                    "clients": [{"id": user_id, "email": user_email}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {
+                        "finalRules": [loopback_allow_rule("udp", echo_addr)]
+                    }
+                },
+                {"tag": "block", "protocol": "blackhole"}
+            ],
+            "api": {
+                "tag": "reference-api",
+                "listen": format!("127.0.0.1:{api_port}"),
+                "services": ["RoutingService"]
+            },
+            "routing": {"rules": [{
+                "type": "field",
+                "inboundTag": ["reference-vless-in"],
+                "ip": ["127.0.0.1/32"],
+                "outboundTag": "block"
+            }]}
+        }),
+    );
+    write_json(
+        &client_config,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "outbounds": [{
+                "tag": "to-reference-xray",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": server_port,
+                        "users": [{"id": user_id, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut server = start_xray(workspace, &server_dir, &server_config);
+    let server_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+    let api_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, api_port));
+    wait_for_tcp(server_addr);
+    wait_for_tcp(api_addr);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create reference Xray API runtime");
+    let channel = runtime.block_on(connect_grpc_channel(api_addr));
+
+    let cidr = format!("{}/32", echo_addr.ip());
+    let cidr_rule = dynamic_cidr_rule(&cidr);
+    let rules = vec![
+        DynamicRoutingRule {
+            target_tag: Some(dynamic_routing_rule::TargetTag::Tag(
+                "direct".to_string(),
+            )),
+            rule_tag: "reference-udp-allow".to_string(),
+            ip: vec![cidr_rule.clone()],
+            networks: vec![3], // Xray common.net.Network: UDP.
+            user_email: vec![user_email.to_string()],
+            inbound_tag: vec!["reference-vless-in".to_string()],
+        },
+        DynamicRoutingRule {
+            target_tag: Some(dynamic_routing_rule::TargetTag::Tag(
+                "block".to_string(),
+            )),
+            rule_tag: "reference-udp-default-deny".to_string(),
+            ip: vec![cidr_rule],
+            networks: Vec::new(),
+            user_email: Vec::new(),
+            inbound_tag: Vec::new(),
+        },
+    ];
+    let typed_config = DynamicTypedMessage {
+        r#type: "xray.app.router.Config".to_string(),
+        value: DynamicRouterConfig {
+            domain_strategy: 0,
+            rule: rules,
+        }
+        .encode_to_vec(),
+    };
+    runtime
+        .block_on(grpc_unary::<DynamicAddRuleRequest, DynamicAddRuleResponse>(
+            channel.clone(),
+            ROUTING_ADD_RULE_PATH,
+            DynamicAddRuleRequest {
+                config: Some(typed_config),
+                should_append: false,
+            },
+        ))
+        .expect("install Xray reference UDP session routing rules");
+
+    let mut client = start_xray(workspace, &client_dir, &client_config);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, socks_port));
+    wait_for_tcp(socks_addr);
+    let association = XraySocksUdpAssociation::connect(socks_addr);
+    let first_marker = b"reference UDP route before RemoveRule";
+    association
+        .udp
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set reference Xray UDP response timeout");
+    association.send(echo_addr, first_marker);
+    if let Err(error) = association.receive_response(echo_addr, first_marker) {
+        panic!(
+            "reference Xray failed before rule removal: {error}; echo target received {} bytes",
+            echo_bytes.load(Ordering::SeqCst)
+        );
+    }
+    remove_dynamic_hub_rule(&runtime, &channel, "reference-udp-allow");
+    association
+        .send_and_expect_echo(echo_addr, b"reference UDP route survives RemoveRule");
+    let new_association = XraySocksUdpAssociation::connect(socks_addr);
+    new_association.send_and_expect_no_response(
+        echo_addr,
+        b"new reference UDP session denied after RemoveRule",
+    );
+    server.assert_running();
+    client.assert_running();
+}
+
+fn assert_hub_xhttp_profile_static_policy(
+    profile: &str,
+    allowed_socks_addr: SocketAddr,
+    denied_socks_addr: SocketAddr,
+    targets: &[HubOverlayEchoTarget],
+) {
+    let tcp_before = targets
+        .iter()
+        .map(|target| target.tcp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let tcp_marker = format!("hub-xhttp-{profile}-static-tcp");
+    for (index, target) in targets.iter().enumerate() {
+        assert_socks5_echo_with_retry(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            tcp_marker.as_bytes(),
+            &target.tcp_allowed_bytes,
+        );
+        assert_socks5_target_denied(
+            allowed_socks_addr,
+            target.overlay_target(target.tcp_denied.port()),
+            format!("hub-xhttp-{profile}-tcp-port-denial-{index}").as_bytes(),
+        );
+        assert_socks5_target_denied(
+            denied_socks_addr,
+            target.overlay_target(target.tcp_allowed.port()),
+            format!("hub-xhttp-{profile}-tcp-identity-denial-{index}").as_bytes(),
+        );
+    }
+
+    let udp_before = targets
+        .iter()
+        .map(|target| target.udp_allowed_bytes.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let udp_marker = format!("hub-xhttp-{profile}-static-udp");
+    let allowed_udp = XraySocksUdpAssociation::connect(allowed_socks_addr);
+    let denied_udp = XraySocksUdpAssociation::connect(denied_socks_addr);
+    for (index, target) in targets.iter().enumerate() {
+        allowed_udp.send_and_expect_echo(
+            target.overlay_target(target.udp_allowed.port()),
+            udp_marker.as_bytes(),
+        );
+        allowed_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_denied.port()),
+            format!("hub-xhttp-{profile}-udp-port-denial-{index}").as_bytes(),
+        );
+        denied_udp.send_and_expect_no_response(
+            target.overlay_target(target.udp_allowed.port()),
+            format!("hub-xhttp-{profile}-udp-identity-denial-{index}").as_bytes(),
+        );
+    }
+
+    thread::sleep(Duration::from_millis(150));
+    for (index, target) in targets.iter().enumerate() {
+        assert_eq!(
+            target.tcp_allowed_bytes.load(Ordering::SeqCst),
+            tcp_before[index] + tcp_marker.len(),
+            "XHTTP {profile}-authorized TCP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.udp_allowed_bytes.load(Ordering::SeqCst),
+            udp_before[index] + udp_marker.len(),
+            "XHTTP {profile}-authorized UDP reaches target {index}; denied identities do not"
+        );
+        assert_eq!(
+            target.tcp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "XHTTP {profile} Hub must deny an unlisted TCP port before Edge dispatch"
+        );
+        assert_eq!(
+            target.udp_denied_bytes.load(Ordering::SeqCst),
+            0,
+            "XHTTP {profile} Hub must deny an unlisted UDP port before Edge dispatch"
+        );
+    }
+}
+
+fn assert_socks5_echo_with_retry(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+    echoed_bytes: &AtomicUsize,
+) {
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match connect_socks5_target_for_vless(socks_addr, target_addr) {
+            Ok(mut stream) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                let mut echoed = vec![0; payload.len()];
+                if let Err(error) = stream
+                    .write_all(payload)
+                    .and_then(|()| stream.read_exact(&mut echoed))
+                {
+                    last_error = Some(error);
+                } else if echoed == payload {
+                    return;
+                } else {
+                    last_error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Overlay echo payload mismatch",
+                    ));
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    panic!(
+        "authorized Overlay route did not become usable; Edge received {} bytes: {}",
+        echoed_bytes.load(Ordering::SeqCst),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no connection attempt completed".to_string())
+    );
+}
+
+fn connect_socks5_target_for_vless(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect_timeout(&socks_addr, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(&[0x05, 0x01, 0x00])?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting)?;
+    if greeting != [0x05, 0x00] {
+        return Err(io::Error::other(format!(
+            "SOCKS greeting failed: {greeting:02x?}"
+        )));
+    }
+
+    let mut request = vec![0x05, 0x01, 0x00];
+    match target_addr.ip() {
+        IpAddr::V4(ip) => {
+            request.push(0x01);
+            request.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            request.push(0x04);
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&target_addr.port().to_be_bytes());
+    stream.write_all(&request)?;
+
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response)?;
+    if response[0] != 0x05 || response[1] != 0x00 {
+        return Err(io::Error::other(format!(
+            "SOCKS connect failed: header={response:02x?}"
+        )));
+    }
+    let tail_length = match response[3] {
+        0x01 => 6,
+        0x03 => {
+            let mut domain_length = [0u8; 1];
+            stream.read_exact(&mut domain_length)?;
+            usize::from(domain_length[0]) + 2
+        }
+        0x04 => 18,
+        address_type => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported SOCKS address type {address_type:#x}"),
+            ));
+        }
+    };
+    let mut tail = vec![0; tail_length];
+    stream.read_exact(&mut tail)?;
+    Ok(stream)
+}
+
+fn assert_socks5_target_denied(
+    socks_addr: SocketAddr,
+    target_addr: SocketAddr,
+    payload: &[u8],
+) {
+    match connect_socks5_target_for_vless(socks_addr, target_addr) {
+        Err(_) => {}
+        Ok(mut stream) => {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set denied target read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_millis(500)))
+                .expect("set denied target write timeout");
+            if stream.write_all(payload).is_ok() {
+                let mut response = vec![0; payload.len()];
+                if stream.read_exact(&mut response).is_ok() {
+                    assert_ne!(
+                        response, payload,
+                        "denied Overlay request unexpectedly reached its echo target"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn dynamic_cidr_rule(prefix: &str) -> DynamicIpRule {
+    let (address, prefix_length) =
+        prefix.split_once('/').expect("CIDR prefix has slash");
+    let address = address.parse::<IpAddr>().expect("parse CIDR address");
+    let prefix_length = prefix_length
+        .parse::<u32>()
+        .expect("parse CIDR prefix length");
+    let (ip, maximum_prefix) = match address {
+        IpAddr::V4(ip) => (ip.octets().to_vec(), 32),
+        IpAddr::V6(ip) => (ip.octets().to_vec(), 128),
+    };
+    assert!(prefix_length <= maximum_prefix, "CIDR prefix is in range");
+    DynamicIpRule {
+        custom: Some(DynamicCidrRule {
+            cidr: Some(DynamicCidr {
+                ip,
+                prefix: prefix_length,
+            }),
+            reverse_match: false,
+        }),
+    }
+}
+
+fn replace_dynamic_hub_policy(
+    runtime: &tokio::runtime::Runtime,
+    channel: &Channel,
+    allowed_prefixes: &[&str],
+) {
+    let mut rules = allowed_prefixes
+        .iter()
+        .enumerate()
+        .map(|(index, prefix)| DynamicRoutingRule {
+            target_tag: Some(dynamic_routing_rule::TargetTag::Tag(
+                "site-edge".to_string(),
+            )),
+            rule_tag: format!("hub-site-allow-prefix-{index}"),
+            ip: vec![dynamic_cidr_rule(prefix)],
+            networks: vec![2, 3], // Xray common.net.Network: TCP and UDP.
+            user_email: vec!["office-allowed@example.test".to_string()],
+            inbound_tag: vec![
+                "hub-vless-in".to_string(),
+                "hub-vless-tls-in".to_string(),
+                "hub-vless-ws-in".to_string(),
+                "hub-vless-xhttp-in".to_string(),
+                "hub-vless-xhttp-stream-up-in".to_string(),
+                "hub-vless-xhttp-auto-in".to_string(),
+                "hub-vless-xhttp-h3-in".to_string(),
+                "hub-vless-xhttp-h3-stream-up-in".to_string(),
+                "hub-vless-xhttp-h3-auto-in".to_string(),
+                "hub-vless-reality-in".to_string(),
+            ],
+        })
+        .collect::<Vec<_>>();
+    rules.extend(HUB_OVERLAY_PROTECTED_PREFIXES.iter().enumerate().map(
+        |(index, prefix)| DynamicRoutingRule {
+            target_tag: Some(dynamic_routing_rule::TargetTag::Tag(
+                "overlay-default-deny".to_string(),
+            )),
+            rule_tag: format!("hub-site-deny-prefix-{index}"),
+            ip: vec![dynamic_cidr_rule(prefix)],
+            networks: Vec::new(),
+            user_email: Vec::new(),
+            inbound_tag: Vec::new(),
+        },
+    ));
+    let typed_config = DynamicTypedMessage {
+        r#type: "xray.app.router.Config".to_string(),
+        value: DynamicRouterConfig {
+            domain_strategy: 0,
+            rule: rules,
+        }
+        .encode_to_vec(),
+    };
+    runtime
+        .block_on(grpc_unary::<DynamicAddRuleRequest, DynamicAddRuleResponse>(
+            channel.clone(),
+            ROUTING_ADD_RULE_PATH,
+            DynamicAddRuleRequest {
+                config: Some(typed_config),
+                should_append: false,
+            },
+        ))
+        .expect("replace Hub rules through Xray RoutingService.AddRule");
+}
+
+fn remove_dynamic_hub_rule(
+    runtime: &tokio::runtime::Runtime,
+    channel: &Channel,
+    rule_tag: &str,
+) {
+    runtime
+        .block_on(grpc_unary::<
+            DynamicRemoveRuleRequest,
+            DynamicRemoveRuleResponse,
+        >(
+            channel.clone(),
+            ROUTING_REMOVE_RULE_PATH,
+            DynamicRemoveRuleRequest {
+                rule_tag: rule_tag.to_string(),
+            },
+        ))
+        .expect("remove Hub rule through Xray RoutingService.RemoveRule");
+}
+
+async fn connect_grpc_channel(addr: SocketAddr) -> Channel {
+    Endpoint::from_shared(format!("http://{addr}"))
+        .expect("valid Hub gRPC endpoint")
+        .connect_timeout(IO_TIMEOUT)
+        .timeout(IO_TIMEOUT)
+        .connect()
+        .await
+        .expect("connect to Hub gRPC API")
+}
+
+async fn grpc_unary<RequestMessage, ResponseMessage>(
+    channel: Channel,
+    path: &'static str,
+    request: RequestMessage,
+) -> Result<ResponseMessage, Status>
+where
+    RequestMessage: Message + Default + Send + Sync + 'static,
+    ResponseMessage: Message + Default + Send + Sync + 'static,
+{
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.map_err(|error| {
+        Status::unknown(format!("Hub gRPC service is not ready: {error}"))
+    })?;
+    grpc.unary(
+        Request::new(request),
+        PathAndQuery::from_static(path),
+        tonic_prost::ProstCodec::default(),
+    )
+    .await
+    .map(|response| response.into_inner())
 }
 
 fn run_chimera_bridge_sniffing_interop(
@@ -304,7 +3418,10 @@ fn run_chimera_bridge_sniffing_interop(
                 },
                 {
                     "tag": "direct",
-                    "protocol": "freedom"
+                    "protocol": "freedom",
+                    "settings": {
+                        "finalRules": [loopback_allow_rule("tcp", echo_addr)]
+                    }
                 }
             ],
             "routing": {
@@ -426,7 +3543,10 @@ fn run_chimera_bridge_udp_interop() {
                 },
                 {
                     "tag": "direct",
-                    "protocol": "freedom"
+                    "protocol": "freedom",
+                    "settings": {
+                        "finalRules": [loopback_allow_rule("udp", echo_addr)]
+                    }
                 }
             ],
             "routing": {
@@ -461,7 +3581,7 @@ fn run_chimera_bridge_udp_interop() {
     xray.assert_running();
 }
 
-fn run_reverse_udp_interop() {
+fn run_reverse_udp_interop(reattach_after_disconnect: bool) {
     let workspace = workspace_root();
     let xray = xray_binary(&workspace);
     if !xray.is_file() {
@@ -473,10 +3593,26 @@ fn run_reverse_udp_interop() {
     }
 
     let _serial = serial_xray_guard();
-    let work_dir = create_test_dir("vless-reverse-xray-bridge-udp-raw");
+    let work_dir = create_test_dir(if reattach_after_disconnect {
+        "vless-reverse-xray-global-id-reattach"
+    } else {
+        "vless-reverse-xray-bridge-udp-raw"
+    });
     let (echo_addr, echoed_bytes) = start_observed_udp_echo_server();
+    let (second_echo_addr, second_echo_bytes) = start_observed_udp_echo_server();
     let reverse_port = free_localhost_port();
+    let vless_udp_port = free_localhost_port();
     let public_port = free_localhost_udp_port();
+    let xray_socks_port = free_localhost_port();
+    let vless_proxy = reattach_after_disconnect.then(|| {
+        ResettableTcpProxy::new(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            vless_udp_port,
+        )))
+    });
+    let xray_vless_port = vless_proxy
+        .as_ref()
+        .map_or(vless_udp_port, |proxy| proxy.addr.port());
     let chimera_config = work_dir.join("chimera.json");
     let xray_config = work_dir.join("xray.json");
 
@@ -512,6 +3648,17 @@ fn run_reverse_udp_interop() {
                         "followRedirect": false
                     },
                     "streamSettings": {"network": "udp"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": vless_udp_port,
+                    "protocol": "vless",
+                    "tag": "vless-udp-in",
+                    "settings": {
+                        "clients": [{"id": TEST_UUID, "email": "udp-gateway@example.test"}],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
                 }
             ],
             "outbounds": [{
@@ -519,12 +3666,20 @@ fn run_reverse_udp_interop() {
                 "protocol": "freedom"
             }],
             "routing": {
-                "rules": [{
-                    "type": "field",
-                    "inboundTag": ["public-udp"],
-                    "network": "udp",
-                    "outboundTag": "reverse-out"
-                }]
+                "rules": [
+                    {
+                        "type": "field",
+                        "inboundTag": ["public-udp"],
+                        "network": "udp",
+                        "outboundTag": "reverse-out"
+                    },
+                    {
+                        "type": "field",
+                        "inboundTag": ["vless-udp-in"],
+                        "network": "udp",
+                        "outboundTag": "reverse-out"
+                    }
+                ]
             }
         }),
     );
@@ -533,6 +3688,13 @@ fn run_reverse_udp_interop() {
         &xray_config,
         json!({
             "log": {"loglevel": "debug"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "xray-socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
             "outbounds": [
                 {
                     "tag": "reverse-bridge",
@@ -543,6 +3705,18 @@ fn run_reverse_udp_interop() {
                         "id": TEST_UUID,
                         "encryption": "none",
                         "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "tag": "to-chimera-vless-udp",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": xray_vless_port,
+                            "users": [{"id": TEST_UUID, "encryption": "none"}]
+                        }]
                     },
                     "streamSettings": {"network": "tcp", "security": "none"}
                 },
@@ -559,12 +3733,20 @@ fn run_reverse_udp_interop() {
                 }
             ],
             "routing": {
-                "rules": [{
-                    "type": "field",
-                    "inboundTag": ["bridge-in"],
-                    "network": "udp",
-                    "outboundTag": "direct"
-                }]
+                "rules": [
+                    {
+                        "type": "field",
+                        "inboundTag": ["bridge-in"],
+                        "network": "udp",
+                        "outboundTag": "direct"
+                    },
+                    {
+                        "type": "field",
+                        "inboundTag": ["xray-socks"],
+                        "network": "udp",
+                        "outboundTag": "to-chimera-vless-udp"
+                    }
+                ]
             }
         }),
     );
@@ -574,6 +3756,7 @@ fn run_reverse_udp_interop() {
     chimera.assert_running();
 
     let mut xray = start_xray(&workspace, &work_dir, &xray_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
     xray.assert_running();
 
     assert_reverse_udp_echo_with_retry(
@@ -581,9 +3764,363 @@ fn run_reverse_udp_interop() {
         b"xray bridge through chimera reverse portal udp",
         &echoed_bytes,
     );
+    let echoed_before_socks = echoed_bytes.load(Ordering::SeqCst);
+    let association = XraySocksUdpAssociation::connect(SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        xray_socks_port,
+    )));
+    association.send_and_expect_echo(
+        echo_addr,
+        b"Xray VLESS UDP through Chimera Reverse Portal",
+    );
+    if let Some(proxy) = vless_proxy.as_ref() {
+        proxy.wait_for_connections(1);
+        proxy.reset_active_connections();
+        association.send_until_echo(
+            echo_addr,
+            b"same GlobalID after VLESS TCP reconnect",
+            Duration::from_secs(8),
+        );
+        proxy.wait_for_connections(2);
+        association.send_and_expect_echo(
+            second_echo_addr,
+            b"second target after GlobalID reattachment",
+        );
+    } else {
+        association.send_and_expect_echo(
+            second_echo_addr,
+            b"same XUDP session, second target",
+        );
+    }
+    assert!(
+        echoed_bytes.load(Ordering::SeqCst) > echoed_before_socks,
+        "the first Xray VLESS UDP target did not reach its echo server"
+    );
+    assert!(
+        second_echo_bytes.load(Ordering::SeqCst) > 0,
+        "the second Xray VLESS UDP target did not reach its echo server"
+    );
 
     chimera.assert_running();
     xray.assert_running();
+}
+
+struct XraySocksUdpAssociation {
+    _control: TcpStream,
+    udp: UdpSocket,
+    relay_addr: SocketAddr,
+}
+
+impl XraySocksUdpAssociation {
+    fn connect(socks_addr: SocketAddr) -> Self {
+        let mut control =
+            TcpStream::connect(socks_addr).expect("connect Xray SOCKS UDP control");
+        control
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set SOCKS control read timeout");
+        control
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("set SOCKS control write timeout");
+        control
+            .write_all(&[0x05, 0x01, 0x00])
+            .expect("send Xray SOCKS hello");
+        let mut hello = [0u8; 2];
+        control
+            .read_exact(&mut hello)
+            .expect("read Xray SOCKS hello response");
+        assert_eq!(hello, [0x05, 0x00]);
+
+        control
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .expect("send Xray SOCKS UDP ASSOCIATE");
+        let mut response_header = [0u8; 4];
+        control
+            .read_exact(&mut response_header)
+            .expect("read Xray SOCKS UDP ASSOCIATE response");
+        assert_eq!(response_header[1], 0, "Xray SOCKS UDP ASSOCIATE failed");
+        let relay_ip = match response_header[3] {
+            0x01 => {
+                let mut bytes = [0u8; 4];
+                control
+                    .read_exact(&mut bytes)
+                    .expect("read SOCKS relay IPv4");
+                std::net::IpAddr::V4(Ipv4Addr::from(bytes))
+            }
+            other => panic!("unexpected Xray SOCKS UDP relay address type {other}"),
+        };
+        let mut port_bytes = [0u8; 2];
+        control
+            .read_exact(&mut port_bytes)
+            .expect("read SOCKS relay port");
+        let mut relay_addr =
+            SocketAddr::new(relay_ip, u16::from_be_bytes(port_bytes));
+        if relay_addr.ip().is_unspecified() {
+            relay_addr.set_ip(socks_addr.ip());
+        }
+
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind SOCKS UDP client");
+        Self {
+            _control: control,
+            udp,
+            relay_addr,
+        }
+    }
+
+    fn send_and_expect_echo(&self, target_addr: SocketAddr, payload: &[u8]) {
+        self.udp
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set SOCKS UDP response timeout");
+        self.send(target_addr, payload);
+        self.expect_response(target_addr, payload);
+    }
+
+    fn send_and_expect_no_response(&self, target_addr: SocketAddr, payload: &[u8]) {
+        self.udp
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set denied SOCKS UDP response timeout");
+        self.send(target_addr, payload);
+        let mut response = [0u8; 2048];
+        match self.udp.recv_from(&mut response) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("read denied SOCKS UDP response: {error}"),
+            Ok((length, _)) => panic!(
+                "denied Overlay UDP request unexpectedly received a response: {length} bytes"
+            ),
+        }
+    }
+
+    fn send_until_echo(
+        &self,
+        target_addr: SocketAddr,
+        payload: &[u8],
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        self.udp
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("set retrying SOCKS UDP response timeout");
+        loop {
+            self.send(target_addr, payload);
+            match self.receive_response(target_addr, payload) {
+                Ok(()) => return,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) && Instant::now() < deadline => {}
+                Err(error) => panic!(
+                    "Xray SOCKS UDP did not recover after the VLESS TCP disconnect: {error}"
+                ),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Xray SOCKS UDP reattachment timed out"
+            );
+        }
+    }
+
+    fn send(&self, target_addr: SocketAddr, payload: &[u8]) {
+        let mut request = vec![0, 0, 0];
+        match target_addr.ip() {
+            IpAddr::V4(ip) => {
+                request.push(0x01);
+                request.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                request.push(0x04);
+                request.extend_from_slice(&ip.octets());
+            }
+        }
+        request.extend_from_slice(&target_addr.port().to_be_bytes());
+        request.extend_from_slice(payload);
+        self.udp
+            .send_to(&request, self.relay_addr)
+            .expect("send Xray SOCKS UDP request");
+    }
+
+    fn expect_response(&self, target_addr: SocketAddr, payload: &[u8]) {
+        self.receive_response(target_addr, payload)
+            .expect("receive Xray SOCKS UDP response");
+    }
+
+    fn receive_response(
+        &self,
+        target_addr: SocketAddr,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let mut response = vec![0u8; payload.len() + 64];
+        let (length, _) = self.udp.recv_from(&mut response)?;
+        assert!(length >= 4, "SOCKS UDP response header was truncated");
+        assert_eq!(&response[..2], &[0, 0]);
+        assert_eq!(response[2], 0, "fragmented SOCKS UDP response");
+        let (source_ip, address_length) = match response[3] {
+            0x01 if length >= 10 => (
+                IpAddr::V4(Ipv4Addr::new(
+                    response[4],
+                    response[5],
+                    response[6],
+                    response[7],
+                )),
+                4,
+            ),
+            0x04 if length >= 22 => (
+                IpAddr::V6(std::net::Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&response[4..20])
+                        .expect("IPv6 SOCKS UDP source length"),
+                )),
+                16,
+            ),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "truncated or unsupported SOCKS UDP address type {other:#x}"
+                    ),
+                ));
+            }
+        };
+        let port_start = 4 + address_length;
+        assert_eq!(
+            source_ip,
+            target_addr.ip(),
+            "SOCKS UDP response source IP while waiting for {target_addr}"
+        );
+        let response_port =
+            u16::from_be_bytes([response[port_start], response[port_start + 1]]);
+        assert_eq!(
+            response_port,
+            target_addr.port(),
+            "SOCKS UDP response source while waiting for {target_addr}, payload={:?}",
+            &response[port_start + 2..length]
+        );
+        assert_eq!(&response[port_start + 2..length], payload);
+        Ok(())
+    }
+}
+
+struct ResettableTcpProxy {
+    addr: SocketAddr,
+    active_clients: Arc<Mutex<Vec<TcpStream>>>,
+    accepted_connections: Arc<AtomicUsize>,
+    running: Arc<AtomicBool>,
+    listener_task: Option<thread::JoinHandle<()>>,
+}
+
+impl ResettableTcpProxy {
+    fn new(target: SocketAddr) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind resettable VLESS TCP proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("set resettable proxy listener nonblocking");
+        let addr = listener.local_addr().expect("read resettable proxy addr");
+        let active_clients = Arc::new(Mutex::new(Vec::new()));
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let task_active_clients = active_clients.clone();
+        let task_accepted_connections = accepted_connections.clone();
+        let task_running = running.clone();
+        let listener_task = thread::spawn(move || {
+            while task_running.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        let upstream = match TcpStream::connect(target) {
+                            Ok(upstream) => upstream,
+                            Err(_) => continue,
+                        };
+                        let Ok(control_client) = client.try_clone() else {
+                            continue;
+                        };
+                        task_active_clients
+                            .lock()
+                            .expect("resettable proxy client mutex")
+                            .push(control_client);
+                        task_accepted_connections.fetch_add(1, Ordering::SeqCst);
+                        let mut client_reader =
+                            client.try_clone().expect("clone proxy client");
+                        let mut upstream_writer =
+                            upstream.try_clone().expect("clone proxy upstream");
+                        thread::spawn(move || {
+                            let _ =
+                                io::copy(&mut client_reader, &mut upstream_writer);
+                            let _ = upstream_writer.shutdown(Shutdown::Write);
+                        });
+
+                        let mut upstream_reader =
+                            upstream.try_clone().expect("clone proxy upstream");
+                        let mut client_writer =
+                            client.try_clone().expect("clone proxy client");
+                        thread::spawn(move || {
+                            let _ =
+                                io::copy(&mut upstream_reader, &mut client_writer);
+                            let _ = client_writer.shutdown(Shutdown::Write);
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            active_clients,
+            accepted_connections,
+            running,
+            listener_task: Some(listener_task),
+        }
+    }
+
+    fn wait_for_connections(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.accepted_connections.load(Ordering::SeqCst) < expected
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            self.accepted_connections.load(Ordering::SeqCst) >= expected,
+            "Xray VLESS transport did not reconnect through the resettable proxy"
+        );
+    }
+
+    fn reset_active_connections(&self) {
+        assert!(
+            self.close_active_connections() > 0,
+            "no VLESS TCP connection to reset"
+        );
+    }
+
+    fn close_active_connections(&self) -> usize {
+        let clients = std::mem::take(
+            &mut *self
+                .active_clients
+                .lock()
+                .expect("resettable proxy client mutex"),
+        );
+        let count = clients.len();
+        for client in clients {
+            let _ = client.shutdown(Shutdown::Both);
+        }
+        count
+    }
+}
+
+impl Drop for ResettableTcpProxy {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        let _ = self.close_active_connections();
+        if let Some(listener_task) = self.listener_task.take() {
+            let _ = listener_task.join();
+        }
+    }
 }
 
 fn run_chimera_bridge_proxy_protocol_interop() {
@@ -675,7 +4212,10 @@ fn run_chimera_bridge_proxy_protocol_interop() {
                 {
                     "tag": "direct",
                     "protocol": "freedom",
-                    "settings": {"proxyProtocol": 1}
+                    "settings": {
+                        "proxyProtocol": 1,
+                        "finalRules": [loopback_allow_rule("tcp", echo_addr)]
+                    }
                 }
             ],
             "routing": {
@@ -856,7 +4396,10 @@ fn run_chimera_bridge_xhttp_forwarded_source_interop() {
                 {
                     "tag": "direct",
                     "protocol": "freedom",
-                    "settings": {"proxyProtocol": 1}
+                    "settings": {
+                        "proxyProtocol": 1,
+                        "finalRules": [loopback_allow_rule("tcp", echo_addr)]
+                    }
                 }
             ],
             "routing": {
@@ -939,6 +4482,7 @@ fn run_chimera_bridge_interop(
     let reverse_port = free_localhost_port();
     let public_port = free_localhost_port();
     let chimera_config = work_dir.join("chimera.json");
+    let chimera_bad_auth_config = work_dir.join("chimera-bad-auth.json");
     let xray_config = work_dir.join("xray.json");
 
     let (xray_stream, chimera_stream) = match security {
@@ -974,6 +4518,30 @@ fn run_chimera_bridge_interop(
                 }),
             )
         }
+        #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+        ReverseSecurity::Reality => (
+            json!({
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "www.apple.com:443",
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
+                    "minClientVer": "26.2.6"
+                }
+            }),
+            json!({
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "serverName": "www.apple.com",
+                    "fingerprint": "chrome",
+                    "publicKey": "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg",
+                    "shortId": "4ac97aaf8b9b0356"
+                }
+            }),
+        ),
         ReverseSecurity::Websocket => (
             json!({
                 "network": "ws",
@@ -995,12 +4563,14 @@ fn run_chimera_bridge_interop(
                 ReverseSecurity::XhttpTlsPacketUp => "packet-up",
                 _ => "stream-up",
             };
+            let alpn = "h2";
             (
                 json!({
                     "network": "xhttp",
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": "localhost",
+                        "alpn": [alpn],
                         "certificates": [{
                             "certificateFile": cert_path,
                             "keyFile": key_path
@@ -1025,6 +4595,7 @@ fn run_chimera_bridge_interop(
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": "localhost",
+                        "alpn": [alpn],
                         "disableSystemRoot": true,
                         "certificates": [{
                             "certificateFile": cert_path,
@@ -1124,12 +4695,19 @@ fn run_chimera_bridge_interop(
         },
         "streamSettings": chimera_stream
     });
+    let direct_outbound = json!({
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+            "finalRules": [loopback_allow_rule("tcp", echo_addr)]
+        }
+    });
     let (mut chimera_outbounds, chimera_routing_rules) =
         if let Some(routing_user) = routing_user {
             (
                 vec![
                     json!({"tag": "default-block", "protocol": "blackhole"}),
-                    json!({"tag": "direct", "protocol": "freedom"}),
+                    direct_outbound.clone(),
                 ],
                 vec![json!({
                     "type": "field",
@@ -1141,7 +4719,7 @@ fn run_chimera_bridge_interop(
             )
         } else {
             (
-                vec![json!({"tag": "direct", "protocol": "freedom"})],
+                vec![direct_outbound],
                 vec![json!({
                     "type": "field",
                     "inboundTag": ["bridge-in"],
@@ -1201,24 +4779,33 @@ fn run_chimera_bridge_interop(
         }),
     );
 
-    write_json(
-        &chimera_config,
-        json!({
-            "log": {"loglevel": "debug"},
-            "inbounds": [],
-            "outbounds": chimera_outbounds,
-            "routing": {
-                "rules": chimera_routing_rules
-            }
-        }),
-    );
+    let chimera_config_value = json!({
+        "log": {"loglevel": "debug"},
+        "inbounds": [],
+        "outbounds": chimera_outbounds,
+        "routing": {
+            "rules": chimera_routing_rules
+        }
+    });
+    write_json(&chimera_config, chimera_config_value.clone());
+    if matches!(security, ReverseSecurity::Reality) {
+        let mut bad_auth = chimera_config_value;
+        bad_auth["outbounds"][0]["streamSettings"]["realitySettings"]["shortId"] =
+            json!("0000000000000000");
+        write_json(&chimera_bad_auth_config, bad_auth);
+    }
 
-    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    let bridge_config = if matches!(security, ReverseSecurity::Reality) {
+        &chimera_bad_auth_config
+    } else {
+        &chimera_config
+    };
+    let mut chimera = start_chimera(&workspace, &work_dir, bridge_config);
     chimera.assert_running();
 
     // Xray waits two seconds before its first Reverse monitor tick. Start
-    // Chimera first and let that first dial fail so the successful path also
-    // proves periodic retry rather than only startup ordering.
+    // Chimera first and let that first TCP dial fail so the successful path
+    // also proves periodic retry rather than startup ordering.
     std::thread::sleep(Duration::from_millis(2300));
     chimera.assert_running();
 
@@ -1228,6 +4815,19 @@ fn run_chimera_bridge_interop(
     xray.assert_running();
 
     let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    if matches!(security, ReverseSecurity::Reality) {
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_reverse_echo_unavailable(public_addr);
+        assert_eq!(
+            echoed_bytes.load(Ordering::SeqCst),
+            0,
+            "invalid REALITY shortId must not create a Reverse worker or reach the target"
+        );
+        drop(chimera);
+        chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+        chimera.assert_running();
+    }
+
     let first_payload = format!(
         "chimera bridge through xray reverse portal ({})",
         security.name()
@@ -1319,6 +4919,30 @@ fn run_reverse_interop(security: ReverseSecurity) {
                 }),
             )
         }
+        #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+        ReverseSecurity::Reality => (
+            json!({
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "dest": "www.apple.com:443",
+                    "serverNames": ["www.apple.com"],
+                    "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
+                    "shortIds": ["4ac97aaf8b9b0356"],
+                    "minClientVer": "26.2.6"
+                }
+            }),
+            json!({
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "serverName": "www.apple.com",
+                    "fingerprint": "chrome",
+                    "publicKey": "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg",
+                    "shortId": "4ac97aaf8b9b0356"
+                }
+            }),
+        ),
         ReverseSecurity::Websocket => {
             unreachable!("Portal-side WebSocket is not exercised here")
         }
@@ -1332,12 +4956,14 @@ fn run_reverse_interop(security: ReverseSecurity) {
                 ReverseSecurity::XhttpTlsPacketUp => "packet-up",
                 _ => "stream-up",
             };
+            let alpn = "h2";
             (
                 json!({
                     "network": "xhttp",
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": "localhost",
+                        "alpn": [alpn],
                         "certificates": [{
                             "certificateFile": cert_path,
                             "keyFile": key_path
@@ -1362,6 +4988,7 @@ fn run_reverse_interop(security: ReverseSecurity) {
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": "localhost",
+                        "alpn": [alpn],
                         "pinnedPeerCertSha256": pinned_peer_cert_sha256
                     },
                     "xhttpSettings": {
@@ -1531,9 +5158,19 @@ fn run_reverse_interop(security: ReverseSecurity) {
         }
     });
     write_json(&xray_config, xray_config_value.clone());
-    if matches!(security, ReverseSecurity::Raw) {
+    if security.has_negative_auth_case() {
         let mut bad_auth = xray_config_value.clone();
-        bad_auth["outbounds"][0]["settings"]["id"] = json!(WRONG_TEST_UUID);
+        match security {
+            ReverseSecurity::Raw => {
+                bad_auth["outbounds"][0]["settings"]["id"] = json!(WRONG_TEST_UUID);
+            }
+            #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+            ReverseSecurity::Reality => {
+                bad_auth["outbounds"][0]["streamSettings"]["realitySettings"]["shortId"] =
+                    json!("0000000000000000");
+            }
+            _ => unreachable!("this transport has no negative-auth case"),
+        }
         write_json(&xray_bad_auth_config, bad_auth);
     }
 
@@ -1543,7 +5180,7 @@ fn run_reverse_interop(security: ReverseSecurity) {
     chimera.assert_running();
 
     let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
-    if matches!(security, ReverseSecurity::Raw) {
+    if security.has_negative_auth_case() {
         let before = echoed_bytes.load(Ordering::SeqCst);
         let mut bad_xray = start_xray(&workspace, &work_dir, &xray_bad_auth_config);
         std::thread::sleep(Duration::from_millis(2300));
@@ -1635,10 +5272,16 @@ fn assert_reverse_udp_echo_with_retry(
 }
 
 fn start_observed_udp_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+    start_observed_udp_echo_server_on(Ipv4Addr::LOCALHOST.into())
+}
+
+fn start_observed_udp_echo_server_on(
+    bind_ip: IpAddr,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0))
         .expect("bind observed Reverse UDP echo server");
     socket
-        .set_read_timeout(Some(REVERSE_READY_TIMEOUT))
+        .set_read_timeout(Some(UDP_ECHO_IDLE_TIMEOUT))
         .expect("set Reverse UDP echo timeout");
     let address = socket
         .local_addr()
@@ -1881,8 +5524,23 @@ fn reverse_echo_once_with_source(
     Ok(source)
 }
 
+// Reverse-originated Freedom traffic defaults to block-all; keep e2e access
+// limited to the fixture's loopback echo address family and ephemeral port.
+fn loopback_allow_rule(network: &str, echo_addr: SocketAddr) -> serde_json::Value {
+    json!({
+        "action": "allow",
+        "network": network,
+        "port": echo_addr.port(),
+        "ip": ["127.0.0.0/8", "::1/128"]
+    })
+}
+
 fn start_observed_echo_server() -> (SocketAddr, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    start_observed_echo_server_on(Ipv4Addr::LOCALHOST.into())
+}
+
+fn start_observed_echo_server_on(bind_ip: IpAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))
         .expect("bind observed Reverse echo server");
     let address = listener
         .local_addr()

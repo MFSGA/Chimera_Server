@@ -164,7 +164,17 @@ async fn run_security_case(case: SecurityCase, payload_len: usize, ack_trace: bo
                     reality_dest,
                 )
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": ["tcp"],
+                        "ip": ["127.0.0.0/8"]
+                    }]
+                }
+            }]
         }),
     );
     write_json(

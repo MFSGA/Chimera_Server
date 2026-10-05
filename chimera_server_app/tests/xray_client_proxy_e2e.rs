@@ -1951,6 +1951,84 @@ async fn xray_client_can_proxy_tcp_through_chimera_vless_tcp() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera and a versioned Xray client to verify Freedom finalRules"]
+async fn xray_client_vless_freedom_final_rules_allow_and_block_tcp_targets() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-freedom-final-rules");
+    let (allowed_addr, allowed_connections) = start_tcp_echo_server_with_counter();
+    let (blocked_addr, blocked_connections) = start_tcp_echo_server_with_counter();
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "vless-final-rules-in",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "final-rules@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": allowed_addr.port(),
+                        "ip": ["127.0.0.1/32"]
+                    }]
+                }
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth"}
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }]
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config_path);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    assert_socks5_echo(socks_addr, allowed_addr, b"finalRules allowed target");
+    assert_eq!(allowed_connections.load(Ordering::SeqCst), 1);
+    assert_socks5_echo_does_not_succeed(socks_addr, blocked_addr);
+    assert_eq!(blocked_connections.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts Chimera and ./xray to verify per-user domain allow/reject"]
 async fn xray_client_domain_access_policy_allows_and_rejects_vless_target() {
     let workspace = workspace_root();
