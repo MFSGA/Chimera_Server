@@ -74,6 +74,12 @@ mod xudp_registry;
 #[cfg(feature = "wireguard")]
 mod wireguard;
 
+// Provisional platform boundary: this module uses Linux L3 system-TUN APIs and
+// has only been packet-tested on Linux. Add a device backend plus lifecycle and
+// packet tests for another OS before widening this gate.
+#[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+mod tun_gateway;
+
 mod user_domain;
 
 use server::{ServerStartupConfig, start_server_resources, supervise_server};
@@ -156,6 +162,14 @@ pub fn prepare_server_runtime(
     log::init(config.log.as_ref(), cwd, log_file)?;
 
     let plan = ValidatedServerPlan::compile(config)?;
+    // The preparation API does not own system devices; this Linux runtime path
+    // rejects that compile-only use rather than widening its lifecycle scope.
+    #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+    if plan.tun_gateway.is_some() {
+        return Err(Error::InvalidConfig(
+            "prepare_server_runtime does not start tunGateway; use start() to own its device lifecycle".into(),
+        ));
+    }
     let runtime_state = RuntimeState::new_with_resolver(
         plan.inbounds.clone(),
         plan.outbounds.clone(),
@@ -182,6 +196,11 @@ pub fn prepare_server_inbounds(
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     log::init(config.log.as_ref(), cwd, log_file)?;
 
+    if config.tun_gateway.is_some() {
+        return Err(Error::InvalidConfig(
+            "prepare_server_inbounds does not start tunGateway; use start() to own its device lifecycle".into(),
+        ));
+    }
     compile_inbounds(config.inbounds)
 }
 
@@ -408,6 +427,10 @@ struct ValidatedServerPlan {
     burst_observatory: Option<config::def::BurstObservatoryConfig>,
     resolved_api: ResolvedApiConfig,
     shutdown_grace_period: Duration,
+    // This plan type belongs to the Linux TUN backend; other targets reject
+    // configured tunGateway before they reach startup.
+    #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+    tun_gateway: Option<tun_gateway::TunGatewayPlan>,
 }
 
 impl ValidatedServerPlan {
@@ -423,6 +446,7 @@ impl ValidatedServerPlan {
             observatory,
             burst_observatory,
             shutdown,
+            tun_gateway,
             legacy_reverse_configured,
             mcp,
             ..
@@ -434,6 +458,41 @@ impl ValidatedServerPlan {
                     .into(),
             ));
         }
+
+        #[cfg(not(feature = "tun-gateway"))]
+        if tun_gateway.is_some() {
+            return Err(Error::InvalidConfig(
+                "tunGateway is configured but the \"tun-gateway\" feature is disabled".into(),
+            ));
+        }
+
+        #[cfg(all(feature = "tun-gateway", not(target_os = "linux")))]
+        if tun_gateway.is_some() {
+            return Err(Error::InvalidConfig(
+                "tunGateway currently requires a Linux server build".into(),
+            ));
+        }
+
+        // A logical TUN inbound tag is used by routing and statistics, so it
+        // must not alias a listener-backed inbound identity.
+        #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+        if let Some(gateway) = tun_gateway.as_ref()
+            && inbounds
+                .iter()
+                .any(|inbound| inbound.tag == gateway.inbound_tag)
+        {
+            return Err(Error::InvalidConfig(format!(
+                "tunGateway.inboundTag {} duplicates a configured inbound tag",
+                gateway.inbound_tag
+            )));
+        }
+
+        // Non-Linux targets return the explicit unsupported-platform error above.
+        #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+        let tun_gateway = tun_gateway
+            .map(tun_gateway::TunGatewayPlan::try_from)
+            .transpose()
+            .map_err(Error::InvalidConfig)?;
 
         #[cfg(not(feature = "api"))]
         if api
@@ -526,6 +585,9 @@ impl ValidatedServerPlan {
             burst_observatory,
             resolved_api,
             shutdown_grace_period,
+            // Keep the compiled runtime plan paired with its Linux-only owner.
+            #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+            tun_gateway,
         })
     }
 
@@ -542,11 +604,18 @@ impl ValidatedServerPlan {
             .is_empty();
         #[cfg(not(feature = "vless-reverse"))]
         let reverse_bridge_started = false;
+        // A non-Linux plan cannot reach startup; no service capability is
+        // advertised on a target without the Linux device backend.
+        #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+        let tun_gateway_started = self.tun_gateway.is_some();
+        #[cfg(not(feature = "tun-gateway"))]
+        let tun_gateway_started = false;
 
         if self.inbounds.is_empty()
             && !api_started
             && self.mcp.is_none()
             && !reverse_bridge_started
+            && !tun_gateway_started
         {
             return Err(Error::InvalidConfig(
                 "no servers started; check inbounds/api configuration".into(),
@@ -762,6 +831,10 @@ async fn start_async(
     let resolved_api = plan.resolved_api;
     let api_listen = resolved_api.listen.clone();
     let skip_inbound_tag = resolved_api.inbound_tag.clone();
+    // Non-Linux builds reject tunGateway during plan compilation and have no
+    // device-service plan to transfer into startup.
+    #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+    let tun_gateway = plan.tun_gateway;
 
     let runtime_state = RuntimeState::new_with_resolver(
         plan.inbounds,
@@ -801,6 +874,9 @@ async fn start_async(
             api_listen,
             #[cfg(feature = "vless-reverse")]
             reverse_bridge_plans,
+            // Keep the startup resource field limited to the implemented Linux owner.
+            #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+            tun_gateway,
         },
         connection_drain_timeout,
     )
@@ -912,6 +988,112 @@ mod tests {
 
         ValidatedServerPlan::compile(config)
             .expect("Xray treats a null root reverse pointer as unconfigured");
+    }
+
+    #[test]
+    fn tun_gateway_is_feature_gated_and_config_validation_is_explicit() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "tunGateway": {
+                    "name": "site-tun",
+                    "address": "10.254.0.1/24",
+                    "inboundTag": "office-tun"
+                }
+            }))
+            .expect("parse Chimera tunGateway extension");
+
+        #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+        {
+            let plan = ValidatedServerPlan::compile(config)
+                .expect("valid TUN gateway config should compile");
+            assert!(plan.tun_gateway.is_some());
+        }
+
+        #[cfg(any(not(feature = "tun-gateway"), not(target_os = "linux")))]
+        {
+            let error = match ValidatedServerPlan::compile(config) {
+                Ok(_) => panic!("disabled TUN feature must not ignore tunGateway"),
+                Err(error) => error,
+            };
+            #[cfg(not(feature = "tun-gateway"))]
+            assert!(error.to_string().contains("feature is disabled"));
+            #[cfg(all(feature = "tun-gateway", not(target_os = "linux")))]
+            assert!(error.to_string().contains("requires a Linux"));
+        }
+    }
+
+    #[test]
+    fn tun_gateway_rejects_unknown_fields_in_its_chimera_extension() {
+        let error = serde_json::from_value::<crate::config::def::LiteralConfig>(
+            serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "tunGateway": {
+                    "name": "site-tun",
+                    "address": "10.254.0.1/24",
+                    "inboundTag": "office-tun",
+                    "unknownTunOption": 9000
+                }
+            }),
+        )
+        .expect_err("unsupported config fields must not be silently ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `unknownTunOption`")
+        );
+    }
+
+    #[test]
+    fn tun_gateway_mtu_is_a_recognized_chimera_extension_field() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "tunGateway": {
+                    "name": "site-tun",
+                    "address": "10.254.0.1/24",
+                    "inboundTag": "office-tun",
+                    "mtu": 1280
+                }
+            }))
+            .expect("parse configured Chimera tunGateway MTU");
+
+        assert_eq!(config.tun_gateway.expect("tunGateway").mtu, 1280);
+    }
+
+    #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+    #[test]
+    fn tun_gateway_tag_cannot_alias_a_listener_inbound_tag() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [{
+                    "tag": "office-tun",
+                    "listen": "127.0.0.1",
+                    "port": 1080,
+                    "protocol": "dokodemo-door",
+                    "settings": {"address": "127.0.0.1"}
+                }],
+                "outbounds": [],
+                "tunGateway": {
+                    "name": "site-tun",
+                    "address": "10.254.0.1/24",
+                    "inboundTag": "office-tun"
+                }
+            }))
+            .expect("parse duplicate TUN inbound tag config");
+
+        let error = match ValidatedServerPlan::compile(config) {
+            Ok(_) => panic!("TUN identity must not alias a listener inbound"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("duplicates a configured inbound tag")
+        );
     }
 
     #[cfg(feature = "vless-reverse")]

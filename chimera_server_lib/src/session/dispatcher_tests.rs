@@ -7,13 +7,14 @@ use std::{
 use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, duplex},
+    net::UdpSocket,
     time::timeout,
 };
 
 use crate::{
     address::{Address, NetLocation},
     config::{
-        rule::{RoutingConfig, RuleConfig},
+        rule::{NetworkListConfig, RoutingConfig, RuleConfig},
         server_config::DokodemoDoorConfig,
     },
     handler::{
@@ -27,8 +28,130 @@ use crate::{
     },
     routing_state::RoutingState,
     runtime::{OutboundSummary, RuntimeState},
-    session::dispatcher::process_stream_with_sniffing_and_local_addr,
+    session::{
+        dispatcher::process_stream_with_sniffing_and_local_addr,
+        udp::run_bidirectional_udp,
+    },
+    traffic::TrafficContext,
 };
+
+#[tokio::test]
+async fn bidirectional_udp_route_round_trips_through_reverse_portal_worker() {
+    let runtime_state = RuntimeState::new(
+        Vec::new(),
+        vec![OutboundSummary {
+            tag: "reverse-out".into(),
+            protocol: "vless-reverse".into(),
+            proxy_settings_type: None,
+            proxy_settings_value: None,
+            sender_settings_type: None,
+            sender_settings_value: None,
+        }],
+    );
+    runtime_state.replace_routing(
+        RoutingState::from_config(Some(&RoutingConfig {
+            rules: vec![RuleConfig {
+                inbound_tag: vec!["vless-udp".into()],
+                network: NetworkListConfig(vec!["udp".into()]),
+                outbound_tag: Some("reverse-out".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        }))
+        .expect("compile VLESS UDP to Reverse route"),
+    );
+    let runtime = runtime_state.data_plane();
+
+    let (physical, mut bridge_peer) = duplex(16 * 1024);
+    let _lease = runtime
+        .attach_reverse_portal(
+            "reverse-out",
+            Box::new(ReverseSessionStream::new(physical)),
+        )
+        .await
+        .expect("attach Reverse UDP worker");
+    let _control = read_frame_with_source_and_local(&mut bridge_peer, true)
+        .await
+        .expect("read Reverse worker control frame");
+
+    let target = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 5353);
+    let relay_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind VLESS UDP relay socket");
+    let relay_addr = relay_socket.local_addr().expect("VLESS UDP relay address");
+    let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind VLESS UDP client socket");
+    let client_addr = client_socket
+        .local_addr()
+        .expect("VLESS UDP client address");
+    relay_socket
+        .connect(client_addr)
+        .await
+        .expect("connect relay socket");
+    client_socket
+        .connect(relay_addr)
+        .await
+        .expect("connect client socket");
+
+    let dispatch = tokio::spawn(run_bidirectional_udp(
+        Box::new(relay_socket),
+        target.clone(),
+        runtime.resolver(),
+        runtime.clone(),
+        client_addr,
+        Some(relay_addr),
+        Some(
+            TrafficContext::new("vless")
+                .with_identity("udp-user")
+                .with_inbound_tag("vless-udp"),
+        ),
+    ));
+    client_socket
+        .send(b"query")
+        .await
+        .expect("send request through fixed-target UDP stream");
+
+    let request = timeout(
+        Duration::from_secs(1),
+        read_frame_with_source_and_local(&mut bridge_peer, true),
+    )
+    .await
+    .expect("Reverse UDP request timeout")
+    .expect("read Reverse UDP request");
+    assert_eq!(request.metadata.status, SessionStatus::New);
+    assert_eq!(request.metadata.target.as_ref().unwrap().location, target);
+    assert_eq!(request.payload.as_ref(), b"query");
+    let session_id = request.metadata.session_id;
+
+    bridge_peer
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id,
+                    status: SessionStatus::Keep,
+                    option: FrameOption::default().with_data(),
+                    target: None,
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::from_static(b"reply"),
+            })
+            .expect("encode Reverse UDP response"),
+        )
+        .await
+        .expect("write Reverse UDP response");
+
+    let mut response = [0u8; 16];
+    let length = timeout(Duration::from_secs(1), client_socket.recv(&mut response))
+        .await
+        .expect("fixed-target UDP response timeout")
+        .expect("read fixed-target UDP response");
+    assert_eq!(&response[..length], b"reply");
+
+    dispatch.abort();
+}
 
 #[tokio::test]
 async fn dokodemo_route_round_trips_through_reverse_portal_worker() {

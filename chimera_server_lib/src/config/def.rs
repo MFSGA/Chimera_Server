@@ -33,6 +33,8 @@ pub struct LiteralConfig {
     pub burst_observatory: Option<BurstObservatoryConfig>,
     #[serde(default)]
     pub shutdown: Option<ShutdownConfig>,
+    #[serde(default, rename = "tunGateway")]
+    pub tun_gateway: Option<TunGatewayConfig>,
     #[serde(
         default,
         rename = "reverse",
@@ -41,6 +43,49 @@ pub struct LiteralConfig {
     pub legacy_reverse_configured: bool,
     // mcp settings
     pub mcp: Option<McpConfig>,
+}
+
+/// Chimera's Linux site-to-site gateway extension. It is intentionally kept
+/// separate from Xray's TUN inbound schema. Optional managed routes are scoped
+/// to a dedicated policy table selected by explicit source prefixes.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TunGatewayConfig {
+    pub name: String,
+    pub address: String,
+    #[serde(default)]
+    pub ipv6_address: Option<String>,
+    #[serde(default = "default_tun_gateway_mtu")]
+    pub mtu: usize,
+    #[serde(default)]
+    pub routes: Vec<String>,
+    #[serde(default, rename = "routeFrom")]
+    pub route_from: Vec<String>,
+    #[serde(default, rename = "routeInputInterface")]
+    pub route_input_interface: Option<String>,
+    #[serde(default, rename = "routeTable")]
+    pub route_table: Option<u32>,
+    #[serde(default, rename = "routeRulePriority")]
+    pub route_rule_priority: Option<u32>,
+    pub inbound_tag: String,
+    #[serde(default)]
+    pub user_level: u32,
+    #[serde(default = "default_tun_gateway_tcp_limit")]
+    pub max_tcp_connections: usize,
+    #[serde(default = "default_tun_gateway_udp_sessions")]
+    pub max_udp_sessions: usize,
+}
+
+fn default_tun_gateway_tcp_limit() -> usize {
+    64
+}
+
+fn default_tun_gateway_udp_sessions() -> usize {
+    256
+}
+
+fn default_tun_gateway_mtu() -> usize {
+    1500
 }
 
 fn deserialize_present_field<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -827,7 +872,7 @@ pub struct ApiConfig {
 pub struct ObservatoryConfig {
     #[serde(default)]
     pub subject_selector: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "probeURL")]
     pub probe_url: String,
     #[serde(default)]
     pub probe_interval: Option<Value>,
@@ -1182,6 +1227,21 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn parses_xray_observatory_probe_url_spellings() {
+        for field in ["probeURL", "probeUrl"] {
+            let input = format!(
+                r#"{{"inbounds":[],"outbounds":[],"observatory":{{"subjectSelector":["to-hub"],"{field}":"http://10.44.0.20:39646/health"}}}}"#
+            );
+            let config: LiteralConfig =
+                serde_json::from_str(&input).expect("Xray Observatory should parse");
+            let observatory =
+                config.observatory.expect("observatory config missing");
+            assert_eq!(observatory.subject_selector, vec!["to-hub"]);
+            assert_eq!(observatory.probe_url, "http://10.44.0.20:39646/health");
+        }
     }
 
     #[test]

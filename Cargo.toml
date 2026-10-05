@@ -7,6 +7,8 @@ members = [
     "chimera_cli",
     "chimera_tcp_reality_server",
 ]
+# Keep the source snapshot out of the Server workspace; its upstream tests run separately.
+exclude = ["vendor/watfaq-netstack"]
 
 [workspace.package]
 version = "0.9.1"
@@ -136,6 +138,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.7.13", features = ["async", "tokio"] }
+rtnetlink = { version = "0.23.0", default-features = false, features = ["tokio_socket"] }
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }

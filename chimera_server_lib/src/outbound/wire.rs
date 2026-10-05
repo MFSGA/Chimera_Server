@@ -50,8 +50,102 @@ pub(super) const TYPE_TRANSPORT_GRPC_CONFIG_V2RAY: &str =
 
 #[derive(Clone, PartialEq, Message)]
 pub(super) struct FreedomConfigPayload {
+    #[prost(int32, tag = "1")]
+    pub(super) domain_strategy: i32,
+    #[prost(message, optional, tag = "3")]
+    pub(super) destination_override: Option<FreedomDestinationOverridePayload>,
+    #[prost(uint32, tag = "4")]
+    pub(super) user_level: u32,
+    #[prost(message, optional, tag = "5")]
+    pub(super) fragment: Option<FreedomFragmentPayload>,
     #[prost(uint32, tag = "6")]
     pub(super) proxy_protocol: u32,
+    #[prost(message, repeated, tag = "7")]
+    pub(super) noises: Vec<FreedomNoisePayload>,
+    #[prost(message, repeated, tag = "8")]
+    pub(super) final_rules: Vec<FreedomFinalRulePayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomDestinationOverridePayload {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    pub(super) address: Option<Vec<u8>>,
+    #[prost(uint32, tag = "2")]
+    pub(super) port: u32,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub(super) user: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomFragmentPayload {
+    #[prost(uint64, tag = "1")]
+    pub(super) packets_from: u64,
+    #[prost(uint64, tag = "2")]
+    pub(super) packets_to: u64,
+    #[prost(uint64, tag = "3")]
+    pub(super) length_min: u64,
+    #[prost(uint64, tag = "4")]
+    pub(super) length_max: u64,
+    #[prost(uint64, tag = "5")]
+    pub(super) interval_min: u64,
+    #[prost(uint64, tag = "6")]
+    pub(super) interval_max: u64,
+    #[prost(uint64, tag = "7")]
+    pub(super) max_split_min: u64,
+    #[prost(uint64, tag = "8")]
+    pub(super) max_split_max: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomNoisePayload {
+    #[prost(uint64, tag = "1")]
+    pub(super) length_min: u64,
+    #[prost(uint64, tag = "2")]
+    pub(super) length_max: u64,
+    #[prost(uint64, tag = "3")]
+    pub(super) delay_min: u64,
+    #[prost(uint64, tag = "4")]
+    pub(super) delay_max: u64,
+    #[prost(bytes = "vec", tag = "5")]
+    pub(super) packet: Vec<u8>,
+    #[prost(string, tag = "6")]
+    pub(super) apply_to: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomFinalRulePayload {
+    #[prost(int32, tag = "1")]
+    pub(super) action: i32,
+    #[prost(int32, repeated, tag = "2")]
+    pub(super) networks: Vec<i32>,
+    #[prost(message, optional, tag = "3")]
+    pub(super) port_list: Option<FreedomPortListPayload>,
+    #[prost(message, repeated, tag = "4")]
+    pub(super) ip: Vec<crate::geodata::proto::IpRule>,
+    #[prost(message, optional, tag = "5")]
+    pub(super) block_delay: Option<FreedomRangePayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomPortListPayload {
+    #[prost(message, repeated, tag = "1")]
+    pub(super) range: Vec<FreedomPortRangePayload>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomPortRangePayload {
+    #[prost(uint32, tag = "1")]
+    pub(super) from: u32,
+    #[prost(uint32, tag = "2")]
+    pub(super) to: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(super) struct FreedomRangePayload {
+    #[prost(uint64, tag = "1")]
+    pub(super) min: u64,
+    #[prost(uint64, tag = "2")]
+    pub(super) max: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -140,6 +234,11 @@ pub(super) struct VlessReversePayload {
     pub(super) tag: String,
     #[prost(message, optional, tag = "2")]
     pub(super) sniffing: Option<VlessReverseSniffingPayload>,
+    // Chimera's site-to-site policy is local Bridge configuration. It is
+    // carried only inside the in-memory compiled outbound snapshot and is
+    // never written to the VLESS wire protocol.
+    #[prost(string, tag = "100")]
+    pub(super) site_to_site_json: String,
 }
 
 #[derive(Clone, PartialEq, Message)]

@@ -5,6 +5,10 @@ use std::collections::HashMap;
 struct StaticFreedomConfig {
     #[serde(default)]
     proxy_protocol: u32,
+    #[serde(default)]
+    final_rules: Option<Vec<serde_json::Value>>,
+    #[serde(flatten)]
+    other_settings: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -77,6 +81,8 @@ struct StaticVlessReverseConfig {
     #[cfg(not(feature = "vless-reverse"))]
     #[serde(default)]
     sniffing: Option<serde_json::Value>,
+    #[serde(default, rename = "siteToSite")]
+    site_to_site: Option<serde_json::Value>,
 }
 
 #[cfg(feature = "vless-reverse")]

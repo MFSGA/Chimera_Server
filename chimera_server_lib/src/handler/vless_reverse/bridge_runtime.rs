@@ -126,6 +126,7 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
                             routing_user: plan.endpoint.routing_user.clone(),
                             policy_identity: plan.endpoint.policy_identity.clone(),
                             user_level: plan.endpoint.user_level,
+                            site_to_site: plan.endpoint.site_to_site.clone(),
                         },
                     ));
                     tracing::info!(
@@ -234,6 +235,43 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "reality")]
+    #[test]
+    fn plan_accepts_reality_reverse_bridge_with_verified_client_transport() {
+        let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "serverName": "www.apple.com",
+                "fingerprint": "chrome",
+                "publicKey": "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg",
+                "shortId": "4ac97aaf8b9b0356"
+            }
+        }));
+        let plans = prepare_reverse_bridge_plans(&[outbound])
+            .expect("REALITY Bridge transport has a verified client implementation");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].outbound_tag, "reverse");
+    }
+
+    #[cfg(not(feature = "reality"))]
+    #[test]
+    fn plan_rejects_reality_reverse_bridge_without_feature() {
+        let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "serverName": "www.apple.com",
+                "fingerprint": "chrome",
+                "publicKey": "lpaMu0U01fKbRO9mgkSiOArWZz4V0TRW7pR543Pm9Xg",
+                "shortId": "4ac97aaf8b9b0356"
+            }
+        }));
+        let error = prepare_reverse_bridge_plans(&[outbound])
+            .expect_err("REALITY Bridge requires its explicit Cargo capability");
+        assert!(error.to_string().contains("requires the reality feature"));
+    }
+
     #[cfg(feature = "tls")]
     #[test]
     fn plan_accepts_xhttp_stream_up_over_tls() {
@@ -293,6 +331,33 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[test]
+    fn plan_rejects_xhttp_h3_until_reverse_runtime_is_implemented() {
+        for mode in ["packet-up", "stream-up", "auto"] {
+            let outbound =
+                reverse_outbound_with_stream_settings(serde_json::json!({
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "alpn": ["h3"]
+                    },
+                    "xhttpSettings": {
+                        "path": "/reverse-xhttp-h3/",
+                        "mode": mode,
+                        "xPaddingBytes": 1
+                    }
+                }));
+            let error = prepare_reverse_bridge_plans(&[outbound])
+                .expect_err("XHTTP/3 Reverse Bridge must fail closed");
+            assert!(
+                error.to_string().contains("VLESS Reverse Bridge XHTTP/3"),
+                "XHTTP/3 {mode}: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
     fn plan_rejects_xhttp_http1_alpn_until_h1_client_exists() {
         let outbound = reverse_outbound_with_stream_settings(serde_json::json!({
             "network": "xhttp",
@@ -309,9 +374,13 @@ mod tests {
         }));
         let error = prepare_reverse_bridge_plans(&[outbound])
             .expect_err("XHTTP HTTP/1.1 must fail closed");
-        assert!(error.to_string().contains("only TLS ALPN h2"), "{error}");
+        assert!(
+            error.to_string().contains("single TLS ALPN h2 or h3"),
+            "{error}"
+        );
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn plan_accepts_xhttp_packet_up_with_tls_h2() {
         let item: OutboundItem = serde_json::from_value(serde_json::json!({

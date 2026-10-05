@@ -2,6 +2,7 @@ use std::io;
 
 use aws_lc_rs::{
     agreement,
+    kem::{DecapsulationKey, ML_KEM_768},
     rand::{SecureRandom, SystemRandom},
 };
 
@@ -11,7 +12,8 @@ use crate::reality::reality_auth::{
 };
 use crate::reality::reality_cipher_suite::DEFAULT_CIPHER_SUITES;
 use crate::reality::reality_tls13_messages::{
-    DEFAULT_ALPN_PROTOCOLS, construct_client_hello, write_record_header,
+    DEFAULT_ALPN_PROTOCOLS, construct_client_hello_with_key_shares,
+    write_record_header,
 };
 
 const XRAY_COMPAT_CLIENT_VERSION: [u8; 3] = [26, 7, 28];
@@ -77,10 +79,30 @@ pub(super) fn generate_client_hello(
     };
     let cipher_suite_ids: Vec<u16> =
         cipher_suites.iter().map(|suite| suite.id()).collect();
-    let mut client_hello = construct_client_hello(
+    let mlkem_decapsulation_key = DecapsulationKey::generate(&ML_KEM_768)
+        .map_err(|_| io::Error::other("Failed to generate ML-KEM-768 key"))?;
+    let mlkem_encapsulation_key = mlkem_decapsulation_key
+        .encapsulation_key()
+        .map_err(|_| io::Error::other("Failed to derive ML-KEM-768 public key"))?;
+    let mlkem_public_key = mlkem_encapsulation_key
+        .key_bytes()
+        .map_err(|_| io::Error::other("Failed to encode ML-KEM-768 public key"))?;
+    let x25519_public_key: [u8; 32] = our_public_key_bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| io::Error::other("X25519 public key has an invalid length"))?;
+    let mut hybrid_key_share =
+        Vec::with_capacity(mlkem_public_key.as_ref().len() + 32);
+    hybrid_key_share.extend_from_slice(mlkem_public_key.as_ref());
+    hybrid_key_share.extend_from_slice(&x25519_public_key);
+    let client_key_shares = [
+        (0x11ec, hybrid_key_share.as_slice()), // X25519MLKEM768
+        (0x001d, x25519_public_key.as_slice()), // X25519 fallback share
+    ];
+    let mut client_hello = construct_client_hello_with_key_shares(
         &client_random,
         &session_id_for_hello,
-        our_public_key_bytes.as_ref(),
+        &client_key_shares,
         &conn.config.server_name,
         &cipher_suite_ids,
         DEFAULT_ALPN_PROTOCOLS,
@@ -129,6 +151,7 @@ pub(super) fn generate_client_hello(
         client_hello_bytes: client_hello.clone(), // Save the actual ClientHello bytes
         client_private_key: our_private_bytes,
         auth_key, // Save auth_key for HMAC certificate verification
+        mlkem_decapsulation_key: Some(mlkem_decapsulation_key),
     };
 
     tracing::debug!(

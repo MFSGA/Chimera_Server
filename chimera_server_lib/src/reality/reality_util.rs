@@ -7,6 +7,22 @@ use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
 use super::buf_reader::BufReader;
 use super::reality_cipher_suite::CipherSuite;
 
+/// The TLS 1.3 key share selected by the server.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerKeyShare {
+    X25519 {
+        public_key: [u8; 32],
+    },
+    X25519MlKem768 {
+        ciphertext: Vec<u8>,
+        x25519_public_key: [u8; 32],
+    },
+}
+
+const X25519_GROUP: u16 = 0x001d;
+const X25519_MLKEM768_GROUP: u16 = 0x11ec;
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+
 /// Decodes a base64url-encoded public key
 pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
     let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {
@@ -281,13 +297,10 @@ fn parse_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
     ))
 }
 
-/// Extract server's X25519 public key from ServerHello message
-///
-/// This parses the TLS 1.3 ServerHello to find the KeyShare extension
-/// and extracts the X25519 public key (group 0x001d).
-pub fn extract_server_public_key(
+/// Extract the selected X25519 or X25519MLKEM768 key share from ServerHello.
+pub fn extract_server_key_share(
     server_hello: &[u8],
-) -> Result<[u8; 32], std::io::Error> {
+) -> Result<ServerKeyShare, std::io::Error> {
     const TLS_HEADER_LEN: usize = 5;
 
     if server_hello.len() < TLS_HEADER_LEN {
@@ -341,7 +354,9 @@ pub fn extract_server_public_key(
 }
 
 /// Parses the ServerHello KeyShare extension to extract X25519 public key
-fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Error> {
+fn parse_server_keyshare_extension(
+    data: &[u8],
+) -> Result<ServerKeyShare, std::io::Error> {
     let mut reader = BufReader::new(data);
 
     // ServerHello KeyShare extension format:
@@ -352,7 +367,7 @@ fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Err
     let group = reader.read_u16_be()?;
     let key_len = reader.read_u16_be()? as usize;
 
-    if group == 29 {
+    if group == X25519_GROUP {
         // X25519
         if key_len != 32 {
             return Err(std::io::Error::new(
@@ -364,12 +379,32 @@ fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Err
         let key_bytes = reader.read_slice(32)?;
         let mut key = [0u8; 32];
         key.copy_from_slice(key_bytes);
-        return Ok(key);
+        return Ok(ServerKeyShare::X25519 { public_key: key });
+    }
+
+    if group == X25519_MLKEM768_GROUP {
+        let expected_len = MLKEM768_CIPHERTEXT_LEN + 32;
+        if key_len != expected_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid X25519MLKEM768 key length: {key_len} (expected {expected_len})"
+                ),
+            ));
+        }
+
+        let key_bytes = reader.read_slice(key_len)?;
+        let mut x25519_public_key = [0u8; 32];
+        x25519_public_key.copy_from_slice(&key_bytes[MLKEM768_CIPHERTEXT_LEN..]);
+        return Ok(ServerKeyShare::X25519MlKem768 {
+            ciphertext: key_bytes[..MLKEM768_CIPHERTEXT_LEN].to_vec(),
+            x25519_public_key,
+        });
     }
 
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "X25519 key share not found in ServerHello KeyShare extension",
+        "unsupported key share in ServerHello KeyShare extension",
     ))
 }
 
@@ -575,6 +610,40 @@ mod tests {
 
         let cipher_suite = extract_server_cipher_suite(&record).unwrap();
         assert_eq!(cipher_suite, 0x1303);
+    }
+
+    #[test]
+    fn server_keyshare_parser_accepts_x25519_mlkem768() {
+        let ciphertext = vec![0x33; MLKEM768_CIPHERTEXT_LEN];
+        let x25519_public_key = [0x44; 32];
+        let mut key_share = Vec::with_capacity(4 + ciphertext.len() + 32);
+        key_share.extend_from_slice(&X25519_MLKEM768_GROUP.to_be_bytes());
+        key_share.extend_from_slice(&((ciphertext.len() + 32) as u16).to_be_bytes());
+        key_share.extend_from_slice(&ciphertext);
+        key_share.extend_from_slice(&x25519_public_key);
+
+        assert_eq!(
+            parse_server_keyshare_extension(&key_share).unwrap(),
+            ServerKeyShare::X25519MlKem768 {
+                ciphertext,
+                x25519_public_key,
+            }
+        );
+    }
+
+    #[test]
+    fn server_keyshare_parser_rejects_malformed_x25519_mlkem768_length() {
+        let mut key_share = Vec::new();
+        key_share.extend_from_slice(&X25519_MLKEM768_GROUP.to_be_bytes());
+        key_share.extend_from_slice(&4u16.to_be_bytes());
+        key_share.extend_from_slice(&[0; 4]);
+
+        let error = parse_server_keyshare_extension(&key_share).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid X25519MLKEM768 key length")
+        );
     }
 
     #[test]

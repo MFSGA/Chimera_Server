@@ -372,7 +372,7 @@ pub(super) async fn drive_udp_datagrams(
             #[cfg(feature = "vless-reverse")]
             DirectOutboundAction::VlessReverse { tag } => {
                 warn!(
-                    "hysteria2 UDP cannot use TCP-only VLESS Reverse outbound {tag}"
+                    "VLESS Reverse outbound {tag} is not supported for Hysteria2 UDP sessions"
                 );
                 continue;
             }

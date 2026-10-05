@@ -3,6 +3,8 @@ mod process;
 
 use std::io::{self, Read, Write};
 
+use aws_lc_rs::kem::DecapsulationKey;
+
 use super::reality_aead::AeadKey;
 use super::reality_cipher_suite::CipherSuite;
 use super::reality_io_state::RealityIoState;
@@ -37,6 +39,7 @@ enum HandshakeState {
         client_hello_bytes: Vec<u8>, // Full ClientHello handshake message
         client_private_key: [u8; 32],
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
+        mlkem_decapsulation_key: Option<DecapsulationKey>,
     },
     /// ServerHello received, processing encrypted handshake messages
     ProcessingHandshake {
@@ -96,6 +99,7 @@ impl RealityClientConnection {
                 client_hello_bytes: Vec::new(),
                 client_private_key: [0u8; 32],
                 auth_key: [0u8; 32],
+                mlkem_decapsulation_key: None,
             },
             app_read_key: None,
             app_read_iv: None,

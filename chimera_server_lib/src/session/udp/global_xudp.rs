@@ -14,9 +14,14 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, warn};
 
+#[cfg(feature = "vless-reverse")]
+use crate::handler::vless_reverse::mux_frame::{Destination, TargetNetwork};
+#[cfg(feature = "vless-reverse")]
+use crate::runtime::DataPlaneRuntime;
 #[cfg(feature = "trojan")]
 use crate::runtime::OutboundSummary;
 use crate::{
+    address::NetLocation,
     traffic::{TrafficContext, record_transfer},
     xudp_registry::{XUDP_GLOBAL_REATTACH_TTL, XudpGlobalRegistry},
 };
@@ -32,6 +37,8 @@ pub(crate) enum GlobalUdpWorkerKey {
         target_is_ipv6: bool,
         outbound_tag: Option<String>,
     },
+    #[cfg(feature = "vless-reverse")]
+    Reverse { tag: String },
     #[cfg(feature = "trojan")]
     Trojan { outbound: OutboundSummary },
 }
@@ -52,6 +59,13 @@ pub(crate) enum GlobalUdpBackendStart {
     Trojan {
         outbound: Box<OutboundSummary>,
     },
+    #[cfg(feature = "vless-reverse")]
+    Reverse {
+        runtime: DataPlaneRuntime,
+        tag: String,
+        source: SocketAddr,
+        local: Option<SocketAddr>,
+    },
 }
 
 impl GlobalUdpBackendStart {
@@ -62,6 +76,10 @@ impl GlobalUdpBackendStart {
             Self::Trojan { outbound } => GlobalUdpWorkerKey::Trojan {
                 outbound: outbound.as_ref().clone(),
             },
+            #[cfg(feature = "vless-reverse")]
+            Self::Reverse { tag, .. } => {
+                GlobalUdpWorkerKey::Reverse { tag: tag.clone() }
+            }
         }
     }
 }
@@ -71,6 +89,7 @@ pub(crate) struct GlobalSessionUdpAttachStart {
     pub(crate) session_id: u16,
     pub(crate) generation: u64,
     pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) route_target: NetLocation,
     pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
     pub(crate) traffic_context: Option<TrafficContext>,
     pub(crate) idle_timeout: Duration,
@@ -237,6 +256,7 @@ pub(crate) async fn attach_global_session_udp_session(
         session_id,
         generation,
         key,
+        route_target,
         response_sender,
         traffic_context,
         idle_timeout,
@@ -377,7 +397,9 @@ pub(crate) async fn attach_global_session_udp_session(
 
     Ok(SessionUdpWorker {
         key,
+        route_target,
         global_id: Some(global_id),
+        global_backend_key: Some(worker_key),
         generation,
         sender: SessionUdpSender::Global {
             sender,
@@ -437,13 +459,31 @@ pub(crate) async fn start_global_session_udp_worker(
     idle_timeout: Duration,
     backend_start: GlobalUdpBackendStart,
 ) -> std::io::Result<GlobalSessionUdpWorker> {
-    let bind_addr = match backend_start {
+    let bind_addr = match &backend_start {
         GlobalUdpBackendStart::Direct => {
             if target_addr.is_ipv6() {
                 SocketAddr::from(([0u16; 8], 0))
             } else {
                 SocketAddr::from(([0, 0, 0, 0], 0))
             }
+        }
+        #[cfg(feature = "vless-reverse")]
+        GlobalUdpBackendStart::Reverse {
+            runtime,
+            tag,
+            source,
+            local,
+        } => {
+            return start_global_reverse_udp_worker(
+                key,
+                target_addr,
+                idle_timeout,
+                runtime.clone(),
+                tag.clone(),
+                *source,
+                *local,
+            )
+            .await;
         }
         #[cfg(feature = "trojan")]
         GlobalUdpBackendStart::Trojan { .. } => {
@@ -622,6 +662,184 @@ pub(crate) async fn start_global_session_udp_worker(
 
     Ok(GlobalSessionUdpWorker {
         key: worker_key,
+        sender,
+        attachment,
+        attachment_notify,
+        task,
+    })
+}
+
+#[cfg(feature = "vless-reverse")]
+async fn start_global_reverse_udp_worker(
+    key: GlobalUdpWorkerKey,
+    target_addr: SocketAddr,
+    idle_timeout: Duration,
+    runtime: DataPlaneRuntime,
+    tag: String,
+    source: SocketAddr,
+    local: Option<SocketAddr>,
+) -> std::io::Result<GlobalSessionUdpWorker> {
+    let mut session = runtime.open_reverse_udp(
+        &tag,
+        NetLocation::from_ip_addr(target_addr.ip(), target_addr.port()),
+        source,
+        local,
+    )?;
+    let (sender, mut receiver) =
+        mpsc::channel::<GlobalUdpPayload>(UDP_SESSION_CHANNEL_CAPACITY);
+    let attachment = Arc::new(RwLock::new(None::<GlobalUdpAttachment>));
+    let attachment_notify = Arc::new(Notify::new());
+    let task_attachment = attachment.clone();
+    let task_attachment_notify = attachment_notify.clone();
+
+    let task = tokio::spawn(async move {
+        let mut last_target = target_addr;
+        let mut pending_responses =
+            VecDeque::<PendingGlobalUdpResponse>::with_capacity(
+                UDP_SESSION_CHANNEL_CAPACITY,
+            );
+        let mut idle = Box::pin(sleep(idle_timeout));
+        let has_error = loop {
+            while let Some(pending) = pending_responses.pop_front() {
+                match forward_global_udp_response(&task_attachment, pending).await {
+                    Ok(()) => idle.as_mut().reset(Instant::now() + idle_timeout),
+                    Err((pending, failed_token)) => {
+                        pending_responses.push_front(pending);
+                        if let Some(failed_token) = failed_token {
+                            clear_global_attachment_if_current(
+                                &task_attachment,
+                                failed_token,
+                            )
+                            .await;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let attachment_present = task_attachment.read().await.is_some();
+            let pause_reverse_receive = should_pause_global_udp_receive(
+                attachment_present,
+                pending_responses.len(),
+                UDP_SESSION_CHANNEL_CAPACITY,
+            );
+            tokio::select! {
+                _ = idle.as_mut() => break false,
+                _ = task_attachment_notify.notified() => continue,
+                request = receiver.recv() => {
+                    let Some(request) = request else {
+                        break false;
+                    };
+                    let current = match plan_global_udp_payload(
+                        task_attachment.read().await.clone(),
+                        request.attachment_token,
+                    ) {
+                        GlobalUdpPayloadPlan::Send(current) => current,
+                        GlobalUdpPayloadPlan::RejectDetached => {
+                            let _ = request.completion.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "XUDP GlobalID attachment is detached",
+                            )));
+                            continue;
+                        }
+                        GlobalUdpPayloadPlan::RejectStale { current_token } => {
+                            debug!(
+                                "dropping stale XUDP GlobalID payload token {} (current {})",
+                                request.attachment_token, current_token,
+                            );
+                            let _ = request.completion.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "XUDP GlobalID attachment token is stale",
+                            )));
+                            continue;
+                        }
+                    };
+                    let target = NetLocation::from_ip_addr(
+                        request.target_addr.ip(),
+                        request.target_addr.port(),
+                    );
+                    let payload_length = request.payload.len();
+                    match session.send(
+                        bytes::Bytes::from(request.payload),
+                        Some(Destination {
+                            network: TargetNetwork::Udp,
+                            location: target,
+                        }),
+                    ).await {
+                        Ok(()) => {
+                            last_target = request.target_addr;
+                            record_transfer(
+                                current.traffic_context.clone(),
+                                payload_length as u64,
+                                0,
+                            );
+                            let _ = request.completion.send(Ok(()));
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                        Err(error) => {
+                            debug!("VLESS Reverse GlobalID UDP write failed: {}", error);
+                            let completion_error = std::io::Error::new(
+                                error.kind(),
+                                error.to_string(),
+                            );
+                            let _ = request.completion.send(Err(completion_error));
+                            break true;
+                        }
+                    }
+                }
+                response = session.recv(), if !pause_reverse_receive => {
+                    let (payload, source_override) = match response {
+                        Ok(Some(response)) => response,
+                        Ok(None) => break false,
+                        Err(error) => {
+                            debug!("VLESS Reverse GlobalID UDP receive failed: {}", error);
+                            break true;
+                        }
+                    };
+                    let source = source_override
+                        .as_ref()
+                        .and_then(|target| target.location.to_socket_addr_nonblocking())
+                        .unwrap_or(last_target);
+                    let pending = PendingGlobalUdpResponse {
+                        source,
+                        payload: payload.to_vec(),
+                    };
+                    match forward_global_udp_response(&task_attachment, pending).await {
+                        Ok(()) => idle.as_mut().reset(Instant::now() + idle_timeout),
+                        Err((pending, failed_token)) => {
+                            if pending_responses.len() < UDP_SESSION_CHANNEL_CAPACITY {
+                                pending_responses.push_back(pending);
+                            }
+                            if let Some(failed_token) = failed_token {
+                                clear_global_attachment_if_current(
+                                    &task_attachment,
+                                    failed_token,
+                                ).await;
+                            }
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Err(error) = session.close().await {
+            debug!("VLESS Reverse GlobalID UDP close failed: {}", error);
+        }
+        if let Some(current) = task_attachment.read().await.clone() {
+            let _ = current
+                .response_sender
+                .send(SessionUdpEvent::End {
+                    session_id: current.session_id,
+                    generation: current.generation,
+                    has_error,
+                })
+                .await;
+        }
+    });
+
+    Ok(GlobalSessionUdpWorker {
+        key,
         sender,
         attachment,
         attachment_notify,

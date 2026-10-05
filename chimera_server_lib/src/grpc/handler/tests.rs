@@ -213,6 +213,40 @@ fn handler_preserves_freedom_proxy_protocol() {
 }
 
 #[test]
+fn handler_validates_freedom_final_rules_before_publishing_outbound() {
+    let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
+    let outbound = service
+        .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+            tag: "freedom-rule".to_string(),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_FREEDOM_CONFIG.to_string(),
+                // Xray Freedom.Config.final_rules = field 8; one Block rule.
+                value: vec![0x42, 0x02, 0x08, 0x01],
+            }),
+            ..proto::xray::core::OutboundHandlerConfig::default()
+        })
+        .expect("literal Freedom finalRules should be accepted");
+    assert_eq!(
+        outbound.proxy_settings_value.as_deref(),
+        Some([0x42, 0x02, 0x08, 0x01].as_slice())
+    );
+
+    let error = service
+        .parse_add_outbound(proto::xray::core::OutboundHandlerConfig {
+            tag: "freedom-delay".to_string(),
+            proxy_settings: Some(proto::xray::common::serial::TypedMessage {
+                r#type: TYPE_PROXY_FREEDOM_CONFIG.to_string(),
+                // Same Block rule with a present FinalRuleConfig.block_delay.
+                value: vec![0x42, 0x04, 0x08, 0x01, 0x2a, 0x00],
+            }),
+            ..proto::xray::core::OutboundHandlerConfig::default()
+        })
+        .expect_err("unsupported blockDelay must fail before publication");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("blockDelay"));
+}
+
+#[test]
 fn handler_accepts_executable_socks_outbound() {
     let service = HandlerServiceImpl::new(RuntimeState::new(Vec::new(), Vec::new()));
     let config = SocksClientConfigPayload {

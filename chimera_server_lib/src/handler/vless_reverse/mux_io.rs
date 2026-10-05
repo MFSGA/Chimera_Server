@@ -9,7 +9,7 @@ use super::mux_frame::FrameMetadata;
 
 const MAX_MUX_PAYLOAD_LENGTH: usize = u16::MAX as usize;
 // Xray common/buf.Size. PacketReader rejects a single UDP packet above this size.
-const XRAY_PACKET_BUFFER_SIZE: usize = 8 * 1024;
+pub(crate) const XRAY_MUX_UDP_PACKET_SIZE: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MuxFrame {
@@ -112,11 +112,10 @@ fn validate_packet_payload(
     payload_length: usize,
     error_kind: std::io::ErrorKind,
 ) -> std::io::Result<()> {
-    let is_packet_new = metadata.status == super::mux_frame::SessionStatus::New
-        && metadata.target.as_ref().is_some_and(|target| {
-            target.network == super::mux_frame::TargetNetwork::Udp
-        });
-    if is_packet_new && payload_length > XRAY_PACKET_BUFFER_SIZE {
+    let is_udp_packet = metadata.target.as_ref().is_some_and(|target| {
+        target.network == super::mux_frame::TargetNetwork::Udp
+    });
+    if is_udp_packet && payload_length > XRAY_MUX_UDP_PACKET_SIZE {
         return Err(std::io::Error::new(
             error_kind,
             format!("Xray Mux UDP packet size too large: {payload_length}"),
@@ -142,6 +141,13 @@ mod tests {
         Destination {
             network: TargetNetwork::Tcp,
             location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 8080),
+        }
+    }
+
+    fn udp_target() -> Destination {
+        Destination {
+            network: TargetNetwork::Udp,
+            location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53),
         }
     }
 
@@ -250,22 +256,53 @@ mod tests {
                 session_id: 9,
                 status: SessionStatus::New,
                 option: FrameOption::default().with_data(),
-                target: Some(Destination {
-                    network: TargetNetwork::Udp,
-                    location: NetLocation::new(
-                        Address::Ipv4(Ipv4Addr::LOCALHOST),
-                        53,
-                    ),
-                }),
+                target: Some(udp_target()),
                 source: None,
                 local: None,
                 global_id: None,
             },
-            payload: Bytes::from(vec![0; XRAY_PACKET_BUFFER_SIZE + 1]),
+            payload: Bytes::from(vec![0; XRAY_MUX_UDP_PACKET_SIZE + 1]),
         })
         .expect_err("Xray PacketReader rejects packets above common/buf.Size");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("8193"));
+    }
+
+    #[test]
+    fn udp_keep_with_target_rejects_packet_larger_than_xray_buffer() {
+        let error = encode_frame(&MuxFrame {
+            metadata: FrameMetadata {
+                session_id: 10,
+                status: SessionStatus::Keep,
+                option: FrameOption::default().with_data(),
+                target: Some(udp_target()),
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::from(vec![0; XRAY_MUX_UDP_PACKET_SIZE + 1]),
+        })
+        .expect_err("Xray UDP Keep packets are subject to the same size bound");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("8193"));
+    }
+
+    #[test]
+    fn tcp_keep_payload_above_udp_buffer_limit_is_allowed() {
+        let frame = MuxFrame {
+            metadata: FrameMetadata {
+                session_id: 11,
+                status: SessionStatus::Keep,
+                option: FrameOption::default().with_data(),
+                target: None,
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::from(vec![0; XRAY_MUX_UDP_PACKET_SIZE + 1]),
+        };
+        encode_frame(&frame)
+            .expect("TCP payload is not subject to the UDP packet limit");
     }
 
     #[test]

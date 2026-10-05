@@ -22,6 +22,7 @@ pub(crate) struct VlessUdpStream {
     pending_write: Vec<u8>,
     pending_write_offset: usize,
     response_header_pending: bool,
+    response_header_offset: usize,
 }
 
 impl std::fmt::Debug for VlessUdpStream {
@@ -34,6 +35,7 @@ impl std::fmt::Debug for VlessUdpStream {
             .field("pending_write_len", &self.pending_write.len())
             .field("pending_write_offset", &self.pending_write_offset)
             .field("response_header_pending", &self.response_header_pending)
+            .field("response_header_offset", &self.response_header_offset)
             .finish()
     }
 }
@@ -49,6 +51,44 @@ impl VlessUdpStream {
             pending_write: Vec::new(),
             pending_write_offset: 0,
             response_header_pending: true,
+            response_header_offset: 0,
+        }
+    }
+
+    fn poll_response_header(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        while self.response_header_pending
+            && self.response_header_offset < RESPONSE_HEADER.len()
+        {
+            match Pin::new(&mut self.stream)
+                .poll_write(cx, &RESPONSE_HEADER[self.response_header_offset..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "VLESS UDP stream closed while writing response header",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => self.response_header_offset += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        if self.response_header_pending {
+            match Pin::new(&mut self.stream).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.response_header_pending = false;
+                    self.response_header_offset = 0;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -87,6 +127,12 @@ impl AsyncReadMessage for VlessUdpStream {
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+
+        match this.poll_response_header(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         loop {
             if this.read_payload.is_empty() {
@@ -344,6 +390,41 @@ mod tests {
             .await
             .expect("read second packet");
         assert_eq!(&buffer[..second], b"two");
+    }
+
+    #[tokio::test]
+    async fn sends_response_header_before_waiting_for_first_datagram() {
+        let (mut client, server) = duplex(128);
+        let mut stream = VlessUdpStream::new(Box::new(TestStream(server)));
+        let read_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 16];
+            let length = read_message(&mut stream, &mut buffer)
+                .await
+                .expect("read first VLESS UDP packet");
+            buffer[..length].to_vec()
+        });
+
+        let mut response_header = [0u8; 2];
+        timeout(
+            Duration::from_secs(1),
+            client.read_exact(&mut response_header),
+        )
+        .await
+        .expect("VLESS response header must not wait for a UDP payload")
+        .expect("read VLESS response header");
+        assert_eq!(response_header, RESPONSE_HEADER);
+
+        client
+            .write_all(&[0, 4, b'p', b'i', b'n', b'g'])
+            .await
+            .expect("write first VLESS UDP packet");
+        assert_eq!(
+            timeout(Duration::from_secs(1), read_task)
+                .await
+                .expect("VLESS UDP stream did not read the packet")
+                .expect("VLESS UDP read task panicked"),
+            b"ping"
+        );
     }
 
     #[tokio::test]

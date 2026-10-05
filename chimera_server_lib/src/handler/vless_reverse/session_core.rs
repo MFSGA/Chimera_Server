@@ -7,9 +7,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use tokio::task::JoinHandle;
+
 use super::control::ControlState;
 
 const XRAY_PORTAL_DRAIN_AFTER_TOTAL_CONNECTIONS: u32 = 256;
+
+pub(crate) fn track_task(tasks: &Mutex<Vec<JoinHandle<()>>>, task: JoinHandle<()>) {
+    let mut tasks = tasks.lock().expect("Reverse task lock poisoned");
+    tasks.retain(|tracked| !tracked.is_finished());
+    tasks.push(task);
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionLimits {
@@ -285,6 +293,32 @@ impl WorkerPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_task_handles_are_reaped_when_new_tasks_are_tracked() {
+        let tasks = Mutex::new(Vec::new());
+
+        for _ in 0..512 {
+            track_task(&tasks, tokio::spawn(async {}));
+            loop {
+                if tasks
+                    .lock()
+                    .expect("Reverse task lock poisoned")
+                    .last()
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        assert_eq!(
+            tasks.lock().expect("Reverse task lock poisoned").len(),
+            1,
+            "completed task handles do not grow with cumulative sessions"
+        );
+    }
 
     #[test]
     fn session_manager_enforces_concurrency_and_reuses_released_capacity() {

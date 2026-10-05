@@ -892,7 +892,9 @@ async fn session_udp_response_requires_current_generation() {
                 target_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
                 outbound_tag: None,
             },
+            route_target: NetLocation::from_ip_addr(Ipv4Addr::LOCALHOST.into(), 53),
             global_id: None,
+            global_backend_key: None,
             generation: 2,
             sender: SessionUdpSender::Local(sender),
             task: Some(LocalSessionUdpTask {
@@ -1924,7 +1926,9 @@ async fn removing_session_udp_worker_waits_for_cancelled_task() {
                 target_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 53)),
                 outbound_tag: None,
             },
+            route_target: NetLocation::from_ip_addr(Ipv4Addr::LOCALHOST.into(), 53),
             global_id: None,
+            global_backend_key: None,
             generation: 1,
             sender: SessionUdpSender::Local(sender),
             task: Some(LocalSessionUdpTask {
@@ -2049,7 +2053,10 @@ async fn multi_directional_udp_relays_trojan_packets() {
         tokio::spawn(crate::session::udp::run_multi_directional_udp_with_tasks(
             Box::new(TrojanUdpStream::new(Box::new(TestStream(server)))),
             Arc::new(NativeResolver::new()),
-            runtime_with_outbounds(vec![outbound("direct", "freedom")]).data_plane(),
+            runtime_with_outbounds(vec![
+                crate::outbound::freedom_outbound_allow_loopback("direct"),
+            ])
+            .data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 32000)),
             None,
             Some(
@@ -2412,7 +2419,10 @@ async fn bidirectional_udp_relay_preserves_message_boundaries() {
         Box::new(relay_socket),
         NetLocation::from_ip_addr(echo_addr.ip(), echo_addr.port()),
         Arc::new(NativeResolver::new()),
-        runtime_with_outbounds(Vec::new()).data_plane(),
+        runtime_with_outbounds(vec![
+            crate::outbound::freedom_outbound_allow_loopback("direct"),
+        ])
+        .data_plane(),
         client_addr,
         None,
         Some(
@@ -2538,7 +2548,9 @@ async fn shadowsocks_udp_packet_stays_owned_after_listener_stop() {
         .local_addr()
         .expect("Shadowsocks UDP target address");
     let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
-    let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
+    let runtime = runtime_with_outbounds(vec![
+        crate::outbound::freedom_outbound_allow_loopback("direct"),
+    ]);
     let user = ShadowsocksUser {
         method: "xchacha20-poly1305".to_string(),
         password: "password".to_string(),
@@ -3005,6 +3017,40 @@ async fn udp_routing_selects_blackhole_outbound() {
 }
 
 #[tokio::test]
+async fn dokodemo_udp_applies_freedom_final_rules_to_resolved_target() {
+    let runtime = runtime_with_outbounds(vec![
+        crate::outbound::freedom_outbound_with_final_rules(
+            "direct",
+            serde_json::json!([{
+                "action": "block",
+                "network": "udp",
+                "port": "53",
+                "ip": "198.51.100.0/24"
+            }]),
+        ),
+    ]);
+    let target = SocketAddr::from(([198, 51, 100, 9], 53));
+
+    let action = select_udp_outbound(
+        &runtime.data_plane(),
+        "dokodemo-udp",
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
+        None,
+        target,
+        &NetLocation::from_ip_addr(target.ip(), target.port()),
+    )
+    .await
+    .expect("Freedom finalRules should evaluate the fixed UDP target");
+
+    assert_eq!(
+        action,
+        UdpOutboundAction::Blackhole {
+            tag: crate::outbound::FREEDOM_FINAL_RULES_BLACKHOLE_TAG.into()
+        }
+    );
+}
+
+#[tokio::test]
 async fn udp_routing_rejects_user_domain_policy_before_outbound_selection() {
     let runtime = runtime_with_outbounds(vec![outbound("direct", "freedom")]);
     runtime
@@ -3140,6 +3186,30 @@ async fn udp_routing_defaults_to_first_outbound() {
         action,
         UdpOutboundAction::Freedom {
             tag: Some("direct".into())
+        }
+    );
+}
+
+#[cfg(feature = "vless")]
+#[tokio::test]
+async fn dokodemo_udp_routing_selects_vless_outbound() {
+    let runtime = runtime_with_outbounds(vec![outbound("to-hub", "vless")]);
+
+    let action = select_udp_outbound(
+        &runtime.data_plane(),
+        "tun-gateway",
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
+        None,
+        SocketAddr::from((Ipv4Addr::new(10, 44, 0, 20), 53)),
+        &NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 44, 0, 20)), 53),
+    )
+    .await
+    .expect("Dokodemo UDP should select the standard VLESS outbound");
+
+    assert_eq!(
+        action,
+        UdpOutboundAction::Vless {
+            outbound: outbound("to-hub", "vless")
         }
     );
 }

@@ -30,6 +30,7 @@ use super::{
         Destination, FrameMetadata, FrameOption, SessionStatus, TargetNetwork,
     },
     mux_io::{MuxFrame, encode_frame, read_frame_with_source_and_local},
+    session_core::track_task,
 };
 
 const OUTBOUND_FRAME_CAPACITY: usize = 16;
@@ -44,6 +45,7 @@ enum InboundEvent {
         payload: Bytes,
         target: Option<NetLocation>,
     },
+    HalfClose,
     End,
 }
 
@@ -68,6 +70,7 @@ pub(crate) struct BridgeDispatchContext {
     pub(crate) routing_user: String,
     pub(crate) policy_identity: String,
     pub(crate) user_level: u32,
+    pub(crate) site_to_site: Option<super::site_policy::SiteToSitePolicy>,
 }
 
 type SessionRoutes = Arc<Mutex<HashMap<u16, mpsc::Sender<InboundEvent>>>>;
@@ -251,6 +254,9 @@ async fn run_physical_reader<R>(
         }
 
         let session_id = frame.metadata.session_id;
+        let frame_status = frame.metadata.status;
+        let has_data = frame.metadata.option.has_data();
+        let half_close = frame.metadata.option.has_half_close();
         let result = match frame.metadata.status {
             SessionStatus::New => {
                 handle_new_tcp(
@@ -268,8 +274,17 @@ async fn run_physical_reader<R>(
             }
             SessionStatus::Keep => forward_keep(frame, &sessions, &outbound).await,
             SessionStatus::End => {
-                end_session(frame.metadata.session_id, &sessions).await;
-                Ok(())
+                if frame.metadata.option.has_half_close() {
+                    half_close_session(
+                        frame.metadata.session_id,
+                        &sessions,
+                        &outbound,
+                    )
+                    .await
+                } else {
+                    end_session(frame.metadata.session_id, &sessions).await;
+                    Ok(())
+                }
             }
             SessionStatus::KeepAlive => Ok(()),
         };
@@ -277,6 +292,9 @@ async fn run_physical_reader<R>(
             debug!(
                 reverse_tag = %reverse_tag,
                 session_id,
+                status = ?frame_status,
+                has_data,
+                half_close,
                 error = %error,
                 "VLESS Reverse Bridge failed to handle Mux session frame"
             );
@@ -349,8 +367,26 @@ async fn handle_new_tcp(
         .local
         .as_ref()
         .and_then(destination_socket_addr);
+    let target = if let Some(policy) = context.site_to_site.as_ref() {
+        match policy.map_tcp_target(&target.location) {
+            Ok(target) => target,
+            Err(_) => {
+                send_end_frame(frame.metadata.session_id, true, &outbound).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        target.location.clone()
+    };
+    debug!(
+        reverse_tag = %reverse_tag,
+        session_id = frame.metadata.session_id,
+        target = %target,
+        initial_payload_bytes = frame.payload.len(),
+        "dispatching VLESS Reverse TCP session"
+    );
     let stream = dispatcher
-        .open_tcp(reverse_tag, target.location.clone(), source, local, context)
+        .open_tcp(reverse_tag, target, source, local, context)
         .await?;
 
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_FRAME_CAPACITY);
@@ -368,10 +404,7 @@ async fn handle_new_tcp(
         sessions,
         cancellation,
     ));
-    tasks
-        .lock()
-        .expect("Reverse Bridge task lock poisoned")
-        .push(task);
+    track_task(&tasks, task);
     Ok(())
 }
 
@@ -393,6 +426,13 @@ async fn handle_new_udp(
             "Reverse Mux UDP NEW frame is missing its target",
         )
     })?;
+    let site_to_site = context.site_to_site.clone();
+    if let Some(policy) = site_to_site.as_ref()
+        && policy.map_udp_target(&target.location).is_err()
+    {
+        send_end_frame(frame.metadata.session_id, true, &outbound).await?;
+        return Ok(());
+    }
     if sessions
         .lock()
         .expect("Reverse Bridge routes lock poisoned")
@@ -435,11 +475,9 @@ async fn handle_new_udp(
         outbound,
         sessions,
         cancellation,
+        site_to_site,
     ));
-    tasks
-        .lock()
-        .expect("Reverse Bridge task lock poisoned")
-        .push(task);
+    track_task(&tasks, task);
     Ok(())
 }
 
@@ -453,23 +491,39 @@ async fn run_udp_session(
     outbound: mpsc::Sender<Bytes>,
     sessions: SessionRoutes,
     cancellation: CancellationToken,
+    site_to_site: Option<super::site_policy::SiteToSitePolicy>,
 ) {
-    if !initial_payload.is_empty()
-        && session
+    if !initial_payload.is_empty() {
+        let request_target = match site_to_site.as_ref() {
+            Some(policy) => match policy.map_udp_target(&target) {
+                Ok(target) => target,
+                Err(_) => {
+                    let _ = send_end_frame(session_id, true, &outbound).await;
+                    sessions
+                        .lock()
+                        .expect("Reverse Bridge routes lock poisoned")
+                        .remove(&session_id);
+                    return;
+                }
+            },
+            None => target.clone(),
+        };
+        if session
             .requests
             .send(BridgeUdpRequest {
                 payload: initial_payload,
-                target: target.clone(),
+                target: request_target,
             })
             .await
             .is_err()
-    {
-        let _ = send_end_frame(session_id, true, &outbound).await;
-        sessions
-            .lock()
-            .expect("Reverse Bridge routes lock poisoned")
-            .remove(&session_id);
-        return;
+        {
+            let _ = send_end_frame(session_id, true, &outbound).await;
+            sessions
+                .lock()
+                .expect("Reverse Bridge routes lock poisoned")
+                .remove(&session_id);
+            return;
+        }
     }
 
     loop {
@@ -482,11 +536,21 @@ async fn run_udp_session(
                         if let Some(override_target) = override_target {
                             target = override_target;
                         }
+                        let request_target = match site_to_site.as_ref() {
+                            Some(policy) => match policy.map_udp_target(&target) {
+                                Ok(target) => target,
+                                Err(_) => {
+                                    let _ = send_end_frame(session_id, true, &outbound).await;
+                                    break;
+                                }
+                            },
+                            None => target.clone(),
+                        };
                         if session
                             .requests
                             .send(BridgeUdpRequest {
                                 payload,
-                                target: target.clone(),
+                                target: request_target,
                             })
                             .await
                             .is_err()
@@ -495,7 +559,7 @@ async fn run_udp_session(
                             break;
                         }
                     }
-                    Some(InboundEvent::End) | None => break,
+                    Some(InboundEvent::HalfClose | InboundEvent::End) | None => break,
                 }
             }
             response = session.responses.recv() => {
@@ -503,11 +567,21 @@ async fn run_udp_session(
                     let _ = send_end_frame(session_id, false, &outbound).await;
                     break;
                 };
+                let source = match site_to_site.as_ref() {
+                    Some(policy) => match policy.map_response_source(response.source) {
+                        Ok(source) => source,
+                        Err(_) => {
+                            let _ = send_end_frame(session_id, true, &outbound).await;
+                            break;
+                        }
+                    },
+                    None => response.source,
+                };
                 let response_target = Destination {
                     network: TargetNetwork::Udp,
                     location: NetLocation::from_ip_addr(
-                        response.source.ip(),
-                        response.source.port(),
+                        source.ip(),
+                        source.port(),
                     ),
                 };
                 if send_frame(
@@ -578,29 +652,32 @@ async fn forward_keep(
     sessions: &SessionRoutes,
     outbound: &mpsc::Sender<Bytes>,
 ) -> std::io::Result<()> {
+    let session_id = frame.metadata.session_id;
     let route = sessions
         .lock()
         .expect("Reverse Bridge routes lock poisoned")
-        .get(&frame.metadata.session_id)
+        .get(&session_id)
         .cloned();
-    if let Some(route) = route {
-        if frame.metadata.option.has_data() {
-            route
-                .send(InboundEvent::Data {
-                    payload: frame.payload,
-                    target: frame.metadata.target.map(|target| target.location),
-                })
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "Reverse Bridge logical session is closed",
-                    )
-                })?;
+    match route {
+        Some(route) => {
+            if frame.metadata.option.has_data()
+                && route
+                    .send(InboundEvent::Data {
+                        payload: frame.payload,
+                        target: frame.metadata.target.map(|target| target.location),
+                    })
+                    .await
+                    .is_err()
+            {
+                // The per-session task can remove its route after this reader
+                // clones the sender. Close that logical session like Xray does
+                // for a missing KEEP route; keep unrelated Mux sessions alive.
+                return send_end_frame(session_id, false, outbound).await;
+            }
+            Ok(())
         }
-        return Ok(());
+        None => send_end_frame(session_id, false, outbound).await,
     }
-    send_end_frame(frame.metadata.session_id, false, outbound).await
 }
 
 async fn end_session(session_id: u16, sessions: &SessionRoutes) {
@@ -613,6 +690,27 @@ async fn end_session(session_id: u16, sessions: &SessionRoutes) {
     }
 }
 
+async fn half_close_session(
+    session_id: u16,
+    sessions: &SessionRoutes,
+    outbound: &mpsc::Sender<Bytes>,
+) -> std::io::Result<()> {
+    let route = sessions
+        .lock()
+        .expect("Reverse Bridge routes lock poisoned")
+        .get(&session_id)
+        .cloned();
+    if let Some(route) = route
+        && route.send(InboundEvent::HalfClose).await.is_err()
+    {
+        // The task ended between route lookup and delivery. Treat the late
+        // directional close as a per-session close, never a physical-link
+        // failure.
+        return send_end_frame(session_id, false, outbound).await;
+    }
+    Ok(())
+}
+
 async fn run_tcp_session(
     session_id: u16,
     stream: Box<dyn AsyncStream>,
@@ -622,6 +720,7 @@ async fn run_tcp_session(
     sessions: SessionRoutes,
     cancellation: CancellationToken,
 ) {
+    let initial_payload_bytes = initial_payload.len();
     let (mut remote_read, mut remote_write) = split(stream);
     if !initial_payload.is_empty()
         && remote_write.write_all(&initial_payload).await.is_err()
@@ -634,15 +733,38 @@ async fn run_tcp_session(
         return;
     }
 
+    debug!(
+        session_id,
+        initial_payload_bytes, "started VLESS Reverse TCP relay"
+    );
+
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
+    let mut inbound_open = true;
+    let mut remote_read_open = true;
+    let mut first_keep_logged = false;
     loop {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
-            event = inbound.recv() => {
+            event = inbound.recv(), if inbound_open => {
                 match event {
                     Some(InboundEvent::Data { payload, .. }) => {
+                        if !first_keep_logged {
+                            debug!(
+                                session_id,
+                                payload_bytes = payload.len(),
+                                "received first VLESS Reverse TCP data frame"
+                            );
+                            first_keep_logged = true;
+                        }
                         if remote_write.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(InboundEvent::HalfClose) => {
+                        let _ = remote_write.shutdown().await;
+                        inbound_open = false;
+                        if !remote_read_open {
                             break;
                         }
                     }
@@ -652,11 +774,16 @@ async fn run_tcp_session(
                     }
                 }
             }
-            read = remote_read.read(&mut buffer) => {
+            read = remote_read.read(&mut buffer), if remote_read_open => {
                 match read {
                     Ok(0) => {
-                        let _ = send_end_frame(session_id, false, &outbound).await;
-                        break;
+                        if send_half_close_frame(session_id, &outbound).await.is_err() {
+                            break;
+                        }
+                        remote_read_open = false;
+                        if !inbound_open {
+                            break;
+                        }
                     }
                     Ok(size) => {
                         if send_keep_frame(
@@ -745,6 +872,21 @@ async fn send_end_frame(
         session_id,
         SessionStatus::End,
         option,
+        None,
+        Bytes::new(),
+        outbound,
+    )
+    .await
+}
+
+async fn send_half_close_frame(
+    session_id: u16,
+    outbound: &mpsc::Sender<Bytes>,
+) -> std::io::Result<()> {
+    send_frame(
+        session_id,
+        SessionStatus::End,
+        FrameOption::default().with_half_close(),
         None,
         Bytes::new(),
         outbound,

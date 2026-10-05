@@ -206,12 +206,13 @@ pub fn derive_handshake_keys_for_suite(
     let hmac_algorithm = cipher_suite.hmac_algorithm();
     let digest_algorithm = cipher_suite.digest_algorithm();
 
-    // Validate input lengths
-    if shared_secret.len() != 32 {
+    // X25519 produces 32 bytes; X25519MLKEM768 produces the ML-KEM secret
+    // followed by the X25519 secret (64 bytes total).
+    if shared_secret.len() != 32 && shared_secret.len() != 64 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Invalid shared_secret length: {} (expected 32)",
+                "Invalid TLS 1.3 shared secret length: {} (expected 32 or 64)",
                 shared_secret.len()
             ),
         ));
@@ -654,6 +655,30 @@ mod tests {
 
         assert_eq!(
             handshake_keys.client_handshake_traffic_secret.len(),
+            cipher_suite.hash_len()
+        );
+    }
+
+    #[test]
+    fn handshake_key_derivation_accepts_x25519_mlkem768_secret() {
+        let cipher_suite = CipherSuite::AES_128_GCM_SHA256;
+        let shared_secret = vec![0x11u8; 64];
+        let server_hash = vec![0x33u8; cipher_suite.hash_len()];
+
+        let handshake_keys = derive_handshake_keys_for_suite(
+            cipher_suite,
+            &shared_secret,
+            &[],
+            &server_hash,
+        )
+        .unwrap();
+
+        assert_eq!(
+            handshake_keys.client_handshake_traffic_secret.len(),
+            cipher_suite.hash_len()
+        );
+        assert_eq!(
+            handshake_keys.server_handshake_traffic_secret.len(),
             cipher_suite.hash_len()
         );
     }

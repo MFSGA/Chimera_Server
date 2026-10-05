@@ -147,15 +147,22 @@ async fn tcp_session_round_trips_payload_and_xray_end_closes_both_halves() {
         .expect("read session downlink");
     assert_eq!(&response, b"world");
 
-    session
-        .shutdown()
-        .await
-        .expect("shutdown session write side");
-
-    let end = read_frame(&mut peer).await.expect("read Mux END");
-    assert_eq!(end.metadata.session_id, session_id);
-    assert_eq!(end.metadata.status, SessionStatus::End);
-    assert!(end.payload.is_empty());
+    write_remote_frame(
+        &mut peer,
+        MuxFrame {
+            metadata: FrameMetadata {
+                session_id,
+                status: SessionStatus::End,
+                option: FrameOption::default(),
+                target: None,
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::new(),
+        },
+    )
+    .await;
 
     let mut one = [0u8; 1];
     let read = timeout(Duration::from_secs(1), session.read(&mut one))
@@ -163,6 +170,83 @@ async fn tcp_session_round_trips_payload_and_xray_end_closes_both_halves() {
         .expect("logical session close must propagate")
         .expect("read logical EOF");
     assert_eq!(read, 0, "Xray Mux END closes the logical session");
+    assert_eq!(worker.active_connections(), 0);
+}
+
+#[tokio::test]
+async fn tcp_session_half_close_keeps_downlink_open_for_final_response() {
+    let (worker, mut peer) = worker_with_peer(21, 4096, SessionLimits::default());
+    worker
+        .control_session_became_active()
+        .expect("activate worker");
+    let mut session = worker
+        .open_tcp_session(target(8080), None, None)
+        .expect("open public Reverse session");
+    session
+        .write_all(b"request")
+        .await
+        .expect("write session uplink");
+
+    let first = read_frame(&mut peer).await.expect("read Reverse NEW frame");
+    let session_id = first.metadata.session_id;
+    assert_eq!(first.metadata.status, SessionStatus::New);
+    assert_eq!(first.payload, Bytes::from_static(b"request"));
+
+    session.shutdown().await.expect("half-close session uplink");
+    let half_close = read_frame(&mut peer)
+        .await
+        .expect("read directional Reverse END");
+    assert_eq!(half_close.metadata.session_id, session_id);
+    assert_eq!(half_close.metadata.status, SessionStatus::End);
+    assert!(half_close.metadata.option.has_half_close());
+
+    write_remote_frame(
+        &mut peer,
+        MuxFrame {
+            metadata: FrameMetadata {
+                session_id,
+                status: SessionStatus::Keep,
+                option: FrameOption::default().with_data(),
+                target: None,
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::from_static(b"final-response"),
+        },
+    )
+    .await;
+    write_remote_frame(
+        &mut peer,
+        MuxFrame {
+            metadata: FrameMetadata {
+                session_id,
+                status: SessionStatus::End,
+                option: FrameOption::default().with_half_close(),
+                target: None,
+                source: None,
+                local: None,
+                global_id: None,
+            },
+            payload: Bytes::new(),
+        },
+    )
+    .await;
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(1), session.read_to_end(&mut response))
+        .await
+        .expect("read final response and remote FIN")
+        .expect("read Reverse response");
+    assert_eq!(response, b"final-response");
+
+    timeout(Duration::from_secs(1), async {
+        while worker.active_connections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session resources are released after both halves close");
 }
 
 #[tokio::test]
@@ -240,6 +324,29 @@ async fn udp_packet_session_matches_xray_reverse_mux_packet_frames() {
     assert_eq!(end.metadata.session_id, session_id);
     assert_eq!(end.metadata.status, SessionStatus::End);
     assert!(end.payload.is_empty());
+}
+
+#[tokio::test]
+async fn closed_worker_rejects_udp_packets_for_recovery() {
+    let (worker, _peer) = worker_with_peer(22, 4096, SessionLimits::default());
+    worker
+        .control_session_became_active()
+        .expect("activate worker");
+    let mut session = worker
+        .open_packet_session(
+            udp_target(Ipv4Addr::new(192, 0, 2, 53), 53),
+            None,
+            None,
+        )
+        .expect("open Reverse UDP packet session");
+
+    worker.close();
+
+    let error = session
+        .send(Bytes::from_static(b"retry-me"), None)
+        .await
+        .expect_err("a closed worker must reject stale UDP packets");
+    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
 }
 
 #[tokio::test]

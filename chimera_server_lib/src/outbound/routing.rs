@@ -14,12 +14,14 @@ use crate::{
 };
 
 pub(crate) const USER_DOMAIN_ACCESS_BLACKHOLE_TAG: &str = "user-domain-access";
+pub(crate) const FREEDOM_FINAL_RULES_BLACKHOLE_TAG: &str = "freedom-final-rules";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectOutboundAction {
     Freedom {
         tag: Option<String>,
         proxy_protocol: u32,
+        final_rules: Vec<super::freedom_rules::FreedomFinalRule>,
     },
     Blackhole {
         tag: String,
@@ -165,6 +167,7 @@ pub(super) async fn plan_tcp_route(
         DirectOutboundAction::Freedom {
             tag,
             proxy_protocol,
+            ..
         } => Ok(Some(TcpRoutePlan::Freedom {
             target_addr: target_addr.ok_or_else(|| {
                 std::io::Error::other("TCP freedom route did not resolve target")
@@ -207,6 +210,7 @@ pub(crate) async fn select_direct_outbound_for_location(
 ) -> std::io::Result<(DirectOutboundAction, Option<SocketAddr>)> {
     let policy_identities = context.metadata.policy_identities.clone();
     let inbound_protocol = context.metadata.inbound_protocol.clone();
+    let network = context.network;
     let mut route_input = apply_routing_metadata(
         unresolved_connection_routing_input(
             context.inbound_tag,
@@ -298,9 +302,61 @@ pub(crate) async fn select_direct_outbound_for_location(
         | DirectOutboundAction::Trojan { .. } => Ok((action, None)),
         #[cfg(feature = "vless-reverse")]
         DirectOutboundAction::VlessReverse { .. } => Ok((action, None)),
-        DirectOutboundAction::Freedom { .. } => {
+        DirectOutboundAction::Freedom {
+            ref final_rules, ..
+        } => {
+            let mut resolved_for_freedom = None;
+            if super::freedom_rules::requires_target_ip_check(
+                final_rules,
+                inbound_protocol.as_deref(),
+            ) {
+                let candidates = match remote_location.to_socket_addr_nonblocking() {
+                    Some(target_addr) => vec![target_addr],
+                    None if routing_location == *remote_location => {
+                        if let Some(addresses) = resolved_for_routing.as_ref() {
+                            addresses.clone()
+                        } else {
+                            resolve_all_addresses(resolver, remote_location, runtime)
+                                .await?
+                        }
+                    }
+                    None => {
+                        resolve_all_addresses(resolver, remote_location, runtime)
+                            .await?
+                    }
+                };
+                let denied = candidates.iter().any(|candidate| {
+                    !super::freedom_rules::allows(
+                        final_rules,
+                        inbound_protocol.as_deref(),
+                        network,
+                        candidate.ip(),
+                        remote_location.port(),
+                    )
+                });
+                if denied {
+                    return Ok((
+                        DirectOutboundAction::Blackhole {
+                            tag: FREEDOM_FINAL_RULES_BLACKHOLE_TAG.to_string(),
+                        },
+                        None,
+                    ));
+                }
+                if remote_location.address().hostname().is_some() {
+                    resolved_for_freedom = Some(candidates);
+                }
+            }
             let target_addr = match remote_location.to_socket_addr_nonblocking() {
                 Some(target_addr) => target_addr,
+                None if resolved_for_freedom.is_some() => resolved_for_freedom
+                    .as_ref()
+                    .and_then(|addresses| addresses.first().copied())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "freedom finalRules DNS lookup returned no addresses",
+                        )
+                    })?,
                 None if routing_location == *remote_location => resolved_for_routing
                     .as_ref()
                     .and_then(|addresses| addresses.first().copied())
@@ -518,21 +574,27 @@ fn classify_selected_outbound(
         return Ok(DirectOutboundAction::Freedom {
             tag: None,
             proxy_protocol: 0,
+            final_rules: Vec::new(),
         });
     };
     match outbound.protocol.trim().to_ascii_lowercase().as_str() {
         "freedom" => {
-            let proxy_protocol = super::decode_freedom_proxy_protocol(&outbound)?;
+            let (proxy_protocol, final_rules) =
+                super::decode::decode_freedom_settings(&outbound)?;
             Ok(DirectOutboundAction::Freedom {
                 tag: Some(outbound.tag),
                 proxy_protocol,
+                final_rules,
             })
         }
         "blackhole" => Ok(DirectOutboundAction::Blackhole { tag: outbound.tag }),
         "socks" if network_name.eq_ignore_ascii_case("tcp") => {
             Ok(DirectOutboundAction::Socks { outbound })
         }
-        "vless" if network_name.eq_ignore_ascii_case("tcp") => {
+        "vless"
+            if network_name.eq_ignore_ascii_case("tcp")
+                || network_name.eq_ignore_ascii_case("udp") =>
+        {
             Ok(DirectOutboundAction::Vless { outbound })
         }
         #[cfg(feature = "vless-reverse")]

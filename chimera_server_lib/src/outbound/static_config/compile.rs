@@ -1,5 +1,9 @@
 use super::super::*;
 use super::*;
+#[cfg(feature = "vless-reverse")]
+use crate::handler::vless_reverse::site_policy::{
+    SiteToSiteConfig, SiteToSitePolicy,
+};
 use crate::{address::Address, config::def::OutboundItem, runtime::OutboundSummary};
 use base64::Engine as _;
 use prost::Message;
@@ -20,10 +24,92 @@ pub(crate) fn compile_static_outbound(
         {
             Some(encode_static_sender_settings(settings, &item.tag)?)
         }
+        Some(settings)
+            if protocol == "vless" && static_vless_tcp_tls_requested(settings) =>
+        {
+            if !cfg!(feature = "tls") {
+                return Err(format!(
+                    "VLESS outbound {} TCP/TLS requires the tls feature",
+                    item.tag
+                ));
+            }
+            if let Some(field) = static_vless_tls_unsupported_field(settings) {
+                return Err(format!(
+                    "VLESS outbound {} streamSettings field {field} is recognized but not implemented",
+                    item.tag
+                ));
+            }
+            Some(encode_static_sender_settings(settings, &item.tag)?)
+        }
+        Some(settings)
+            if protocol == "vless"
+                && static_vless_tcp_reality_requested(settings) =>
+        {
+            if !cfg!(feature = "reality") {
+                return Err(format!(
+                    "VLESS outbound {} TCP/REALITY requires the reality feature",
+                    item.tag
+                ));
+            }
+            if let Some(field) = static_vless_tls_unsupported_field(settings) {
+                return Err(format!(
+                    "VLESS outbound {} streamSettings field {field} is recognized but not implemented",
+                    item.tag
+                ));
+            }
+            Some(encode_static_sender_settings(settings, &item.tag)?)
+        }
+        Some(settings)
+            if protocol == "vless"
+                && static_vless_websocket_tls_requested(settings) =>
+        {
+            if !cfg!(feature = "tls") {
+                return Err(format!(
+                    "VLESS outbound {} WebSocket/TLS requires the tls feature",
+                    item.tag
+                ));
+            }
+            if !cfg!(feature = "ws") {
+                return Err(format!(
+                    "VLESS outbound {} WebSocket/TLS requires the ws feature",
+                    item.tag
+                ));
+            }
+            if let Some(field) = static_vless_tls_unsupported_field(settings) {
+                return Err(format!(
+                    "VLESS outbound {} streamSettings field {field} is recognized but not implemented",
+                    item.tag
+                ));
+            }
+            Some(encode_static_sender_settings(settings, &item.tag)?)
+        }
+        Some(settings)
+            if protocol == "vless" && static_vless_xhttp_tls_requested(settings) =>
+        {
+            if !cfg!(feature = "tls") {
+                return Err(format!(
+                    "VLESS outbound {} XHTTP/TLS requires the tls feature",
+                    item.tag
+                ));
+            }
+            if let Some(field) = static_vless_xhttp_tls_unsupported_field(settings) {
+                return Err(format!(
+                    "VLESS outbound {} streamSettings field {field} is recognized but not implemented",
+                    item.tag
+                ));
+            }
+            Some(encode_static_sender_settings(settings, &item.tag)?)
+        }
         Some(_) if matches!(protocol.as_str(), "socks" | "vless") => {
             return Err(format!(
                 "{} outbound {} streamSettings are not implemented yet; refusing to downgrade transport security",
                 protocol, item.tag
+            ));
+        }
+        Some(_) if protocol == "freedom" => {
+            return Err(format!(
+                "freedom outbound {} streamSettings are not implemented; refusing to ignore dialer and socket settings",
+                item.tag
             ));
         }
         Some(_) => None,
@@ -39,6 +125,31 @@ pub(crate) fn compile_static_outbound(
                 })?,
                 None => StaticFreedomConfig::default(),
             };
+            for (field, value) in &config.other_settings {
+                let has_unsupported_value = match field.as_str() {
+                    "targetStrategy" | "domainStrategy" => {
+                        value.as_str().is_none_or(|strategy| {
+                            !strategy.is_empty()
+                                && !strategy.eq_ignore_ascii_case("asis")
+                        })
+                    }
+                    "redirect" => {
+                        value.as_str().is_none_or(|redirect| !redirect.is_empty())
+                    }
+                    "userLevel" => value.as_u64() != Some(0),
+                    "noises" => {
+                        value.as_array().is_none_or(|noises| !noises.is_empty())
+                    }
+                    "fragment" | "noise" | "ipsBlocked" => !value.is_null(),
+                    _ => false,
+                };
+                if has_unsupported_value {
+                    return Err(format!(
+                        "freedom outbound {} settings field {field} is recognized but not implemented",
+                        item.tag
+                    ));
+                }
+            }
             if config.proxy_protocol > 2 {
                 return Err(format!(
                     "freedom outbound {} proxyProtocol must be 0, 1, or 2",
@@ -46,7 +157,17 @@ pub(crate) fn compile_static_outbound(
                 ));
             }
             let payload = FreedomConfigPayload {
+                domain_strategy: 0,
+                destination_override: None,
+                user_level: 0,
+                fragment: None,
                 proxy_protocol: config.proxy_protocol,
+                noises: Vec::new(),
+                final_rules:
+                    super::super::freedom_rules::compile_static_final_rules(
+                        config.final_rules.as_deref().unwrap_or_default(),
+                        &item.tag,
+                    )?,
             };
             (
                 Some(TYPE_PROXY_FREEDOM_CONFIG.to_string()),
@@ -124,6 +245,90 @@ fn static_vless_reverse_requested(item: &OutboundItem) -> bool {
         let _ = item;
         false
     }
+}
+
+fn static_vless_tcp_tls_requested(settings: &serde_json::Value) -> bool {
+    let network = settings
+        .get("network")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let security = settings
+        .get("security")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    matches!(network.to_ascii_lowercase().as_str(), "" | "raw" | "tcp")
+        && security.eq_ignore_ascii_case("tls")
+}
+
+fn static_vless_tcp_reality_requested(settings: &serde_json::Value) -> bool {
+    let network = settings
+        .get("network")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let security = settings
+        .get("security")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    matches!(network.to_ascii_lowercase().as_str(), "" | "raw" | "tcp")
+        && security.eq_ignore_ascii_case("reality")
+}
+
+fn static_vless_websocket_tls_requested(settings: &serde_json::Value) -> bool {
+    let network = settings
+        .get("network")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let security = settings
+        .get("security")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    matches!(network.to_ascii_lowercase().as_str(), "ws" | "websocket")
+        && security.eq_ignore_ascii_case("tls")
+}
+
+fn static_vless_xhttp_tls_requested(settings: &serde_json::Value) -> bool {
+    let network = settings
+        .get("network")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let security = settings
+        .get("security")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    matches!(network.to_ascii_lowercase().as_str(), "xhttp" | "splithttp")
+        && security.eq_ignore_ascii_case("tls")
+}
+
+fn static_vless_tls_unsupported_field(
+    settings: &serde_json::Value,
+) -> Option<&'static str> {
+    ["tcpSettings", "sockopt"].into_iter().find(|field| {
+        settings.get(field).is_some_and(|value| {
+            !value.is_null()
+                && value
+                    .as_object()
+                    .is_none_or(|settings| !settings.is_empty())
+        })
+    })
+}
+
+fn static_vless_xhttp_tls_unsupported_field(
+    settings: &serde_json::Value,
+) -> Option<&'static str> {
+    static_vless_tls_unsupported_field(settings).or_else(|| {
+        settings
+            .get("finalmask")
+            .filter(|value| !value.is_null())
+            .map(|_| "finalmask")
+    })
 }
 
 fn encode_static_sender_settings(
@@ -867,9 +1072,26 @@ fn encode_static_vless_config(
             .sniffing
             .map(encode_static_reverse_sniffing)
             .transpose()?;
+        let site_to_site_json = reverse
+            .site_to_site
+            .map(|config| {
+                let config: SiteToSiteConfig = serde_json::from_value(config)
+                    .map_err(|error| {
+                        format!("invalid VLESS Reverse siteToSite config: {error}")
+                    })?;
+                SiteToSitePolicy::compile(&config).map_err(|error| {
+                    format!("invalid VLESS Reverse siteToSite: {error}")
+                })?;
+                serde_json::to_string(&config).map_err(|error| {
+                    format!("failed to encode VLESS Reverse siteToSite: {error}")
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
         Some(VlessReversePayload {
             tag: reverse.tag,
             sniffing,
+            site_to_site_json,
         })
     } else {
         None
@@ -877,7 +1099,7 @@ fn encode_static_vless_config(
 
     #[cfg(not(feature = "vless-reverse"))]
     if let Some(reverse) = config.reverse.as_ref() {
-        let _ = (&reverse.tag, &reverse.sniffing);
+        let _ = (&reverse.tag, &reverse.sniffing, &reverse.site_to_site);
         return Err(
             "VLESS outbound reverse requires the vless-reverse feature".into()
         );

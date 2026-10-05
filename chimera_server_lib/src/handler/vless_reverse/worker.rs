@@ -23,8 +23,8 @@ use crate::async_stream::AsyncStream;
 use super::{
     control::ControlState,
     mux_frame::{Destination, FrameMetadata, FrameOption, SessionStatus},
-    mux_io::{MuxFrame, encode_frame, read_frame},
-    session_core::{SessionLimits, WorkerCore, WorkerPhase},
+    mux_io::{MuxFrame, XRAY_MUX_UDP_PACKET_SIZE, encode_frame, read_frame},
+    session_core::{SessionLimits, WorkerCore, WorkerPhase, track_task},
     session_stream::ReverseSessionStream,
 };
 
@@ -39,6 +39,7 @@ enum InboundEvent {
         payload: Bytes,
         target: Option<Destination>,
     },
+    HalfClose,
     End,
 }
 
@@ -61,6 +62,20 @@ impl ReversePacketSession {
         payload: Bytes,
         target: Option<Destination>,
     ) -> std::io::Result<()> {
+        if self.core.phase() == WorkerPhase::Closed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Reverse Mux worker is closed",
+            ));
+        }
+        if self.target.network == super::mux_frame::TargetNetwork::Udp
+            && payload.len() > XRAY_MUX_UDP_PACKET_SIZE
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Xray Mux UDP packet size too large: {}", payload.len()),
+            ));
+        }
         let status = if self.first {
             SessionStatus::New
         } else {
@@ -89,7 +104,7 @@ impl ReversePacketSession {
     }
 
     pub(crate) async fn close(&mut self) -> std::io::Result<()> {
-        if self.first {
+        if self.first || self.core.phase() == WorkerPhase::Closed {
             return Ok(());
         }
         send_end_frame(self.session_id, &self.outbound).await
@@ -102,7 +117,7 @@ impl ReversePacketSession {
             Some(InboundEvent::Data { payload, target }) => {
                 Ok(Some((payload, target)))
             }
-            Some(InboundEvent::End) | None => Ok(None),
+            Some(InboundEvent::HalfClose | InboundEvent::End) | None => Ok(None),
         }
     }
 }
@@ -318,10 +333,7 @@ impl MuxClientWorker {
             self.core.clone(),
             self.cancellation.clone(),
         ));
-        self.tasks
-            .lock()
-            .expect("Reverse task lock poisoned")
-            .push(task);
+        track_task(&self.tasks, task);
 
         Ok(ReverseSessionStream::new(application))
     }
@@ -479,12 +491,23 @@ async fn run_physical_reader<R>(
                 }
             }
             SessionStatus::End => {
-                let route = sessions
-                    .lock()
-                    .expect("Reverse routes lock poisoned")
-                    .remove(&frame.metadata.session_id);
-                if let Some(route) = route {
-                    let _ = route.send(InboundEvent::End).await;
+                if frame.metadata.option.has_half_close() {
+                    let route = sessions
+                        .lock()
+                        .expect("Reverse routes lock poisoned")
+                        .get(&frame.metadata.session_id)
+                        .cloned();
+                    if let Some(route) = route {
+                        let _ = route.send(InboundEvent::HalfClose).await;
+                    }
+                } else {
+                    let route = sessions
+                        .lock()
+                        .expect("Reverse routes lock poisoned")
+                        .remove(&frame.metadata.session_id);
+                    if let Some(route) = route {
+                        let _ = route.send(InboundEvent::End).await;
+                    }
                 }
             }
             SessionStatus::New | SessionStatus::KeepAlive => {
@@ -513,15 +536,24 @@ async fn run_tcp_session(
     let (mut uplink, mut downlink) = split(stream);
     let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
     let mut first = true;
+    let mut uplink_open = true;
+    let mut downlink_open = true;
 
     loop {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
-            event = inbound.recv() => {
+            event = inbound.recv(), if downlink_open => {
                 match event {
                     Some(InboundEvent::Data { payload, .. }) => {
                         if downlink.write_all(&payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(InboundEvent::HalfClose) => {
+                        let _ = downlink.shutdown().await;
+                        downlink_open = false;
+                        if !uplink_open {
                             break;
                         }
                     }
@@ -531,7 +563,7 @@ async fn run_tcp_session(
                     }
                 }
             }
-            read = uplink.read(&mut buffer) => {
+            read = uplink.read(&mut buffer), if uplink_open => {
                 match read {
                     Ok(0) => {
                         if first
@@ -550,10 +582,13 @@ async fn run_tcp_session(
                         {
                             break;
                         }
-                        if send_end_frame(session_id, &outbound).await.is_err() {
+                        if send_half_close_frame(session_id, &outbound).await.is_err() {
                             break;
                         }
-                        break;
+                        uplink_open = false;
+                        if !downlink_open {
+                            break;
+                        }
                     }
                     Ok(size) => {
                         let status = if first {
@@ -633,6 +668,23 @@ async fn send_end_frame(
         session_id,
         SessionStatus::End,
         FrameOption::default(),
+        None,
+        None,
+        None,
+        Bytes::new(),
+        outbound,
+    )
+    .await
+}
+
+async fn send_half_close_frame(
+    session_id: u16,
+    outbound: &mpsc::Sender<Bytes>,
+) -> std::io::Result<()> {
+    send_stream_frame(
+        session_id,
+        SessionStatus::End,
+        FrameOption::default().with_half_close(),
         None,
         None,
         None,

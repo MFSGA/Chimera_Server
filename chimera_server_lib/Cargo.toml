@@ -77,6 +77,13 @@ rcgen = { workspace = true, optional = true }
 subtle = { workspace = true }
 x509-parser = { version = "0.18", optional = true }
 
+# Provisional Linux-only backend: the system-TUN device owner has only been
+# implemented and packet-tested on Linux; widen after target-specific adapters
+# and packet/lifecycle checks exist for another maintained OS.
+[target.'cfg(target_os = "linux")'.dependencies]
+watfaq-netstack = { path = "../vendor/watfaq-netstack", version = "0.26.3", package = "watfaq-netstack", optional = true }
+rtnetlink = { workspace = true, optional = true }
+
 [build-dependencies]
 tonic-build = { workspace = true }
 tonic-prost-build = { workspace = true }
@@ -84,6 +91,8 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+etherparse = "0.20.3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 brutal-ack-batch-trace = []
@@ -101,7 +110,8 @@ shadowsocks = ["md-5", "blake3", "aes", "chacha20poly1305"]
 vless = []
 vless-reverse = ["vless"]
 vmess = ["md-5", "sha3", "sha1"]
-wireguard = ["boringtun", "tun"]
+wireguard = ["dep:boringtun", "dep:tun"]
+tun-gateway = ["dep:tun", "dep:watfaq-netstack", "dep:rtnetlink"]
 tuic = ["dashmap", "lru", "uuid"]
 traffic = []
 api = ["tonic", "tonic-prost", "prost-types", "tokio-stream"]

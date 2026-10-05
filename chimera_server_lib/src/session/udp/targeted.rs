@@ -256,14 +256,19 @@ pub(crate) async fn run_multi_directional_udp_with_tasks(
                     | DirectOutboundAction::Vless { outbound } => {
                         break Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
+                            format!(
+                                "proxy outbound {} is not supported for multi-target UDP sessions",
+                                outbound.tag
+                            ),
                         ));
                     }
                     #[cfg(feature = "vless-reverse")]
                     DirectOutboundAction::VlessReverse { tag } => {
                         break Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
-                            format!("VLESS Reverse outbound {tag} is TCP-only"),
+                            format!(
+                                "VLESS Reverse outbound {tag} is not supported for multi-target UDP sessions"
+                            ),
                         ));
                     }
                 }

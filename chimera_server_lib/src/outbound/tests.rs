@@ -35,7 +35,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "trojan")]
 use super::decode::decode_sender_transport;
 use super::routing::{
-    apply_routing_metadata, connection_routing_input, select_direct_outbound,
+    FREEDOM_FINAL_RULES_BLACKHOLE_TAG, apply_routing_metadata,
+    connection_routing_input, select_direct_outbound,
+    select_direct_outbound_for_location,
 };
 use super::*;
 #[cfg(feature = "ws")]
@@ -71,11 +73,45 @@ fn freedom_outbound(tag: &str, proxy_protocol: u32) -> OutboundSummary {
         protocol: "freedom".into(),
         proxy_settings_type: Some(TYPE_PROXY_FREEDOM_CONFIG.into()),
         proxy_settings_value: Some(
-            FreedomConfigPayload { proxy_protocol }.encode_to_vec(),
+            FreedomConfigPayload {
+                domain_strategy: 0,
+                destination_override: None,
+                user_level: 0,
+                fragment: None,
+                proxy_protocol,
+                noises: Vec::new(),
+                final_rules: Vec::new(),
+            }
+            .encode_to_vec(),
         ),
         sender_settings_type: None,
         sender_settings_value: None,
     }
+}
+
+pub(crate) fn freedom_outbound_allow_loopback(tag: &str) -> OutboundSummary {
+    freedom_outbound_with_final_rules(
+        tag,
+        serde_json::json!([{
+            "action": "allow",
+            "network": ["tcp", "udp"],
+            "ip": ["127.0.0.0/8", "::1/128"]
+        }]),
+    )
+}
+
+pub(crate) fn freedom_outbound_with_final_rules(
+    tag: &str,
+    final_rules: serde_json::Value,
+) -> OutboundSummary {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "freedom",
+        "tag": tag,
+        "settings": {"finalRules": final_rules}
+    }))
+    .expect("parse Freedom test outbound with finalRules");
+    compile_static_outbound(&item)
+        .expect("compile Freedom test outbound with finalRules")
 }
 
 fn socks_outbound(
@@ -817,6 +853,219 @@ fn static_freedom_outbound_preserves_xray_proxy_protocol() {
 }
 
 #[test]
+fn static_freedom_outbound_compiles_literal_final_rules_and_rejects_ignored_fields()
+{
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {
+            "finalRules": [{
+                "action": "allow",
+                "network": "tcp,udp",
+                "port": "443,8443-8444",
+                "ip": ["203.0.113.0/24", "2001:db8::/32"]
+            }]
+        }
+    }))
+    .expect("parse Freedom finalRules");
+    let outbound = compile_static_outbound(&item).expect("compile finalRules");
+    let (_, rules) = super::decode::decode_freedom_settings(&outbound)
+        .expect("decode compiled finalRules");
+    assert_eq!(rules.len(), 1);
+    assert!(super::freedom_rules::allows(
+        &rules,
+        Some("vless-reverse"),
+        2,
+        "203.0.113.10".parse().unwrap(),
+        8443,
+    ));
+    assert!(super::freedom_rules::allows(
+        &rules,
+        Some("vless-reverse"),
+        3,
+        "2001:db8::1".parse().unwrap(),
+        443,
+    ));
+    assert!(!super::freedom_rules::allows(
+        &rules,
+        Some("vless-reverse"),
+        2,
+        "203.0.113.10".parse().unwrap(),
+        80,
+    ));
+
+    for (settings, field) in [
+        (
+            serde_json::json!({"domainStrategy": "UseIP"}),
+            "domainStrategy",
+        ),
+        (
+            serde_json::json!({
+                "finalRules": [{"action": "block", "blockDelay": "30-60"}]
+            }),
+            "blockDelay",
+        ),
+    ] {
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "freedom",
+            "tag": "invalid",
+            "settings": settings
+        }))
+        .expect("parse unsupported Freedom setting");
+        let error = compile_static_outbound(&item)
+            .expect_err("unsupported Freedom settings must fail closed");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn freedom_final_rules_gate_vless_reverse_tcp_and_udp_targets() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {
+            "finalRules": [{
+                "action": "allow",
+                "network": ["tcp", "udp"],
+                "port": "8443,5353",
+                "ip": "203.0.113.0/24"
+            }]
+        }
+    }))
+    .expect("parse Freedom finalRules");
+    let outbound =
+        compile_static_outbound(&item).expect("compile Freedom finalRules");
+    let runtime = RuntimeState::new(Vec::new(), vec![outbound]).data_plane();
+    let resolver: Arc<dyn Resolver> = Arc::new(CountingResolver::new(Vec::new()));
+    let source = "192.0.2.10:12345".parse().unwrap();
+    let metadata = || InboundRoutingMetadata {
+        inbound_protocol: Some("vless-reverse".into()),
+        ..InboundRoutingMetadata::default()
+    };
+
+    for (network, name, port, allowed) in [
+        (2, "tcp", 8443, true),
+        (3, "udp", 5353, true),
+        (2, "tcp", 80, false),
+        (3, "udp", 80, false),
+    ] {
+        let target = NetLocation::from_str(&format!("203.0.113.10:{port}"), None)
+            .expect("parse target");
+        let (action, resolved) = select_direct_outbound_for_location(
+            &resolver,
+            &target,
+            &runtime,
+            OutboundRoutingContext::new(
+                "reverse",
+                "",
+                source,
+                network,
+                name,
+                metadata(),
+            ),
+        )
+        .await
+        .expect("select Freedom route");
+        if allowed {
+            assert!(matches!(action, DirectOutboundAction::Freedom { .. }));
+            assert_eq!(resolved.unwrap().port(), port);
+        } else {
+            assert_eq!(
+                action,
+                DirectOutboundAction::Blackhole {
+                    tag: FREEDOM_FINAL_RULES_BLACKHOLE_TAG.into()
+                }
+            );
+            assert!(resolved.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn reverse_freedom_default_block_all_stops_tcp_before_connect() {
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind target listener");
+    let target_addr = listener.local_addr().expect("target address");
+    let runtime = RuntimeState::new(Vec::new(), vec![freedom_outbound("direct", 0)])
+        .data_plane();
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let target = NetLocation::from_ip_addr(target_addr.ip(), target_addr.port());
+
+    let connection = connect_tcp_outbound_with_routing_metadata(
+        &resolver,
+        &target,
+        &runtime,
+        "reverse",
+        "",
+        "192.0.2.10:12345".parse().unwrap(),
+        InboundRoutingMetadata {
+            inbound_protocol: Some("vless-reverse".into()),
+            ..InboundRoutingMetadata::default()
+        },
+    )
+    .await
+    .expect("apply Reverse Freedom default policy");
+    assert!(connection.is_none());
+    assert!(
+        timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn freedom_final_rules_check_all_dns_candidates_before_dial() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "freedom",
+        "tag": "direct",
+        "settings": {
+            "finalRules": [{
+                "action": "block",
+                "network": "tcp",
+                "ip": "203.0.113.0/24"
+            }]
+        }
+    }))
+    .expect("parse Freedom finalRules");
+    let outbound =
+        compile_static_outbound(&item).expect("compile Freedom finalRules");
+    let runtime = RuntimeState::new(Vec::new(), vec![outbound]).data_plane();
+    let resolver: Arc<dyn Resolver> = Arc::new(CountingResolver::new(vec![
+        "1.1.1.1:443".parse().unwrap(),
+        "203.0.113.9:443".parse().unwrap(),
+    ]));
+    let target = NetLocation::from_str("mixed.example:443", None)
+        .expect("parse domain target");
+
+    let (action, resolved) = select_direct_outbound_for_location(
+        &resolver,
+        &target,
+        &runtime,
+        OutboundRoutingContext::new(
+            "inbound",
+            "",
+            "192.0.2.10:12345".parse().unwrap(),
+            2,
+            "tcp",
+            InboundRoutingMetadata::default(),
+        ),
+    )
+    .await
+    .expect("select Freedom route");
+    assert_eq!(
+        action,
+        DirectOutboundAction::Blackhole {
+            tag: FREEDOM_FINAL_RULES_BLACKHOLE_TAG.into()
+        }
+    );
+    assert!(resolved.is_none());
+}
+
+#[test]
 fn static_socks_outbound_compiles_xray_short_form() {
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "socks",
@@ -843,7 +1092,8 @@ fn static_socks_outbound_compiles_xray_short_form() {
 
 #[cfg(feature = "vless")]
 #[test]
-fn static_vless_outbound_compiles_xray_short_form_and_rejects_transport_downgrade() {
+fn static_vless_outbound_compiles_xray_short_form_and_rejects_unsupported_transport()
+{
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "vless",
         "tag": "proxy",
@@ -873,15 +1123,643 @@ fn static_vless_outbound_compiles_xray_short_form_and_rejects_transport_downgrad
             "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
             "encryption": "none"
         },
-        "streamSettings": {
-            "network": "tcp",
-            "security": "reality"
-        }
+        "streamSettings": {"network": "mkcp", "security": "none"}
     }))
     .expect("parse VLESS outbound with stream settings");
     let error = compile_static_outbound(&secure_item)
         .expect_err("unsupported VLESS transport must fail closed");
-    assert!(error.contains("refusing to downgrade transport security"));
+    assert!(
+        error.contains("refusing to downgrade transport security"),
+        "{error}"
+    );
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[test]
+fn static_vless_tcp_tls_outbound_compiles_verified_sender_settings() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": "site-tls.test",
+                "disableSystemRoot": true,
+                "certificates": [{
+                    "certificateFile": concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../scripts/fixtures/reverse-site-tls-cert.pem"
+                    ),
+                    "usage": "verify"
+                }]
+            }
+        }
+    }))
+    .expect("parse VLESS TCP/TLS outbound");
+
+    let outbound =
+        compile_static_outbound(&item).expect("compile VLESS TCP/TLS outbound");
+    let transport = super::decode::decode_outbound_transport(&outbound)
+        .expect("decode VLESS outbound transport");
+    let OutboundTransport::Tls(settings) = transport else {
+        panic!("expected VLESS TLS transport");
+    };
+    assert_eq!(settings.server_name, "site-tls.test");
+    assert!(settings.disable_system_root);
+    assert_eq!(settings.custom_root_certificates.len(), 1);
+}
+
+#[cfg(all(feature = "vless", feature = "tls", feature = "ws"))]
+#[test]
+fn static_vless_websocket_tls_outbound_compiles_transport_and_verified_tls() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-ws-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "tls",
+            "wsSettings": {
+                "host": "site-tls.test",
+                "path": "/office-ws",
+                "headers": {"X-Site-Transport": "office-gateway"}
+            },
+            "tlsSettings": {
+                "serverName": "site-tls.test",
+                "disableSystemRoot": true,
+                "certificates": [{
+                    "certificateFile": concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../scripts/fixtures/reverse-site-tls-cert.pem"
+                    ),
+                    "usage": "verify"
+                }]
+            }
+        }
+    }))
+    .expect("parse VLESS WebSocket/TLS outbound");
+
+    let outbound = compile_static_outbound(&item)
+        .expect("compile VLESS WebSocket/TLS outbound");
+    let sender = SenderConfigPayload::decode(
+        outbound
+            .sender_settings_value
+            .as_deref()
+            .expect("VLESS WebSocket/TLS sender settings"),
+    )
+    .expect("decode VLESS WebSocket/TLS sender settings");
+    let stream = sender.stream_settings.expect("sender stream settings");
+    assert_eq!(stream.protocol_name, "websocket");
+    assert_eq!(stream.security_type, TYPE_TRANSPORT_TLS_CONFIG);
+    let websocket = stream
+        .transport_settings
+        .iter()
+        .find(|transport| transport.protocol_name == "websocket")
+        .and_then(|transport| transport.settings.as_ref())
+        .expect("encoded WebSocket transport settings");
+    let websocket = WebsocketConfigPayload::decode(websocket.value.as_slice())
+        .expect("decode WebSocket transport settings");
+    assert_eq!(websocket.host, "site-tls.test");
+    assert_eq!(websocket.path, "/office-ws");
+    assert_eq!(
+        websocket.header.get("X-Site-Transport").map(String::as_str),
+        Some("office-gateway")
+    );
+
+    let OutboundTransport::Websocket {
+        tls: Some(tls),
+        settings,
+    } = super::decode::decode_outbound_transport(&outbound)
+        .expect("decode VLESS WebSocket/TLS settings")
+    else {
+        panic!("expected VLESS WebSocket/TLS transport");
+    };
+    assert_eq!(tls.server_name, "site-tls.test");
+    assert!(tls.disable_system_root);
+    assert_eq!(tls.custom_root_certificates.len(), 1);
+    assert_eq!(settings.host, "site-tls.test");
+    assert_eq!(settings.path, "/office-ws");
+    assert_eq!(
+        settings.headers.get("X-Site-Transport").map(String::as_str),
+        Some("office-gateway")
+    );
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[test]
+fn static_vless_xhttp_tls_outbound_compiles_h2_transport_and_verified_tls() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-xhttp-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "xhttpSettings": {
+                "host": "site-tls.test",
+                "path": "/office-xhttp",
+                "mode": "packet-up"
+            },
+            "tlsSettings": {
+                "serverName": "site-tls.test",
+                "disableSystemRoot": true,
+                "certificates": [{
+                    "certificateFile": concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../scripts/fixtures/reverse-site-tls-cert.pem"
+                    ),
+                    "usage": "verify"
+                }]
+            }
+        }
+    }))
+    .expect("parse VLESS XHTTP/TLS outbound");
+
+    let outbound =
+        compile_static_outbound(&item).expect("compile VLESS XHTTP/TLS outbound");
+    let OutboundTransport::Xhttp { tls, settings } =
+        super::decode::decode_outbound_transport(&outbound)
+            .expect("decode VLESS XHTTP/TLS settings")
+    else {
+        panic!("expected VLESS XHTTP/TLS transport");
+    };
+    assert_eq!(tls.server_name, "site-tls.test");
+    assert!(tls.disable_system_root);
+    assert_eq!(tls.custom_root_certificates.len(), 1);
+    assert_eq!(settings.host, "site-tls.test");
+    assert_eq!(settings.path, "/office-xhttp");
+    assert_eq!(settings.mode, super::OutboundXhttpMode::PacketUp);
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[test]
+fn static_vless_xhttp_tls_accepts_h3_alpn_without_falling_back_to_h2() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "xhttp-h3",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 443,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": "xhttp.example.test",
+                "alpn": ["h3"]
+            },
+            "xhttpSettings": {
+                "host": "xhttp.example.test",
+                "path": "/xhttp",
+                "mode": "packet-up"
+            }
+        }
+    }))
+    .expect("parse XHTTP/H3 VLESS outbound");
+
+    let outbound = compile_static_outbound(&item)
+        .expect("compile recognized XHTTP/H3 VLESS config");
+    let super::OutboundTransport::Xhttp { tls, settings } =
+        super::decode::decode_outbound_transport(&outbound)
+            .expect("decode XHTTP/H3 settings")
+    else {
+        panic!("expected XHTTP transport");
+    };
+    assert_eq!(tls.alpn, ["h3"]);
+    assert_eq!(settings.mode, super::OutboundXhttpMode::PacketUp);
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[test]
+fn static_vless_xhttp_tls_rejects_unimplemented_stream_options() {
+    for (field, value) in [
+        (
+            "tcpSettings",
+            serde_json::json!({"header": {"type": "http"}}),
+        ),
+        ("sockopt", serde_json::json!({"mark": 7})),
+        ("finalmask", serde_json::json!({"tcp": [{"type": "none"}]})),
+    ] {
+        let mut stream_settings = serde_json::json!({
+            "network": "xhttp",
+            "security": "tls"
+        });
+        stream_settings[field] = value;
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "tag": "secure-xhttp-proxy",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 1234,
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "encryption": "none"
+            },
+            "streamSettings": stream_settings
+        }))
+        .expect("parse VLESS XHTTP/TLS outbound");
+
+        let error = compile_static_outbound(&item)
+            .expect_err("recognized unsupported stream option must fail closed");
+        assert!(error.contains(field), "{error}");
+        assert!(error.contains("recognized but not implemented"), "{error}");
+    }
+}
+
+#[cfg(all(feature = "vless", not(feature = "tls")))]
+#[test]
+fn static_vless_xhttp_tls_outbound_requires_tls_feature() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-xhttp-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {"network": "xhttp", "security": "tls"}
+    }))
+    .expect("parse VLESS XHTTP/TLS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("XHTTP/TLS outbound must require the tls feature");
+    assert!(error.contains("requires the tls feature"), "{error}");
+}
+
+#[cfg(all(feature = "vless", feature = "tls", not(feature = "ws")))]
+#[test]
+fn static_vless_websocket_tls_outbound_requires_ws_feature() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-ws-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {"network": "ws", "security": "tls"}
+    }))
+    .expect("parse VLESS WebSocket/TLS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("WebSocket/TLS outbound must require the ws feature");
+    assert!(error.contains("requires the ws feature"), "{error}");
+}
+
+#[cfg(all(feature = "vless", feature = "ws", not(feature = "tls")))]
+#[test]
+fn static_vless_websocket_tls_outbound_requires_tls_feature() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-ws-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {"network": "ws", "security": "tls"}
+    }))
+    .expect("parse VLESS WebSocket/TLS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("WebSocket/TLS outbound must require the tls feature");
+    assert!(error.contains("requires the tls feature"), "{error}");
+}
+
+#[cfg(all(feature = "vless", feature = "tls"))]
+#[test]
+fn static_vless_tcp_tls_rejects_unimplemented_tcp_and_socket_options() {
+    for (field, value) in [
+        (
+            "tcpSettings",
+            serde_json::json!({"header": {"type": "http"}}),
+        ),
+        ("sockopt", serde_json::json!({"mark": 7})),
+    ] {
+        let mut stream_settings = serde_json::json!({
+            "network": "tcp",
+            "security": "tls"
+        });
+        stream_settings[field] = value;
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "tag": "secure-proxy",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 1234,
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "encryption": "none"
+            },
+            "streamSettings": stream_settings
+        }))
+        .expect("parse VLESS TCP/TLS outbound");
+
+        let error = compile_static_outbound(&item)
+            .expect_err("recognized unsupported stream option must fail closed");
+        assert!(error.contains(field), "{error}");
+        assert!(error.contains("recognized but not implemented"), "{error}");
+    }
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn outbound_tls_rejects_untrusted_root_and_wrong_server_name() {
+    use std::time::Duration;
+
+    let trusted = rcgen::generate_simple_self_signed(["site-tls.test".to_string()])
+        .expect("generate trusted test certificate");
+    let untrusted =
+        rcgen::generate_simple_self_signed(["site-tls.test".to_string()])
+            .expect("generate untrusted test certificate");
+    let certificate_der =
+        rustls::pki_types::CertificateDer::from(trusted.cert.der().to_vec());
+    let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(
+            trusted.signing_key.serialize_der(),
+        ),
+    );
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("select TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate_der], private_key)
+        .expect("build test TLS server config");
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test TLS server");
+    let address = listener.local_addr().expect("test TLS server address");
+    let server = tokio::spawn(async move {
+        let mut accepted = 0;
+        let mut completed = 0;
+        for _ in 0..3 {
+            let (stream, _) =
+                tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                    .await
+                    .expect("TLS client should connect")
+                    .expect("accept TLS client");
+            accepted += 1;
+            let handshake = tokio::time::timeout(
+                Duration::from_secs(3),
+                acceptor.accept(stream),
+            )
+            .await
+            .expect("TLS handshake should terminate");
+            if let Ok(stream) = handshake {
+                completed += 1;
+                drop(stream);
+            }
+        }
+        (accepted, completed)
+    });
+
+    let server_location =
+        NetLocation::from_str(&format!("{}:{}", address.ip(), address.port()), None)
+            .expect("build test TLS server location");
+    let trusted_root = trusted.cert.pem().into_bytes();
+    let untrusted_root = untrusted.cert.pem().into_bytes();
+    let cases = [
+        ("site-tls.test", trusted_root.clone(), true),
+        ("site-tls.test", untrusted_root, false),
+        ("wrong-site-tls.test", trusted_root, false),
+    ];
+
+    for (server_name, root, should_connect) in cases {
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect test TLS socket");
+        let settings = OutboundTlsClientSettings {
+            server_name: server_name.to_string(),
+            alpn: Vec::new(),
+            disable_system_root: true,
+            custom_root_certificates: vec![root],
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::connect_tls_transport(stream, &settings, &server_location),
+        )
+        .await
+        .expect("outbound TLS handshake should terminate");
+        if should_connect {
+            drop(result.expect("trusted root and matching SNI should connect"));
+        } else {
+            assert!(result.is_err(), "untrusted TLS identity must fail closed");
+        }
+    }
+
+    let (accepted, completed) = server.await.expect("TLS test server task");
+    assert_eq!(accepted, 3);
+    assert_eq!(
+        completed, 1,
+        "only the trusted matching identity may finish TLS"
+    );
+}
+
+#[cfg(all(feature = "vless", not(feature = "tls")))]
+#[test]
+fn static_vless_tcp_tls_outbound_requires_tls_feature() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "secure-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "tls"
+        }
+    }))
+    .expect("parse VLESS TCP/TLS outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("TLS outbound must fail when TLS is not compiled");
+    assert!(error.contains("requires the tls feature"), "{error}");
+}
+
+#[cfg(all(feature = "vless", feature = "reality"))]
+#[test]
+fn static_vless_tcp_reality_compiles_client_settings() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reality-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "serverName": "site-reality.test",
+                "publicKey": "J_9uQvLVkMofYOh1gIGhm9sMvgPS1J-TxeJ8fCKajT0",
+                "shortId": "0011223344556677"
+            }
+        }
+    }))
+    .expect("parse VLESS TCP/REALITY outbound");
+
+    let outbound =
+        compile_static_outbound(&item).expect("compile VLESS TCP/REALITY outbound");
+    let OutboundTransport::Reality(settings) =
+        super::decode::decode_outbound_transport(&outbound)
+            .expect("decode VLESS REALITY settings")
+    else {
+        panic!("expected VLESS REALITY transport");
+    };
+    assert_eq!(settings.server_name, "site-reality.test");
+    assert_eq!(
+        settings.short_id,
+        [0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+    );
+}
+
+#[cfg(all(feature = "vless", not(feature = "reality")))]
+#[test]
+fn static_vless_tcp_reality_outbound_requires_reality_feature() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reality-proxy",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "serverName": "site-reality.test",
+                "publicKey": "J_9uQvLVkMofYOh1gIGhm9sMvgPS1J-TxeJ8fCKajT0",
+                "shortId": "0011223344556677"
+            }
+        }
+    }))
+    .expect("parse VLESS TCP/REALITY outbound");
+
+    let error = compile_static_outbound(&item)
+        .expect_err("REALITY must fail closed without its feature");
+    assert!(error.contains("requires the reality feature"), "{error}");
+}
+
+#[cfg(feature = "vless")]
+#[tokio::test]
+async fn vless_udp_outbound_uses_xray_udp_command_and_packet_framing() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake VLESS server");
+    let server_addr = listener.local_addr().expect("VLESS server address");
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "vless-udp",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": server_addr.port(),
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none"
+        }
+    }))
+    .expect("parse VLESS UDP outbound");
+    let outbound =
+        compile_static_outbound(&item).expect("compile VLESS UDP outbound");
+    let runtime = RuntimeState::new(Vec::new(), vec![outbound.clone()]).data_plane();
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let target = NetLocation::from_str("192.0.2.53:53", None)
+        .expect("parse VLESS UDP target");
+
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept VLESS client");
+        let mut request_prefix = [0u8; 19];
+        stream
+            .read_exact(&mut request_prefix)
+            .await
+            .expect("read VLESS request prefix");
+        assert_eq!(request_prefix[0], 0);
+        assert_eq!(
+            &request_prefix[1..17],
+            &parse_xray_uuid("3ac9b383-75a1-431c-8184-106c80eb2273")
+                .expect("parse UUID")
+        );
+        assert_eq!(request_prefix[17], 0);
+        assert_eq!(request_prefix[18], 0x02, "VLESS UDP command");
+
+        let mut target_header = [0u8; 7];
+        stream
+            .read_exact(&mut target_header)
+            .await
+            .expect("read VLESS UDP target");
+        assert_eq!(u16::from_be_bytes([target_header[0], target_header[1]]), 53);
+        assert_eq!(target_header[2], 1);
+        assert_eq!(&target_header[3..], &[192, 0, 2, 53]);
+        let length = stream.read_u16().await.expect("read request packet length");
+        assert_eq!(length, 5);
+        let mut query = [0u8; 5];
+        stream
+            .read_exact(&mut query)
+            .await
+            .expect("read request packet");
+        assert_eq!(&query, b"query");
+        stream
+            .write_all(&[0, 0])
+            .await
+            .expect("write VLESS response header after uplink packet");
+        stream
+            .write_all(&[0, 4, b'p', b'o', b'n', b'g'])
+            .await
+            .expect("write response packet");
+    });
+
+    let mut proxy = timeout(
+        Duration::from_secs(2),
+        connect_vless_udp_via_outbound(&resolver, &target, &runtime, &outbound),
+    )
+    .await
+    .expect("VLESS UDP connect timeout")
+    .expect("connect VLESS UDP outbound");
+    proxy
+        .send_to(&target, b"query")
+        .await
+        .expect("send VLESS UDP packet");
+    let mut response = [0u8; 16];
+    let (source, length) =
+        timeout(Duration::from_secs(2), proxy.recv_from(&mut response))
+            .await
+            .expect("VLESS UDP response timeout")
+            .expect("read VLESS UDP response");
+    assert_eq!(source, target);
+    assert_eq!(&response[..length], b"pong");
+    server_task.await.expect("VLESS fake server task");
 }
 
 #[cfg(feature = "vless-reverse")]
@@ -894,6 +1772,7 @@ fn encoded_vless_reverse_account_cannot_downgrade_to_forward_outbound() {
         reverse: Some(VlessReversePayload {
             tag: "reverse-in".into(),
             sniffing: None,
+            site_to_site_json: String::new(),
         }),
     };
     let config = VlessClientConfigPayload {
@@ -1234,6 +2113,129 @@ fn static_vless_reverse_sniffing_round_trips_xray_fields() {
 
 #[cfg(feature = "vless-reverse")]
 #[test]
+fn static_vless_reverse_site_to_site_policy_round_trips_and_validates() {
+    let item: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tunnel",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {
+                "tag": "home-edge",
+                "siteToSite": {
+                    "prefixMaps": [{
+                        "from": "10.200.1.0/24",
+                        "to": "192.168.50.0/24"
+                    }],
+                    "allow": [{
+                        "network": ["tcp", "udp"],
+                        "ip": ["192.168.50.0/24"],
+                        "ports": ["22", "80-443"]
+                    }]
+                }
+            }
+        }
+    }))
+    .expect("parse Reverse site-to-site policy");
+
+    let outbound =
+        compile_static_outbound(&item).expect("compile Reverse site-to-site policy");
+    let bridge = decode_vless_reverse_bridge(&outbound)
+        .expect("decode Reverse Bridge site policy");
+    let policy = bridge.site_to_site.expect("compiled site-to-site policy");
+    assert_eq!(
+        policy
+            .map_tcp_target(&NetLocation::from_str("10.200.1.20:443", None).unwrap())
+            .unwrap(),
+        NetLocation::from_str("192.168.50.20:443", None).unwrap()
+    );
+
+    let invalid: OutboundItem = serde_json::from_value(serde_json::json!({
+        "protocol": "vless",
+        "tag": "reverse-tunnel",
+        "settings": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+            "encryption": "none",
+            "reverse": {
+                "tag": "home-edge",
+                "siteToSite": {
+                    "prefixMaps": [{
+                        "from": "10.200.1.0/24",
+                        "to": "192.168.50.0/24"
+                    }],
+                    "allow": [{
+                        "networks": ["tcp"],
+                        "ip": ["192.168.50.0/24"],
+                        "ports": ["443"]
+                    }]
+                }
+            }
+        }
+    }))
+    .expect("parse invalid reverse extension");
+    let error = compile_static_outbound(&invalid)
+        .expect_err("unknown policy fields must fail closed");
+    assert!(error.contains("siteToSite"), "{error}");
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn static_vless_reverse_site_to_site_rejects_target_override_without_route_only() {
+    let outbound = |route_only| {
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "tag": "reverse-tunnel",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 1234,
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "encryption": "none",
+                "reverse": {
+                    "tag": "home-edge",
+                    "sniffing": {
+                        "enabled": true,
+                        "destOverride": ["http", "tls"],
+                        "routeOnly": route_only
+                    },
+                    "siteToSite": {
+                        "prefixMaps": [{
+                            "from": "10.200.1.0/24",
+                            "to": "192.168.50.0/24"
+                        }],
+                        "allow": [{
+                            "network": ["tcp"],
+                            "ip": ["192.168.50.0/24"],
+                            "ports": ["80-443"]
+                        }]
+                    }
+                }
+            }
+        }))
+        .expect("parse Reverse site-to-site plus sniffing");
+        compile_static_outbound(&item).expect("compile static outbound")
+    };
+
+    let error = maybe_decode_vless_reverse_bridge(&outbound(false))
+        .expect_err("non-route-only target override could bypass the mapped ACL");
+    assert!(
+        error.to_string().contains("destOverride")
+            && error.to_string().contains("routeOnly"),
+        "{error}"
+    );
+
+    let endpoint = maybe_decode_vless_reverse_bridge(&outbound(true))
+        .expect("route-only sniffing preserves the checked target")
+        .expect("Reverse Bridge endpoint");
+    assert!(endpoint.site_to_site.is_some());
+    assert!(endpoint.sniffing.expect("sniffing config").route_only);
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
 fn static_vless_reverse_sniffing_rejects_unsupported_metadata_only() {
     let item: OutboundItem = serde_json::from_value(serde_json::json!({
         "protocol": "vless",
@@ -1355,6 +2357,12 @@ async fn routed_tcp_connection_uses_vless_outbound_and_strips_response_header() 
         );
         assert_eq!(header.remote_location.to_string(), "origin.example:443");
         assert!(header.flow.is_empty());
+        let mut early_payload = [0; 10];
+        stream
+            .read_exact(&mut early_payload)
+            .await
+            .expect("read VLESS uplink before sending response header");
+        assert_eq!(&early_payload, b"early-data");
         stream
             .write_all(&[0, 0])
             .await
@@ -1403,6 +2411,10 @@ async fn routed_tcp_connection_uses_vless_outbound_and_strips_response_header() 
     .expect("VLESS route should not blackhole");
     assert_eq!(connection.outbound_tag.as_deref(), Some("proxy"));
     let mut stream = connection.stream;
+    stream
+        .write_all(b"early-data")
+        .await
+        .expect("write VLESS uplink before response header");
     assert_eq!(stream.read_u8().await.expect("read relayed byte"), b'x');
     server.await.expect("fake VLESS server task");
 }
@@ -3623,6 +4635,7 @@ fn direct_outbound_defaults_to_implicit_freedom() {
         DirectOutboundAction::Freedom {
             tag: None,
             proxy_protocol: 0,
+            final_rules: Vec::new(),
         }
     );
 }

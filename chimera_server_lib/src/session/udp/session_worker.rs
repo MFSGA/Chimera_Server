@@ -1,13 +1,22 @@
+#[cfg(feature = "vless-reverse")]
+use bytes::Bytes;
 use tokio::task::JoinHandle;
 
-#[cfg(feature = "trojan")]
-use crate::resolver::resolve_single_address;
+use crate::{
+    address::NetLocation,
+    outbound::connect_vless_udp_via_outbound,
+    resolver::{Resolver, resolve_single_address},
+    runtime::OutboundSummary,
+};
 
 use super::*;
 
 #[derive(Clone)]
 pub(crate) enum SessionUdpSender {
     Local(mpsc::Sender<LocalUdpPayload>),
+    Vless(mpsc::Sender<Vec<u8>>),
+    #[cfg(feature = "vless-reverse")]
+    Reverse(mpsc::Sender<Vec<u8>>),
     #[cfg(feature = "trojan")]
     Trojan(mpsc::Sender<LocalUdpPayload>),
     Global {
@@ -20,6 +29,9 @@ impl SessionUdpSender {
     pub(crate) fn is_closed(&self) -> bool {
         match self {
             Self::Local(sender) => sender.is_closed(),
+            Self::Vless(sender) => sender.is_closed(),
+            #[cfg(feature = "vless-reverse")]
+            Self::Reverse(sender) => sender.is_closed(),
             #[cfg(feature = "trojan")]
             Self::Trojan(sender) => sender.is_closed(),
             Self::Global { sender, .. } => sender.is_closed(),
@@ -39,6 +51,13 @@ impl SessionUdpSender {
                 })
                 .await
                 .map_err(|error| error.0.payload),
+            Self::Vless(sender) => {
+                sender.send(payload).await.map_err(|error| error.0)
+            }
+            #[cfg(feature = "vless-reverse")]
+            Self::Reverse(sender) => {
+                sender.send(payload).await.map_err(|error| error.0)
+            }
             #[cfg(feature = "trojan")]
             Self::Trojan(sender) => sender
                 .send(LocalUdpPayload {
@@ -96,7 +115,9 @@ impl Drop for LocalSessionUdpTask {
 
 pub(crate) struct SessionUdpWorker {
     pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) route_target: NetLocation,
     pub(crate) global_id: Option<[u8; 8]>,
+    pub(crate) global_backend_key: Option<GlobalUdpWorkerKey>,
     pub(crate) generation: u64,
     pub(crate) sender: SessionUdpSender,
     pub(crate) task: Option<LocalSessionUdpTask>,
@@ -109,6 +130,7 @@ pub(crate) enum SessionUdpWorkerPlan {
 
 pub(crate) struct SessionUdpWorkerStart {
     pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) route_target: NetLocation,
     pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
     pub(crate) traffic_context: Option<TrafficContext>,
     pub(crate) global_id: Option<[u8; 8]>,
@@ -118,6 +140,7 @@ pub(crate) struct SessionUdpWorkerStart {
 #[cfg(feature = "trojan")]
 pub(crate) struct TrojanSessionUdpWorkerStart {
     pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) route_target: NetLocation,
     pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
     pub(crate) traffic_context: Option<TrafficContext>,
     pub(crate) resolver: Arc<dyn Resolver>,
@@ -127,14 +150,63 @@ pub(crate) struct TrojanSessionUdpWorkerStart {
     pub(crate) idle_timeout: Duration,
 }
 
+pub(crate) struct VlessSessionUdpWorkerStart {
+    pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) traffic_context: Option<TrafficContext>,
+    pub(crate) resolver: Arc<dyn Resolver>,
+    pub(crate) runtime: DataPlaneRuntime,
+    pub(crate) outbound: OutboundSummary,
+    pub(crate) target: NetLocation,
+    pub(crate) idle_timeout: Duration,
+}
+
+#[cfg(feature = "vless-reverse")]
+pub(crate) struct ReverseSessionUdpWorkerStart {
+    pub(crate) key: TargetedUdpSessionKey,
+    pub(crate) response_sender: mpsc::Sender<SessionUdpEvent>,
+    pub(crate) traffic_context: Option<TrafficContext>,
+    pub(crate) resolver: Arc<dyn Resolver>,
+    pub(crate) runtime: DataPlaneRuntime,
+    pub(crate) tag: String,
+    pub(crate) target: NetLocation,
+    pub(crate) source: SocketAddr,
+    pub(crate) local: Option<SocketAddr>,
+    pub(crate) global_id: Option<[u8; 8]>,
+    pub(crate) idle_timeout: Duration,
+}
+
 pub(crate) fn session_udp_worker_matches(
     worker: &SessionUdpWorker,
     key: &TargetedUdpSessionKey,
     global_id: Option<[u8; 8]>,
 ) -> bool {
-    worker.global_id == global_id
-        && !worker.sender.is_closed()
-        && GlobalUdpWorkerKey::from(&worker.key) == GlobalUdpWorkerKey::from(key)
+    let expected_backend_key = global_id.map(|_| GlobalUdpWorkerKey::from(key));
+    session_udp_worker_matches_backend(
+        worker,
+        key,
+        global_id,
+        expected_backend_key.as_ref(),
+    )
+}
+
+pub(crate) fn session_udp_worker_matches_backend(
+    worker: &SessionUdpWorker,
+    key: &TargetedUdpSessionKey,
+    global_id: Option<[u8; 8]>,
+    global_backend_key: Option<&GlobalUdpWorkerKey>,
+) -> bool {
+    if worker.global_id != global_id || worker.sender.is_closed() {
+        return false;
+    }
+    match global_id {
+        Some(_) => worker.global_backend_key.as_ref() == global_backend_key,
+        None => {
+            worker.global_backend_key.is_none()
+                && GlobalUdpWorkerKey::from(&worker.key)
+                    == GlobalUdpWorkerKey::from(key)
+        }
+    }
 }
 
 pub(crate) fn plan_session_udp_worker(
@@ -167,16 +239,9 @@ pub(crate) async fn replace_session_udp_worker(
     let (generation, following_generation) =
         plan_session_generation(*next_generation)?;
     *next_generation = following_generation;
-    let worker = start_session_udp_session(
-        session_id,
-        generation,
-        start.key,
-        start.response_sender,
-        start.traffic_context,
-        start.global_id,
-        start.idle_timeout,
-    )
-    .await?;
+    let worker =
+        start_session_udp_session_with_route_target(session_id, generation, start)
+            .await?;
     let sender = worker.sender.clone();
     sessions.insert(session_id, worker);
     Ok(sender)
@@ -198,6 +263,78 @@ pub(crate) async fn replace_trojan_session_udp_worker(
     let sender = worker.sender.clone();
     sessions.insert(session_id, worker);
     Ok(sender)
+}
+
+pub(crate) async fn replace_vless_session_udp_worker(
+    sessions: &mut HashMap<u16, SessionUdpWorker>,
+    session_id: u16,
+    next_generation: &mut u64,
+    start: VlessSessionUdpWorkerStart,
+) -> std::io::Result<SessionUdpSender> {
+    terminate_session_udp_worker(sessions, session_id).await;
+    let (generation, following_generation) =
+        plan_session_generation(*next_generation)?;
+    *next_generation = following_generation;
+    let worker =
+        start_vless_session_udp_session(session_id, generation, start).await?;
+    let sender = worker.sender.clone();
+    sessions.insert(session_id, worker);
+    Ok(sender)
+}
+
+#[cfg(feature = "vless-reverse")]
+pub(crate) async fn replace_reverse_session_udp_worker(
+    sessions: &mut HashMap<u16, SessionUdpWorker>,
+    session_id: u16,
+    next_generation: &mut u64,
+    start: ReverseSessionUdpWorkerStart,
+) -> std::io::Result<SessionUdpSender> {
+    terminate_session_udp_worker(sessions, session_id).await;
+    let (generation, following_generation) =
+        plan_session_generation(*next_generation)?;
+    *next_generation = following_generation;
+    let worker = if let Some(global_id) = start.global_id {
+        let route_target = start.target.clone();
+        attach_global_session_udp_session(GlobalSessionUdpAttachStart {
+            global_id,
+            session_id,
+            generation,
+            key: start.key,
+            route_target,
+            response_sender: start.response_sender,
+            traffic_context: start.traffic_context,
+            idle_timeout: start.idle_timeout,
+            backend_start: GlobalUdpBackendStart::Reverse {
+                runtime: start.runtime,
+                tag: start.tag,
+                source: start.source,
+                local: start.local,
+            },
+        })
+        .await?
+    } else {
+        start_reverse_session_udp_session(session_id, generation, start)?
+    };
+    let sender = worker.sender.clone();
+    sessions.insert(session_id, worker);
+    Ok(sender)
+}
+
+pub(crate) async fn resolve_session_udp_location(
+    resolver: &Arc<dyn Resolver>,
+    runtime: &DataPlaneRuntime,
+    target: &NetLocation,
+) -> std::io::Result<SocketAddr> {
+    match target.to_socket_addr_nonblocking() {
+        Some(address) => Ok(address),
+        None => match resolve_single_address(resolver, target).await {
+            Ok(address) => Ok(address),
+            Err(error) => {
+                runtime.record_user_domain_dns_failure();
+                Err(error)
+            }
+        },
+    }
 }
 
 async fn stop_local_session_udp_task(task: LocalSessionUdpTask) {
@@ -270,6 +407,7 @@ pub(crate) fn is_current_session_udp_response(
     )
 }
 
+#[cfg(test)]
 pub(crate) async fn start_session_udp_session(
     session_id: u16,
     generation: u64,
@@ -279,16 +417,39 @@ pub(crate) async fn start_session_udp_session(
     global_id: Option<[u8; 8]>,
     idle_timeout: Duration,
 ) -> std::io::Result<SessionUdpWorker> {
-    match global_id {
+    let route_target =
+        NetLocation::from_ip_addr(key.target_addr.ip(), key.target_addr.port());
+    start_session_udp_session_with_route_target(
+        session_id,
+        generation,
+        SessionUdpWorkerStart {
+            key,
+            route_target,
+            response_sender,
+            traffic_context,
+            global_id,
+            idle_timeout,
+        },
+    )
+    .await
+}
+
+async fn start_session_udp_session_with_route_target(
+    session_id: u16,
+    generation: u64,
+    start: SessionUdpWorkerStart,
+) -> std::io::Result<SessionUdpWorker> {
+    match start.global_id {
         Some(global_id) => {
             attach_global_session_udp_session(GlobalSessionUdpAttachStart {
                 global_id,
                 session_id,
                 generation,
-                key,
-                response_sender,
-                traffic_context,
-                idle_timeout,
+                key: start.key,
+                route_target: start.route_target,
+                response_sender: start.response_sender,
+                traffic_context: start.traffic_context,
+                idle_timeout: start.idle_timeout,
                 backend_start: GlobalUdpBackendStart::Direct,
             })
             .await
@@ -297,20 +458,220 @@ pub(crate) async fn start_session_udp_session(
             start_local_session_udp_session(
                 session_id,
                 generation,
-                key,
-                response_sender,
-                traffic_context,
-                idle_timeout,
+                start.key,
+                start.route_target,
+                start.response_sender,
+                start.traffic_context,
+                start.idle_timeout,
             )
             .await
         }
     }
 }
 
+async fn start_vless_session_udp_session(
+    session_id: u16,
+    generation: u64,
+    start: VlessSessionUdpWorkerStart,
+) -> std::io::Result<SessionUdpWorker> {
+    let mut proxy = connect_vless_udp_via_outbound(
+        &start.resolver,
+        &start.target,
+        &start.runtime,
+        &start.outbound,
+    )
+    .await?;
+    let (sender, mut receiver) =
+        mpsc::channel::<Vec<u8>>(UDP_SESSION_CHANNEL_CAPACITY);
+    let worker_key = start.key.clone();
+    let route_target = start.target.clone();
+    let target = start.target;
+    let target_addr = start.key.target_addr;
+    let response_sender = start.response_sender;
+    let traffic_context = start.traffic_context;
+    let idle_timeout = start.idle_timeout;
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+
+    let join = tokio::spawn(async move {
+        let mut response_buffer = vec![0u8; UDP_BUFFER_SIZE];
+        let mut idle = Box::pin(sleep(idle_timeout));
+        let has_error = task_cancellation
+            .run_until_cancelled(async {
+                loop {
+                    tokio::select! {
+                        _ = idle.as_mut() => break false,
+                        maybe_payload = receiver.recv() => {
+                            let Some(payload) = maybe_payload else {
+                                break false;
+                            };
+                            if let Err(error) = proxy.send_to(&target, &payload).await {
+                                debug!("VLESS session UDP write to {} failed: {}", target, error);
+                                break true;
+                            }
+                            record_transfer(traffic_context.clone(), payload.len() as u64, 0);
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                        response = proxy.recv_from(&mut response_buffer) => {
+                            let (_source, length) = match response {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    debug!("VLESS session UDP receive failed: {}", error);
+                                    break true;
+                                }
+                            };
+                            let response = SessionUdpResponse {
+                                session_id,
+                                generation,
+                                source: target_addr,
+                                payload: response_buffer[..length].to_vec(),
+                                traffic_context: traffic_context.clone(),
+                            };
+                            if response_sender.send(SessionUdpEvent::Data(response)).await.is_err() {
+                                break false;
+                            }
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                    }
+                }
+            })
+            .await;
+        let has_error = has_error.unwrap_or(false);
+        let _ = response_sender
+            .send(SessionUdpEvent::End {
+                session_id,
+                generation,
+                has_error,
+            })
+            .await;
+    });
+
+    Ok(SessionUdpWorker {
+        key: worker_key,
+        route_target,
+        global_id: None,
+        global_backend_key: None,
+        generation,
+        sender: SessionUdpSender::Vless(sender),
+        task: Some(LocalSessionUdpTask {
+            cancellation,
+            join: Some(join),
+        }),
+    })
+}
+
+#[cfg(feature = "vless-reverse")]
+fn start_reverse_session_udp_session(
+    session_id: u16,
+    generation: u64,
+    start: ReverseSessionUdpWorkerStart,
+) -> std::io::Result<SessionUdpWorker> {
+    let route_target = start.target.clone();
+    let mut session = start.runtime.open_reverse_udp(
+        &start.tag,
+        start.target.clone(),
+        start.source,
+        start.local,
+    )?;
+    let (sender, mut receiver) =
+        mpsc::channel::<Vec<u8>>(UDP_SESSION_CHANNEL_CAPACITY);
+    let worker_key = start.key.clone();
+    let fallback_source = start.key.target_addr;
+    let resolver = start.resolver;
+    let runtime = start.runtime;
+    let response_sender = start.response_sender;
+    let traffic_context = start.traffic_context;
+    let idle_timeout = start.idle_timeout;
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+
+    let join = tokio::spawn(async move {
+        let mut idle = Box::pin(sleep(idle_timeout));
+        let has_error = task_cancellation
+            .run_until_cancelled(async {
+                loop {
+                    tokio::select! {
+                        _ = idle.as_mut() => break false,
+                        maybe_payload = receiver.recv() => {
+                            let Some(payload) = maybe_payload else {
+                                break false;
+                            };
+                            let payload_length = payload.len();
+                            if let Err(error) = session.send(Bytes::from(payload), None).await {
+                                debug!("VLESS Reverse session UDP write failed: {}", error);
+                                break true;
+                            }
+                            record_transfer(traffic_context.clone(), payload_length as u64, 0);
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                        response = session.recv() => {
+                            let (payload, target_override) = match response {
+                                Ok(Some(response)) => response,
+                                Ok(None) => break false,
+                                Err(error) => {
+                                    debug!("VLESS Reverse session UDP receive failed: {}", error);
+                                    break true;
+                                }
+                            };
+                            let source = match target_override {
+                                Some(source) => match resolve_session_udp_location(&resolver, &runtime, &source.location).await {
+                                    Ok(source) => source,
+                                    Err(error) => {
+                                        debug!("VLESS Reverse UDP response source resolution failed: {}", error);
+                                        break true;
+                                    }
+                                },
+                                None => fallback_source,
+                            };
+                            let response = SessionUdpResponse {
+                                session_id,
+                                generation,
+                                source,
+                                payload: payload.to_vec(),
+                                traffic_context: traffic_context.clone(),
+                            };
+                            if response_sender.send(SessionUdpEvent::Data(response)).await.is_err() {
+                                break false;
+                            }
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                        }
+                    }
+                }
+            })
+            .await;
+        let mut has_error = has_error.unwrap_or(false);
+        if let Err(error) = session.close().await {
+            debug!("VLESS Reverse session UDP close failed: {}", error);
+            has_error = true;
+        }
+        let _ = response_sender
+            .send(SessionUdpEvent::End {
+                session_id,
+                generation,
+                has_error,
+            })
+            .await;
+    });
+
+    Ok(SessionUdpWorker {
+        key: worker_key,
+        route_target,
+        global_id: None,
+        global_backend_key: None,
+        generation,
+        sender: SessionUdpSender::Reverse(sender),
+        task: Some(LocalSessionUdpTask {
+            cancellation,
+            join: Some(join),
+        }),
+    })
+}
+
 async fn start_local_session_udp_session(
     session_id: u16,
     generation: u64,
     key: TargetedUdpSessionKey,
+    route_target: NetLocation,
     response_sender: mpsc::Sender<SessionUdpEvent>,
     traffic_context: Option<TrafficContext>,
     idle_timeout: Duration,
@@ -411,7 +772,9 @@ async fn start_local_session_udp_session(
 
     Ok(SessionUdpWorker {
         key: worker_key,
+        route_target,
         global_id: None,
+        global_backend_key: None,
         generation,
         sender: SessionUdpSender::Local(sender),
         task: Some(LocalSessionUdpTask {
@@ -433,6 +796,7 @@ async fn start_trojan_session_udp_session(
             session_id,
             generation,
             key: start.key,
+            route_target: start.route_target,
             response_sender: start.response_sender,
             traffic_context: start.traffic_context,
             idle_timeout: start.idle_timeout,
@@ -457,6 +821,7 @@ async fn start_trojan_session_udp_session(
     let (sender, mut receiver) =
         mpsc::channel::<LocalUdpPayload>(UDP_SESSION_CHANNEL_CAPACITY);
     let worker_key = start.key.clone();
+    let route_target = start.route_target;
     let response_sender = start.response_sender;
     let traffic_context = start.traffic_context;
     let resolver = start.resolver;
@@ -550,7 +915,9 @@ async fn start_trojan_session_udp_session(
 
     Ok(SessionUdpWorker {
         key: worker_key,
+        route_target,
         global_id: None,
+        global_backend_key: None,
         generation,
         sender: SessionUdpSender::Trojan(sender),
         task: Some(LocalSessionUdpTask {

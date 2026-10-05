@@ -1,13 +1,14 @@
 use std::{
     convert::Infallible,
     io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
+use bytes::{Buf as _, Bytes};
 use futures::StreamExt as _;
 use http_body_util::{
     BodyExt as _, Empty, Full, StreamBody, combinators::UnsyncBoxBody,
@@ -51,11 +52,15 @@ pub(super) struct XhttpOutboundStream {
     connection_abort: AbortHandle,
     downlink_abort: AbortHandle,
     uplink_abort: AbortHandle,
+    uplink_response_abort: Option<AbortHandle>,
 }
 
 impl Drop for XhttpOutboundStream {
     fn drop(&mut self) {
         self.uplink_abort.abort();
+        if let Some(abort) = &self.uplink_response_abort {
+            abort.abort();
+        }
         self.downlink_abort.abort();
         self.connection_abort.abort();
     }
@@ -125,6 +130,561 @@ impl AsyncPing for XhttpOutboundStream {
 
 impl AsyncStream for XhttpOutboundStream {}
 
+#[cfg(feature = "tls")]
+pub(super) async fn connect_xhttp_h3(
+    target_addr: SocketAddr,
+    tls: &super::OutboundTlsClientSettings,
+    settings: &OutboundXhttpClientSettings,
+    server: &NetLocation,
+) -> io::Result<XhttpOutboundStream> {
+    if settings.xmux.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "XHTTP xmux runtime reuse is not implemented yet",
+        ));
+    }
+
+    let (tls_config, server_name) = super::build_tls_client_config(tls, server)?;
+    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid outbound XHTTP/3 TLS configuration: {error}"),
+            )
+        })?;
+    let local_addr: SocketAddr = if target_addr.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let mut endpoint = quinn::Endpoint::client(local_addr)?;
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_tls)));
+    let connecting =
+        endpoint
+            .connect(target_addr, &server_name)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid XHTTP/3 QUIC destination: {error}"),
+                )
+            })?;
+    let quic_connection = connecting.await.map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("XHTTP/3 QUIC connection failed: {error}"),
+        )
+    })?;
+    let (mut connection, sender) = h3::client::builder()
+        .build(h3_quinn::Connection::new(quic_connection))
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP/3 connection setup failed: {error}"),
+            )
+        })?;
+    let sender_for_requests = sender.clone();
+
+    let shared_error = Arc::new(Mutex::new(None));
+    let connection_error = Arc::clone(&shared_error);
+    let connection_task = tokio::spawn(async move {
+        // Keeping one sender alive prevents h3 from initiating graceful shutdown
+        // while an XHTTP request is still carrying the VLESS byte stream.
+        let _sender_keepalive = sender;
+        let _endpoint_keepalive = endpoint;
+        let error = connection.wait_idle().await;
+        if !error.is_h3_no_error() {
+            set_xhttp_error(
+                &connection_error,
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP/3 connection failed: {error}"),
+            );
+        }
+    });
+    let connection_abort = connection_task.abort_handle();
+    drop(connection_task);
+    let mut connection_guard = AbortOnDrop::new(connection_abort.clone());
+
+    let result = match settings.mode {
+        OutboundXhttpMode::StreamUp => {
+            connect_xhttp_stream_up_h3(
+                sender_for_requests,
+                settings,
+                server,
+                &tls.server_name,
+                shared_error,
+                connection_abort,
+            )
+            .await
+        }
+        OutboundXhttpMode::Auto | OutboundXhttpMode::PacketUp => {
+            connect_xhttp_packet_up_h3(
+                sender_for_requests,
+                settings,
+                server,
+                &tls.server_name,
+                shared_error,
+                connection_abort,
+            )
+            .await
+        }
+    };
+
+    match result {
+        Ok(stream) => {
+            let _ = connection_guard.disarm();
+            Ok(stream)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "tls")]
+async fn connect_xhttp_stream_up_h3(
+    mut sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    settings: &OutboundXhttpClientSettings,
+    server: &NetLocation,
+    tls_server_name: &str,
+    shared_error: Arc<Mutex<Option<(io::ErrorKind, String)>>>,
+    connection_abort: AbortHandle,
+) -> io::Result<XhttpOutboundStream> {
+    let authority = xhttp_authority(settings, server, Some(tls_server_name));
+    let session_id = xhttp_session_id();
+    let downlink_padding = xhttp_padding_value(settings)?;
+    let downlink_uri =
+        xhttp_request_uri(settings, &authority, &session_id, &downlink_padding)?;
+    let downlink_request = apply_xhttp_headers(
+        Request::builder().method(Method::GET).uri(downlink_uri),
+        settings,
+        &authority,
+        &downlink_padding,
+        &session_id,
+        false,
+    )?
+    .body(())
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to build XHTTP/3 downlink request: {error}"),
+        )
+    })?;
+    let downlink_stream =
+        sender
+            .send_request(downlink_request)
+            .await
+            .map_err(|error| {
+                h3_request_error("XHTTP/3 downlink request failed", error)
+            })?;
+    let (mut downlink_send, mut downlink_receive) = downlink_stream.split();
+    downlink_send.finish().await.map_err(|error| {
+        h3_request_error("XHTTP/3 downlink finish failed", error)
+    })?;
+    let downlink_response =
+        downlink_receive.recv_response().await.map_err(|error| {
+            h3_request_error("XHTTP/3 downlink response failed", error)
+        })?;
+    if downlink_response.status() != hyper::StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "XHTTP/3 downlink returned HTTP status {}",
+                downlink_response.status()
+            ),
+        ));
+    }
+
+    let uplink_method = Method::from_bytes(settings.uplink_http_method.as_bytes())
+        .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid XHTTP uplinkHTTPMethod {}: {error}",
+                settings.uplink_http_method
+            ),
+        )
+    })?;
+    let uplink_padding = xhttp_padding_value(settings)?;
+    let uplink_uri =
+        xhttp_request_uri(settings, &authority, &session_id, &uplink_padding)?;
+    let uplink_request = apply_xhttp_headers(
+        Request::builder().method(uplink_method).uri(uplink_uri),
+        settings,
+        &authority,
+        &uplink_padding,
+        &session_id,
+        true,
+    )?
+    .body(())
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to build XHTTP/3 uplink request: {error}"),
+        )
+    })?;
+    let uplink = sender
+        .send_request(uplink_request)
+        .await
+        .map_err(|error| h3_request_error("XHTTP/3 uplink request failed", error))?;
+    let (mut uplink_send, mut uplink_receive) = uplink.split();
+    let (app_stream, transport_stream) = duplex(XHTTP_PIPE_CAPACITY);
+    let (mut upload_read, mut download_write) = split(transport_stream);
+    let uplink_error = Arc::clone(&shared_error);
+    let uplink_task = tokio::spawn(async move {
+        let mut buffer = vec![0u8; XHTTP_PACKET_READ_CAPACITY];
+        loop {
+            let length = match upload_read.read(&mut buffer).await {
+                Ok(0) => {
+                    if let Err(error) = uplink_send.finish().await {
+                        set_xhttp_error(
+                            &uplink_error,
+                            io::ErrorKind::ConnectionAborted,
+                            format!("XHTTP/3 uplink finish failed: {error}"),
+                        );
+                    }
+                    break;
+                }
+                Ok(length) => length,
+                Err(error) => {
+                    set_xhttp_error(
+                        &uplink_error,
+                        error.kind(),
+                        format!("XHTTP/3 uplink read failed: {error}"),
+                    );
+                    break;
+                }
+            };
+            if let Err(error) = uplink_send
+                .send_data(Bytes::copy_from_slice(&buffer[..length]))
+                .await
+            {
+                set_xhttp_error(
+                    &uplink_error,
+                    io::ErrorKind::ConnectionAborted,
+                    format!("XHTTP/3 uplink send failed: {error}"),
+                );
+                break;
+            }
+        }
+    });
+    let uplink_abort = uplink_task.abort_handle();
+    drop(uplink_task);
+
+    let uplink_error = Arc::clone(&shared_error);
+    let uplink_response_task = tokio::spawn(async move {
+        match uplink_receive.recv_response().await {
+            Ok(response) if response.status() == hyper::StatusCode::OK => loop {
+                match uplink_receive.recv_data().await {
+                    Ok(Some(data)) => drop(data),
+                    Ok(None) => break,
+                    Err(error) => {
+                        set_xhttp_error(
+                            &uplink_error,
+                            io::ErrorKind::ConnectionAborted,
+                            format!("XHTTP/3 uplink response failed: {error}"),
+                        );
+                        break;
+                    }
+                }
+            },
+            Ok(response) => set_xhttp_error(
+                &uplink_error,
+                io::ErrorKind::ConnectionRefused,
+                format!("XHTTP/3 uplink returned HTTP status {}", response.status()),
+            ),
+            Err(error) => set_xhttp_error(
+                &uplink_error,
+                io::ErrorKind::ConnectionAborted,
+                format!("XHTTP/3 uplink response failed: {error}"),
+            ),
+        }
+    });
+    let uplink_response_abort = uplink_response_task.abort_handle();
+    drop(uplink_response_task);
+
+    let downlink_error = Arc::clone(&shared_error);
+    let downlink_task = tokio::spawn(async move {
+        loop {
+            match downlink_receive.recv_data().await {
+                Ok(Some(mut data)) => {
+                    let bytes = data.copy_to_bytes(data.remaining());
+                    if let Err(error) = download_write.write_all(&bytes).await {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            set_xhttp_error(
+                                &downlink_error,
+                                error.kind(),
+                                format!("XHTTP/3 downlink write failed: {error}"),
+                            );
+                        }
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    set_xhttp_error(
+                        &downlink_error,
+                        io::ErrorKind::ConnectionAborted,
+                        format!("XHTTP/3 downlink response failed: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+        let _ = download_write.shutdown().await;
+    });
+    let downlink_abort = downlink_task.abort_handle();
+    drop(downlink_task);
+
+    Ok(XhttpOutboundStream {
+        inner: app_stream,
+        shared_error,
+        connection_abort,
+        downlink_abort,
+        uplink_abort,
+        uplink_response_abort: Some(uplink_response_abort),
+    })
+}
+
+#[cfg(feature = "tls")]
+async fn connect_xhttp_packet_up_h3(
+    mut sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    settings: &OutboundXhttpClientSettings,
+    server: &NetLocation,
+    tls_server_name: &str,
+    shared_error: Arc<Mutex<Option<(io::ErrorKind, String)>>>,
+    connection_abort: AbortHandle,
+) -> io::Result<XhttpOutboundStream> {
+    let uplink_method = Method::from_bytes(settings.uplink_http_method.as_bytes())
+        .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid XHTTP uplinkHTTPMethod {}: {error}",
+                settings.uplink_http_method
+            ),
+        )
+    })?;
+    let authority = xhttp_authority(settings, server, Some(tls_server_name));
+    let session_id = xhttp_session_id();
+    let downlink_padding = xhttp_padding_value(settings)?;
+    let downlink_uri =
+        xhttp_request_uri(settings, &authority, &session_id, &downlink_padding)?;
+    let downlink_request = apply_xhttp_headers(
+        Request::builder().method(Method::GET).uri(downlink_uri),
+        settings,
+        &authority,
+        &downlink_padding,
+        &session_id,
+        false,
+    )?
+    .body(())
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to build XHTTP/3 downlink request: {error}"),
+        )
+    })?;
+    let downlink = sender
+        .send_request(downlink_request)
+        .await
+        .map_err(|error| {
+            h3_request_error("XHTTP/3 downlink request failed", error)
+        })?;
+    let (mut downlink_send, mut downlink_receive) = downlink.split();
+    downlink_send.finish().await.map_err(|error| {
+        h3_request_error("XHTTP/3 downlink request finish failed", error)
+    })?;
+    let downlink_response =
+        downlink_receive.recv_response().await.map_err(|error| {
+            h3_request_error("XHTTP/3 downlink response failed", error)
+        })?;
+    if downlink_response.status() != hyper::StatusCode::OK {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "XHTTP/3 downlink returned HTTP status {}",
+                downlink_response.status()
+            ),
+        ));
+    }
+
+    let (app_stream, transport_stream) = duplex(XHTTP_PIPE_CAPACITY);
+    let (mut upload_read, mut download_write) = split(transport_stream);
+    let downlink_error = Arc::clone(&shared_error);
+    let downlink_task = tokio::spawn(async move {
+        loop {
+            match downlink_receive.recv_data().await {
+                Ok(Some(mut data)) => {
+                    let bytes = data.copy_to_bytes(data.remaining());
+                    if let Err(error) = download_write.write_all(&bytes).await {
+                        if error.kind() != io::ErrorKind::BrokenPipe {
+                            set_xhttp_error(
+                                &downlink_error,
+                                error.kind(),
+                                format!("XHTTP/3 downlink write failed: {error}"),
+                            );
+                        }
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    set_xhttp_error(
+                        &downlink_error,
+                        io::ErrorKind::ConnectionAborted,
+                        format!("XHTTP/3 downlink response failed: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
+        let _ = download_write.shutdown().await;
+    });
+    let downlink_abort = downlink_task.abort_handle();
+    drop(downlink_task);
+
+    let uplink_settings = settings.clone();
+    let uplink_authority = authority.clone();
+    let uplink_session_id = session_id;
+    let uplink_error = Arc::clone(&shared_error);
+    let uplink_task = tokio::spawn(async move {
+        if let Err(error) = run_xhttp_packet_uplink_h3(
+            &mut sender,
+            &mut upload_read,
+            &uplink_settings,
+            uplink_method,
+            &uplink_authority,
+            &uplink_session_id,
+        )
+        .await
+        {
+            tracing::warn!(%error, "XHTTP/3 packet-up uplink stopped");
+            set_xhttp_error(&uplink_error, error.kind(), error.to_string());
+        }
+    });
+    let uplink_abort = uplink_task.abort_handle();
+    drop(uplink_task);
+
+    Ok(XhttpOutboundStream {
+        inner: app_stream,
+        shared_error,
+        connection_abort,
+        downlink_abort,
+        uplink_abort,
+        uplink_response_abort: None,
+    })
+}
+
+#[cfg(feature = "tls")]
+async fn run_xhttp_packet_uplink_h3(
+    sender: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    reader: &mut (impl AsyncRead + Unpin),
+    settings: &OutboundXhttpClientSettings,
+    method: Method,
+    authority: &str,
+    session_id: &str,
+) -> io::Result<()> {
+    let max_each_post_bytes = random_xray_range(
+        settings.max_each_post_bytes.0,
+        settings.max_each_post_bytes.1,
+    );
+    let read_capacity = max_each_post_bytes.clamp(1, XHTTP_PACKET_READ_CAPACITY);
+    let mut buffer = vec![0u8; read_capacity];
+    let mut seq = 0u64;
+    let mut last_write: Option<Instant> = None;
+
+    loop {
+        let length = reader.read(&mut buffer).await?;
+        if length == 0 {
+            return Ok(());
+        }
+
+        if settings.min_posts_interval_ms.0 > 0 {
+            let minimum = Duration::from_millis(random_xray_range(
+                settings.min_posts_interval_ms.0,
+                settings.min_posts_interval_ms.1,
+            ) as u64);
+            if let Some(last_write) = last_write {
+                let elapsed = last_write.elapsed();
+                if elapsed < minimum {
+                    sleep(minimum - elapsed).await;
+                }
+            }
+        }
+
+        let padding = xhttp_padding_value(settings)?;
+        let seq_text = seq.to_string();
+        let uri = xhttp_request_uri_with_sequence(
+            settings, authority, session_id, &padding, &seq_text,
+        )?;
+        let payload = Bytes::copy_from_slice(&buffer[..length]);
+        let request = apply_xhttp_packet_headers(
+            Request::builder().method(method.clone()).uri(uri),
+            settings,
+            authority,
+            &padding,
+            session_id,
+            &seq_text,
+            &payload,
+        )?
+        .body(())
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to build XHTTP/3 packet-up request: {error}"),
+            )
+        })?;
+        let mut request_stream =
+            sender.send_request(request).await.map_err(|error| {
+                h3_request_error("XHTTP/3 packet-up request failed", error)
+            })?;
+        if matches!(
+            settings.uplink_data_placement,
+            OutboundXhttpDataPlacement::Auto | OutboundXhttpDataPlacement::Body
+        ) {
+            request_stream.send_data(payload).await.map_err(|error| {
+                h3_request_error("XHTTP/3 packet-up send failed", error)
+            })?;
+        }
+        request_stream.finish().await.map_err(|error| {
+            h3_request_error("XHTTP/3 packet-up finish failed", error)
+        })?;
+        let response = request_stream.recv_response().await.map_err(|error| {
+            h3_request_error("XHTTP/3 packet-up response failed", error)
+        })?;
+        tracing::trace!(sequence = seq, status = %response.status(), "received XHTTP/3 packet-up response");
+        if response.status() != hyper::StatusCode::OK {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!(
+                    "XHTTP/3 packet-up returned HTTP status {}",
+                    response.status()
+                ),
+            ));
+        }
+        while let Some(data) = request_stream.recv_data().await.map_err(|error| {
+            h3_request_error("XHTTP/3 packet-up response failed", error)
+        })? {
+            drop(data);
+        }
+        last_write = Some(Instant::now());
+        seq = seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "XHTTP packet-up sequence exhausted",
+            )
+        })?;
+    }
+}
+
+#[cfg(feature = "tls")]
+fn h3_request_error(context: &str, error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!("{context}: {error}"),
+    )
+}
+
+#[cfg(feature = "tls")]
 pub(super) async fn connect_xhttp_h2(
     stream: Box<dyn AsyncStream>,
     settings: &OutboundXhttpClientSettings,
@@ -332,6 +892,7 @@ async fn connect_xhttp_stream_up_h2(
         connection_abort,
         downlink_abort,
         uplink_abort,
+        uplink_response_abort: None,
     })
 }
 
@@ -488,6 +1049,7 @@ async fn connect_xhttp_packet_up_h2(
         connection_abort,
         downlink_abort,
         uplink_abort,
+        uplink_response_abort: None,
     })
 }
 

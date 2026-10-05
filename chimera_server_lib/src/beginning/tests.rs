@@ -368,6 +368,7 @@ async fn bound_inbound_tasks_drop_releases_ready_listener() {
     panic!("dropping an unadopted bound result must release its listener");
 }
 
+#[cfg(feature = "traffic")]
 #[test]
 fn configured_identity_registration_respects_user_stats_policy() {
     let disabled_identity = "stats-policy-disabled-identity";

@@ -212,6 +212,22 @@ impl HandlerServiceImpl {
                 )));
             }
         };
+        if protocol == "freedom" {
+            if outbound.sender_settings.is_some() {
+                return Err(Status::unimplemented(
+                    "freedom outbound sender_settings are not implemented",
+                ));
+            }
+            crate::outbound::validate_freedom_outbound_settings(&OutboundSummary {
+                tag: outbound.tag.clone(),
+                protocol: protocol.to_string(),
+                proxy_settings_type: Some(proxy_settings.r#type.clone()),
+                proxy_settings_value: Some(proxy_settings.value.clone()),
+                sender_settings_type: None,
+                sender_settings_value: None,
+            })
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        }
         Ok(OutboundSummary {
             tag: outbound.tag,
             protocol: protocol.to_string(),

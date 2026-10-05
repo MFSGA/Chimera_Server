@@ -1,6 +1,14 @@
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use tokio::io::{
+    AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf,
+};
 
 use crate::address::{Address, NetLocation};
+use crate::async_stream::{AsyncPing, AsyncStream, RawTcpRelayState};
 
 #[cfg(feature = "vless-reverse")]
 use super::VlessReverseBridgeEndpoint;
@@ -12,6 +20,21 @@ pub(super) enum TrojanCommand {
     #[allow(dead_code)]
     // UDP is selected by protocol combinations not present in minimal builds.
     Udp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VlessCommand {
+    Tcp,
+    Udp,
+}
+
+impl VlessCommand {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Tcp => 0x01,
+            Self::Udp => 0x02,
+        }
+    }
 }
 
 impl TrojanCommand {
@@ -33,11 +56,173 @@ pub(super) enum TcpProtocolHandshake {
     Vless {
         target: NetLocation,
         endpoint: VlessOutboundEndpoint,
+        command: VlessCommand,
     },
     Trojan {
         target: NetLocation,
         endpoint: TrojanOutboundEndpoint,
     },
+}
+
+/// VLESS servers may defer flushing the response header until the first
+/// downstream data. Keep the uplink writable while parsing that header on the
+/// first read so reverse portals cannot deadlock waiting for client payload.
+pub(super) struct VlessResponseHeaderStream<S> {
+    inner: S,
+    response_header: [u8; 2],
+    response_header_bytes_read: usize,
+    addon_bytes: [u8; u8::MAX as usize],
+    addon_bytes_read: usize,
+    header_complete: bool,
+}
+
+impl<S> VlessResponseHeaderStream<S> {
+    pub(super) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            response_header: [0; 2],
+            response_header_bytes_read: 0,
+            addon_bytes: [0; u8::MAX as usize],
+            addon_bytes_read: 0,
+            header_complete: false,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> VlessResponseHeaderStream<S> {
+    fn poll_response_header(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        while self.response_header_bytes_read < self.response_header.len() {
+            let bytes_read = {
+                let mut buffer = ReadBuf::new(
+                    &mut self.response_header[self.response_header_bytes_read..],
+                );
+                match Pin::new(&mut self.inner).poll_read(cx, &mut buffer) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) if buffer.filled().is_empty() => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "truncated VLESS response header",
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => buffer.filled().len(),
+                }
+            };
+            self.response_header_bytes_read += bytes_read;
+        }
+
+        if self.response_header[0] != 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected VLESS response version {}",
+                    self.response_header[0]
+                ),
+            )));
+        }
+
+        let addon_len = usize::from(self.response_header[1]);
+        while self.addon_bytes_read < addon_len {
+            let bytes_read = {
+                let mut buffer = ReadBuf::new(
+                    &mut self.addon_bytes[self.addon_bytes_read..addon_len],
+                );
+                match Pin::new(&mut self.inner).poll_read(cx, &mut buffer) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) if buffer.filled().is_empty() => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "truncated VLESS response addons",
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => buffer.filled().len(),
+                }
+            };
+            self.addon_bytes_read += bytes_read;
+        }
+
+        self.header_complete = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for VlessResponseHeaderStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let this = self.as_mut().get_mut();
+        if !this.header_complete {
+            match this.poll_response_header(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for VlessResponseHeaderStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncPing + Unpin> AsyncPing for VlessResponseHeaderStream<S> {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_ping(cx)
+    }
+}
+
+impl<S: AsyncStream + Unpin> AsyncStream for VlessResponseHeaderStream<S> {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        if self.header_complete {
+            self.inner.raw_tcp_relay_state()
+        } else {
+            RawTcpRelayState::Unavailable
+        }
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.header_complete
+            .then(|| self.inner.raw_tcp_fd())
+            .flatten()
+    }
 }
 
 #[cfg(feature = "vless-reverse")]
@@ -65,10 +250,13 @@ where
     read_vless_response_header(stream).await
 }
 
-pub(super) async fn vless_tcp_connect<S>(
+/// Write the VLESS request without waiting for its response header. The caller
+/// wraps the stream so that the header is validated and stripped on first read.
+pub(super) async fn vless_connect<S>(
     stream: &mut S,
     endpoint: &VlessOutboundEndpoint,
     target: &NetLocation,
+    command: VlessCommand,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
@@ -84,7 +272,7 @@ where
     request.push(0);
     request.extend_from_slice(&endpoint.user_id);
     request.push(0); // empty addons
-    request.push(1); // TCP
+    request.push(command.byte());
     request.extend_from_slice(&target.port().to_be_bytes());
     match target.address() {
         Address::Ipv4(ip) => {
@@ -109,10 +297,10 @@ where
         }
     }
     stream.write_all(&request).await?;
-    stream.flush().await?;
-    read_vless_response_header(stream).await
+    stream.flush().await
 }
 
+#[cfg(feature = "vless-reverse")]
 async fn read_vless_response_header<S>(stream: &mut S) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + Unpin + ?Sized,
@@ -326,6 +514,7 @@ mod tests {
             policy_identity: "11111111-1111-1111-1111-111111111111".to_string(),
             user_level: 0,
             sniffing: None,
+            site_to_site: None,
         };
         let expected_user = endpoint.user_id;
         let (mut client, mut server) = duplex(128);

@@ -8,11 +8,13 @@ use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 mod decode;
+mod freedom_rules;
 mod grpc_transport;
 mod http_transport;
 mod protocol;
 mod routing;
 mod static_config;
+mod vless_udp;
 mod wire;
 #[cfg(feature = "tls")]
 mod xhttp_transport;
@@ -44,11 +46,11 @@ use http_transport::websocket_accept_value;
 #[cfg(feature = "vless-reverse")]
 use protocol::vless_reverse_connect;
 use protocol::{
-    TcpProtocolHandshake, TrojanCommand, build_trojan_request, socks5_connect,
-    trojan_connect, vless_tcp_connect,
+    TcpProtocolHandshake, TrojanCommand, VlessCommand, VlessResponseHeaderStream,
+    build_trojan_request, socks5_connect, trojan_connect, vless_connect,
 };
 #[cfg(feature = "tls")]
-use xhttp_transport::connect_xhttp_h2;
+use xhttp_transport::{connect_xhttp_h2, connect_xhttp_h3};
 
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 pub(crate) use routing::connection_routing_input;
@@ -57,14 +59,61 @@ pub(crate) use routing::select_direct_outbound;
 #[cfg(feature = "hysteria")]
 pub(crate) use routing::select_direct_outbound_with_policy_identities;
 pub(crate) use routing::{
-    DirectOutboundAction, InboundRoutingMetadata, OutboundRoutingContext,
-    USER_DOMAIN_ACCESS_BLACKHOLE_TAG, select_direct_outbound_for_location,
+    DirectOutboundAction, FREEDOM_FINAL_RULES_BLACKHOLE_TAG, InboundRoutingMetadata,
+    OutboundRoutingContext, USER_DOMAIN_ACCESS_BLACKHOLE_TAG,
+    select_direct_outbound_for_location,
 };
 use routing::{TcpRoutePlan, plan_tcp_route};
 
 #[cfg(all(test, feature = "grpc_transport"))]
 use static_config::{StaticOutboundGrpcSettings, encode_static_grpc_config};
 pub(crate) use static_config::{compile_static_outbound, parse_xray_uuid};
+pub(crate) use vless_udp::VlessUdpOutboundStream;
+
+#[cfg(feature = "api")]
+pub(crate) fn validate_freedom_outbound_settings(
+    outbound: &OutboundSummary,
+) -> std::io::Result<()> {
+    decode::decode_freedom_settings(outbound).map(|_| ())
+}
+
+pub(crate) fn freedom_requires_target_ip_check(
+    outbound: Option<&OutboundSummary>,
+    inbound_protocol: Option<&str>,
+) -> std::io::Result<bool> {
+    let final_rules = outbound
+        .map(decode::decode_freedom_settings)
+        .transpose()?
+        .map(|(_, rules)| rules)
+        .unwrap_or_default();
+    Ok(freedom_rules::requires_target_ip_check(
+        &final_rules,
+        inbound_protocol,
+    ))
+}
+
+pub(crate) fn freedom_allows_targets(
+    outbound: Option<&OutboundSummary>,
+    inbound_protocol: Option<&str>,
+    network: i32,
+    targets: &[SocketAddr],
+) -> std::io::Result<bool> {
+    let final_rules = outbound
+        .map(decode::decode_freedom_settings)
+        .transpose()?
+        .map(|(_, rules)| rules)
+        .unwrap_or_default();
+    let allowed = targets.iter().all(|target| {
+        freedom_rules::allows(
+            &final_rules,
+            inbound_protocol,
+            network,
+            target.ip(),
+            target.port(),
+        )
+    });
+    Ok(allowed)
+}
 
 use crate::{
     address::{Address, NetLocation},
@@ -108,6 +157,8 @@ pub(crate) struct VlessReverseBridgeEndpoint {
     pub(crate) policy_identity: String,
     pub(crate) user_level: u32,
     pub(crate) sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
+    pub(crate) site_to_site:
+        Option<crate::handler::vless_reverse::site_policy::SiteToSitePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +351,13 @@ pub(crate) fn prepare_vless_reverse_bridge(
             #[cfg(feature = "ws")]
             Ok(Some(endpoint))
         }
-        OutboundTransport::Xhttp { .. } => {
+        OutboundTransport::Xhttp { tls, .. } => {
+            if tls.alpn.as_slice() == ["h3"] {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge XHTTP/3 is not implemented yet",
+                ));
+            }
             #[cfg(feature = "tls")]
             {
                 Ok(Some(endpoint))
@@ -310,6 +367,19 @@ pub(crate) fn prepare_vless_reverse_bridge(
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "VLESS Reverse Bridge XHTTP requires the tls feature",
+                ))
+            }
+        }
+        OutboundTransport::Reality(_) => {
+            #[cfg(feature = "reality")]
+            {
+                Ok(Some(endpoint))
+            }
+            #[cfg(not(feature = "reality"))]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge REALITY requires the reality feature",
                 ))
             }
         }
@@ -330,6 +400,15 @@ pub(crate) async fn connect_vless_reverse_bridge(
     endpoint: &VlessReverseBridgeEndpoint,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     let transport = decode_outbound_transport(outbound)?;
+    if matches!(
+        &transport,
+        OutboundTransport::Xhttp { tls, .. } if tls.alpn.as_slice() == ["h3"]
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "VLESS Reverse Bridge XHTTP/3 is not implemented yet",
+        ));
+    }
     let target = resolve_single_address(resolver, &endpoint.server).await?;
     let socket = new_tcp_socket(None, target.is_ipv6())?;
     let raw_stream = socket.connect(target).await?;
@@ -441,6 +520,24 @@ pub(crate) async fn connect_vless_reverse_bridge(
                 ));
             }
         }
+        OutboundTransport::Reality(settings) => {
+            #[cfg(feature = "reality")]
+            {
+                Box::new(connect_reality_transport(
+                    raw_stream,
+                    &settings,
+                    &endpoint.server,
+                )?)
+            }
+            #[cfg(not(feature = "reality"))]
+            {
+                let _ = (raw_stream, settings);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "VLESS Reverse Bridge REALITY requires the reality feature",
+                ));
+            }
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -521,9 +618,16 @@ pub(crate) async fn connect_tcp_outbound_with_routing_metadata(
         return Ok(None);
     };
 
-    connect_planned_tcp_outbound(resolver, runtime, plan, true, TrojanCommand::Tcp)
-        .await
-        .map(Some)
+    connect_planned_tcp_outbound(
+        resolver,
+        runtime,
+        plan,
+        true,
+        TrojanCommand::Tcp,
+        VlessCommand::Tcp,
+    )
+    .await
+    .map(Some)
 }
 
 async fn connect_planned_tcp_outbound(
@@ -532,6 +636,7 @@ async fn connect_planned_tcp_outbound(
     plan: TcpRoutePlan,
     record_observation: bool,
     trojan_command: TrojanCommand,
+    vless_command: VlessCommand,
 ) -> std::io::Result<TcpOutboundConnection> {
     #[cfg(feature = "vless-reverse")]
     if let TcpRoutePlan::VlessReverse {
@@ -597,7 +702,11 @@ async fn connect_planned_tcp_outbound(
                     Some(outbound.tag),
                     transport,
                     Some(server),
-                    TcpProtocolHandshake::Vless { target, endpoint },
+                    TcpProtocolHandshake::Vless {
+                        target,
+                        endpoint,
+                        command: vless_command,
+                    },
                 )
             }
             #[cfg(feature = "vless-reverse")]
@@ -649,9 +758,73 @@ async fn connect_planned_tcp_outbound(
     let handshake_sent_as_early_data =
         websocket_early_data.is_some() || httpupgrade_early_data.is_some();
 
-    let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let started = Instant::now();
     let attempted_at = unix_time_secs();
+    #[cfg(feature = "tls")]
+    if let OutboundTransport::Xhttp { tls, settings } = &transport
+        && tls.alpn.as_slice() == ["h3"]
+    {
+        let server = transport_server.as_ref().ok_or_else(|| {
+            std::io::Error::other("XHTTP outbound is missing its server identity")
+        })?;
+        let TcpProtocolHandshake::Vless {
+            target,
+            endpoint,
+            command,
+        } = handshake
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "XHTTP/3 outbound is currently supported only for VLESS",
+            ));
+        };
+        let mut stream: Box<dyn AsyncStream> =
+            match connect_xhttp_h3(target_addr, tls, settings, server).await {
+                Ok(stream) => Box::new(stream),
+                Err(error) => {
+                    record(tcp_connect_observation(
+                        false,
+                        elapsed_millis(started),
+                        attempted_at,
+                        error.to_string(),
+                    ));
+                    return Err(error);
+                }
+            };
+        if let Err(error) =
+            vless_connect(&mut *stream, &endpoint, &target, command).await
+        {
+            record(tcp_connect_observation(
+                false,
+                elapsed_millis(started),
+                attempted_at,
+                error.to_string(),
+            ));
+            return Err(error);
+        }
+        stream = Box::new(VlessResponseHeaderStream::new(stream));
+        record(tcp_connect_observation(
+            true,
+            elapsed_millis(started),
+            attempted_at,
+            String::new(),
+        ));
+        return Ok(TcpOutboundConnection {
+            stream,
+            outbound_tag,
+        });
+    }
+    #[cfg(not(feature = "tls"))]
+    if let OutboundTransport::Xhttp { tls, .. } = &transport
+        && tls.alpn.as_slice() == ["h3"]
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "XHTTP/3 outbound requires the tls feature",
+        ));
+    }
+
+    let tcp_socket = new_tcp_socket(None, target_addr.is_ipv6())?;
     let mut raw_stream = match tcp_socket.connect(target_addr).await {
         Ok(stream) => stream,
         Err(error) => {
@@ -1032,14 +1205,18 @@ async fn connect_planned_tcp_outbound(
         }
     };
 
+    let defer_vless_response_header =
+        matches!(&handshake, TcpProtocolHandshake::Vless { .. });
     let handshake_result = match handshake {
         TcpProtocolHandshake::None => Ok(()),
         TcpProtocolHandshake::Socks { target, endpoint } => {
             socks5_connect(&mut *stream, &endpoint, &target).await
         }
-        TcpProtocolHandshake::Vless { target, endpoint } => {
-            vless_tcp_connect(&mut *stream, &endpoint, &target).await
-        }
+        TcpProtocolHandshake::Vless {
+            target,
+            endpoint,
+            command,
+        } => vless_connect(&mut *stream, &endpoint, &target, command).await,
         TcpProtocolHandshake::Trojan { .. } if handshake_sent_as_early_data => {
             Ok(())
         }
@@ -1055,6 +1232,10 @@ async fn connect_planned_tcp_outbound(
             error.to_string(),
         ));
         return Err(error);
+    }
+
+    if defer_vless_response_header {
+        stream = Box::new(VlessResponseHeaderStream::new(stream));
     }
 
     record(tcp_connect_observation(
@@ -1118,8 +1299,48 @@ pub(crate) async fn connect_tcp_via_outbound(
             ));
         }
     };
-    connect_planned_tcp_outbound(resolver, runtime, plan, false, TrojanCommand::Tcp)
-        .await
+    connect_planned_tcp_outbound(
+        resolver,
+        runtime,
+        plan,
+        false,
+        TrojanCommand::Tcp,
+        VlessCommand::Tcp,
+    )
+    .await
+}
+
+pub(crate) async fn connect_vless_udp_via_outbound(
+    resolver: &Arc<dyn Resolver>,
+    target: &NetLocation,
+    runtime: &DataPlaneRuntime,
+    outbound: &OutboundSummary,
+) -> std::io::Result<VlessUdpOutboundStream> {
+    if !outbound.protocol.trim().eq_ignore_ascii_case("vless") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "outbound {} protocol {} is not VLESS",
+                outbound.tag, outbound.protocol
+            ),
+        ));
+    }
+    let connection = connect_planned_tcp_outbound(
+        resolver,
+        runtime,
+        TcpRoutePlan::Vless {
+            target: target.clone(),
+            outbound: outbound.clone(),
+        },
+        true,
+        TrojanCommand::Tcp,
+        VlessCommand::Udp,
+    )
+    .await?;
+    Ok(VlessUdpOutboundStream::new(
+        connection.stream,
+        target.clone(),
+    ))
 }
 
 #[cfg(feature = "trojan")]
@@ -1147,6 +1368,7 @@ pub(crate) async fn connect_trojan_udp_via_outbound(
         },
         true,
         TrojanCommand::Udp,
+        VlessCommand::Tcp,
     )
     .await?;
     Ok(TrojanUdpStream::new(connection.stream))
@@ -1219,11 +1441,10 @@ fn connect_reality_transport(
 }
 
 #[cfg(feature = "tls")]
-async fn connect_tls_transport(
-    stream: tokio::net::TcpStream,
+fn build_tls_client_config(
     settings: &OutboundTlsClientSettings,
     server: &NetLocation,
-) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+) -> std::io::Result<(rustls::ClientConfig, String)> {
     let mut roots = rustls::RootCertStore::empty();
     let mut added_roots = 0usize;
     if !settings.disable_system_root {
@@ -1281,7 +1502,6 @@ async fn connect_tls_transport(
         .filter(|protocol| !protocol.is_empty())
         .map(|protocol| protocol.as_bytes().to_vec())
         .collect();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let server_name = if settings.server_name.trim().is_empty() {
         match server.address() {
             Address::Hostname(hostname) => hostname.clone(),
@@ -1291,6 +1511,17 @@ async fn connect_tls_transport(
     } else {
         settings.server_name.trim().to_string()
     };
+    Ok((config, server_name))
+}
+
+#[cfg(feature = "tls")]
+async fn connect_tls_transport(
+    stream: tokio::net::TcpStream,
+    settings: &OutboundTlsClientSettings,
+    server: &NetLocation,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let (config, server_name) = build_tls_client_config(settings, server)?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let server_name = rustls::pki_types::ServerName::try_from(server_name.clone())
         .map_err(|error| {
         std::io::Error::new(
@@ -1341,3 +1572,8 @@ fn unix_time_secs() -> i64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::{
+    freedom_outbound_allow_loopback, freedom_outbound_with_final_rules,
+};

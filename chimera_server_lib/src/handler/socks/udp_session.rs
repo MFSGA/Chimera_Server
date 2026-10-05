@@ -175,7 +175,7 @@ pub(crate) async fn run_shared_udp_relay(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "TCP proxy outbound {} cannot be used for UDP",
+                        "proxy outbound {} is not supported for SOCKS5 UDP associations",
                         outbound.tag
                     ),
                 ));
@@ -184,7 +184,9 @@ pub(crate) async fn run_shared_udp_relay(
             DirectOutboundAction::VlessReverse { tag } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("VLESS Reverse outbound {tag} is TCP-only"),
+                    format!(
+                        "VLESS Reverse outbound {tag} is not supported for SOCKS5 UDP associations"
+                    ),
                 ));
             }
         }
@@ -446,7 +448,7 @@ pub(crate) async fn run_udp_relay_with_expected_client(
                 break Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "TCP proxy outbound {} cannot be used for UDP",
+                        "proxy outbound {} is not supported for SOCKS5 UDP sessions",
                         outbound.tag
                     ),
                 ));
@@ -455,7 +457,9 @@ pub(crate) async fn run_udp_relay_with_expected_client(
             DirectOutboundAction::VlessReverse { tag } => {
                 break Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("VLESS Reverse outbound {tag} is TCP-only"),
+                    format!(
+                        "VLESS Reverse outbound {tag} is not supported for SOCKS5 UDP sessions"
+                    ),
                 ));
             }
         }

@@ -59,7 +59,7 @@ struct RoutingRulePayload {
     #[prost(message, repeated, tag = "2")]
     domain: Vec<DomainPayload>,
     #[prost(message, repeated, tag = "10")]
-    geoip: Vec<GeoIpPayload>,
+    ip: Vec<IpRulePayload>,
     #[prost(message, optional, tag = "14")]
     port_list: Option<PortListPayload>,
     #[prost(
@@ -69,7 +69,7 @@ struct RoutingRulePayload {
     )]
     networks: Vec<i32>,
     #[prost(message, repeated, tag = "11")]
-    source_geoip: Vec<GeoIpPayload>,
+    source_ip: Vec<IpRulePayload>,
     #[prost(message, optional, tag = "16")]
     source_port_list: Option<PortListPayload>,
     #[prost(string, repeated, tag = "7")]
@@ -81,7 +81,7 @@ struct RoutingRulePayload {
     #[prost(map = "string, string", tag = "15")]
     attributes: HashMap<String, String>,
     #[prost(message, repeated, tag = "17")]
-    local_geoip: Vec<GeoIpPayload>,
+    local_ip: Vec<IpRulePayload>,
     #[prost(message, optional, tag = "18")]
     local_port_list: Option<PortListPayload>,
     #[prost(message, optional, tag = "20")]
@@ -120,12 +120,36 @@ enum DomainTypePayload {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct GeoIpPayload {
+struct IpRulePayload {
+    #[prost(oneof = "ip_rule_payload::Value", tags = "1, 2")]
+    value: Option<ip_rule_payload::Value>,
+}
+
+mod ip_rule_payload {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(message, tag = "1")]
+        GeoIp(super::GeoIpRulePayload),
+        #[prost(message, tag = "2")]
+        Custom(super::CidrRulePayload),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct GeoIpRulePayload {
     #[prost(string, tag = "1")]
-    country_code: String,
-    #[prost(message, repeated, tag = "2")]
-    cidr: Vec<CidrPayload>,
+    file: String,
+    #[prost(string, tag = "2")]
+    code: String,
     #[prost(bool, tag = "3")]
+    reverse_match: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CidrRulePayload {
+    #[prost(message, optional, tag = "1")]
+    cidr: Option<CidrPayload>,
+    #[prost(bool, tag = "2")]
     reverse_match: bool,
 }
 
@@ -591,8 +615,8 @@ fn convert_rule_payload(rule: RoutingRulePayload) -> Result<RuleConfig, Status> 
             .map(convert_domain_payload)
             .collect::<Result<Vec<_>, _>>()?,
         domains: Vec::new(),
-        ip: convert_geo_ip_payloads(rule.geoip)?,
-        source_ip: convert_geo_ip_payloads(rule.source_geoip)?,
+        ip: convert_ip_rule_payloads(rule.ip)?,
+        source_ip: convert_ip_rule_payloads(rule.source_ip)?,
         source: Vec::new(),
         port: convert_port_list(rule.port_list),
         network: NetworkListConfig(
@@ -609,7 +633,7 @@ fn convert_rule_payload(rule: RoutingRulePayload) -> Result<RuleConfig, Status> 
         vless_route: convert_port_list(rule.vless_route_list),
         protocol: rule.protocol,
         attrs: rule.attributes,
-        local_ip: convert_geo_ip_payloads(rule.local_geoip)?,
+        local_ip: convert_ip_rule_payloads(rule.local_ip)?,
         local_port: convert_port_list(rule.local_port_list),
         process: rule.process,
         webhook: rule.webhook.and_then(|webhook| {
@@ -635,37 +659,68 @@ fn convert_domain_payload(domain: DomainPayload) -> Result<String, Status> {
     })
 }
 
-fn convert_geo_ip_payloads(
-    entries: Vec<GeoIpPayload>,
+fn convert_ip_rule_payloads(
+    entries: Vec<IpRulePayload>,
 ) -> Result<Vec<String>, Status> {
     let mut values = Vec::new();
     for entry in entries {
-        if !entry.country_code.is_empty() && entry.cidr.is_empty() {
-            values.push(format!(
-                "geoip:{}{}",
-                if entry.reverse_match { "!" } else { "" },
-                entry.country_code
-            ));
-            continue;
-        }
-        for cidr in entry.cidr {
-            let ip = match cidr.ip.as_slice() {
-                [a, b, c, d] => format!("{a}.{b}.{c}.{d}"),
-                bytes if bytes.len() == 16 => std::net::Ipv6Addr::from(
-                    <[u8; 16]>::try_from(bytes).expect("valid ipv6 bytes"),
-                )
-                .to_string(),
-                _ => {
+        match entry.value {
+            Some(ip_rule_payload::Value::GeoIp(rule)) => {
+                if !rule.file.is_empty() {
                     return Err(Status::invalid_argument(
-                        "routing cidr ip must be 4 or 16 bytes",
+                        "custom routing GeoIP files are not supported",
                     ));
                 }
-            };
-            values.push(format!(
-                "{}{ip}/{}",
-                if entry.reverse_match { "!" } else { "" },
-                cidr.prefix
-            ));
+                if rule.code.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "routing GeoIP code is required",
+                    ));
+                }
+                values.push(format!(
+                    "geoip:{}{}",
+                    if rule.reverse_match { "!" } else { "" },
+                    rule.code
+                ));
+            }
+            Some(ip_rule_payload::Value::Custom(rule)) => {
+                let cidr = rule.cidr.ok_or_else(|| {
+                    Status::invalid_argument("routing CIDR value is required")
+                })?;
+                let (ip, max_prefix) = match cidr.ip.as_slice() {
+                    [a, b, c, d] => (format!("{a}.{b}.{c}.{d}"), 32),
+                    bytes if bytes.len() == 16 => (
+                        std::net::Ipv6Addr::from(
+                            <[u8; 16]>::try_from(bytes).map_err(|_| {
+                                Status::invalid_argument(
+                                    "routing CIDR IP must be 4 or 16 bytes",
+                                )
+                            })?,
+                        )
+                        .to_string(),
+                        128,
+                    ),
+                    _ => {
+                        return Err(Status::invalid_argument(
+                            "routing CIDR IP must be 4 or 16 bytes",
+                        ));
+                    }
+                };
+                if cidr.prefix > max_prefix {
+                    return Err(Status::invalid_argument(
+                        "routing CIDR prefix is out of range",
+                    ));
+                }
+                values.push(format!(
+                    "{}{ip}/{}",
+                    if rule.reverse_match { "!" } else { "" },
+                    cidr.prefix
+                ));
+            }
+            None => {
+                return Err(Status::invalid_argument(
+                    "routing IP rule value is required",
+                ));
+            }
         }
     }
     Ok(values)
@@ -1010,6 +1065,29 @@ mod tests {
         }
     }
 
+    fn custom_cidr_rule(
+        ip: Vec<u8>,
+        prefix: u32,
+        reverse_match: bool,
+    ) -> IpRulePayload {
+        IpRulePayload {
+            value: Some(ip_rule_payload::Value::Custom(CidrRulePayload {
+                cidr: Some(CidrPayload { ip, prefix }),
+                reverse_match,
+            })),
+        }
+    }
+
+    fn geoip_code_rule(code: &str, reverse_match: bool) -> IpRulePayload {
+        IpRulePayload {
+            value: Some(ip_rule_payload::Value::GeoIp(GeoIpRulePayload {
+                file: String::new(),
+                code: code.to_string(),
+                reverse_match,
+            })),
+        }
+    }
+
     #[tokio::test]
     async fn routing_test_route_uses_runtime_rules() {
         let runtime = build_runtime(&["direct", "backup"]);
@@ -1289,6 +1367,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_add_rule_decodes_xray_nested_custom_cidr_wire_format() {
+        let runtime = build_runtime(&["direct"]);
+        let service = RoutingServiceImpl::new(runtime);
+
+        // Serialized from the checked-in Xray v26.9.9 app/router/config.proto:
+        // Config.rule -> RoutingRule.ip -> IPRule.custom -> CIDRRule.cidr.
+        // Keep this independent byte fixture so a locally mirrored message
+        // definition cannot make an incorrect wire shape pass its own test.
+        let xray_config = vec![
+            0x12, 0x16, // Config.rule, length 22
+            0x0a, 0x06, b'd', b'i', b'r', b'e', b'c', b't', // RoutingRule.tag
+            0x52, 0x0c, // RoutingRule.ip, length 12
+            0x12, 0x0a, // IPRule.custom, length 10
+            0x0a, 0x08, // CIDRRule.cidr, length 8
+            0x0a, 0x04, 10, 42, 0, 0, // CIDR.ip = 10.42.0.0
+            0x10, 0x10, // CIDR.prefix = 16
+        ];
+
+        service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(proto::xray::common::serial::TypedMessage {
+                        r#type: TYPE_ROUTER_CONFIG.to_string(),
+                        value: xray_config,
+                    }),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect("Xray custom CIDR routing rule should decode");
+
+        let matched = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            target_i_ps: vec![vec![10, 42, 3, 4]],
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect("address within Xray CIDR should match")
+            .into_inner();
+        assert_eq!(matched.outbound_tag, "direct");
+
+        let unmatched = service
+            .test_route(Request::new(
+                proto::xray::app::router::command::TestRouteRequest {
+                    routing_context: Some(
+                        proto::xray::app::router::command::RoutingContext {
+                            target_i_ps: vec![vec![10, 43, 3, 4]],
+                            ..Default::default()
+                        },
+                    ),
+                    field_selectors: vec![],
+                    publish_result: false,
+                },
+            ))
+            .await
+            .expect_err("address outside Xray CIDR must not match");
+        assert_eq!(unmatched.code(), Code::Unknown);
+    }
+
+    #[tokio::test]
     async fn routing_add_rule_matches_user_and_domain_like_xray() {
         let runtime = build_runtime(&["direct", "blocked"]);
         let service = RoutingServiceImpl::new(runtime);
@@ -1526,14 +1672,7 @@ mod tests {
                         "ip".into(),
                     )),
                     rule_tag: "ip-rule".into(),
-                    geoip: vec![GeoIpPayload {
-                        country_code: String::new(),
-                        cidr: vec![CidrPayload {
-                            ip: vec![203, 0, 113, 7],
-                            prefix: 32,
-                        }],
-                        reverse_match: false,
-                    }],
+                    ip: vec![custom_cidr_rule(vec![203, 0, 113, 7], 32, false)],
                     ..RoutingRulePayload::default()
                 },
                 RoutingRulePayload {
@@ -1667,11 +1806,7 @@ mod tests {
                     "direct".into(),
                 )),
                 rule_tag: "geoip-country".into(),
-                geoip: vec![GeoIpPayload {
-                    country_code: "test".into(),
-                    cidr: vec![],
-                    reverse_match: false,
-                }],
+                ip: vec![geoip_code_rule("test", false)],
                 ..RoutingRulePayload::default()
             }],
             balancing_rule: vec![],
@@ -1709,6 +1844,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routing_add_rule_rejects_custom_geoip_file_explicitly() {
+        let runtime = build_runtime(&["direct"]);
+        let service = RoutingServiceImpl::new(runtime);
+        let router_config = RouterConfigPayload {
+            domain_strategy: RouterDomainStrategyPayload::AsIs as i32,
+            rule: vec![RoutingRulePayload {
+                target_tag: Some(routing_rule_payload::TargetTag::Tag(
+                    "direct".into(),
+                )),
+                ip: vec![IpRulePayload {
+                    value: Some(ip_rule_payload::Value::GeoIp(GeoIpRulePayload {
+                        file: "custom.dat".into(),
+                        code: "test".into(),
+                        reverse_match: false,
+                    })),
+                }],
+                ..RoutingRulePayload::default()
+            }],
+            balancing_rule: vec![],
+        };
+
+        let error = service
+            .add_rule(Request::new(
+                proto::xray::app::router::command::AddRuleRequest {
+                    config: Some(encode_router_config(router_config)),
+                    should_append: false,
+                },
+            ))
+            .await
+            .expect_err("custom GeoIP file must fail closed");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(
+            error.message(),
+            "custom routing GeoIP files are not supported"
+        );
+    }
+
+    #[tokio::test]
     async fn routing_add_rule_supports_reverse_geoip_cidrs() {
         let runtime = build_runtime(&["direct"]);
         let service = RoutingServiceImpl::new(runtime);
@@ -1719,14 +1892,7 @@ mod tests {
                     "direct".into(),
                 )),
                 rule_tag: "reverse-geoip".into(),
-                geoip: vec![GeoIpPayload {
-                    country_code: String::new(),
-                    cidr: vec![CidrPayload {
-                        ip: vec![10, 0, 0, 0],
-                        prefix: 8,
-                    }],
-                    reverse_match: true,
-                }],
+                ip: vec![custom_cidr_rule(vec![10, 0, 0, 0], 8, true)],
                 ..RoutingRulePayload::default()
             }],
             balancing_rule: vec![],

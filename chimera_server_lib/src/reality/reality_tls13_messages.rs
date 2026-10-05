@@ -279,6 +279,7 @@ pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
 /// * `server_name` - SNI hostname
 /// * `cipher_suites` - Cipher suite IDs to offer, e.g. 0x1301 for TLS_AES_128_GCM_SHA256
 /// * `alpn_protocols` - ALPN protocols to offer, e.g. "h2" and "http/1.1"
+#[cfg(test)]
 pub fn construct_client_hello(
     client_random: &[u8; 32],
     session_id: &[u8; 32],
@@ -287,6 +288,35 @@ pub fn construct_client_hello(
     cipher_suites: &[u16],
     alpn_protocols: &[&str],
 ) -> Result<Vec<u8>> {
+    construct_client_hello_with_key_shares(
+        client_random,
+        session_id,
+        &[(0x001d, client_public_key)],
+        server_name,
+        cipher_suites,
+        alpn_protocols,
+    )
+}
+
+/// Construct a TLS 1.3 ClientHello with the supplied supported key shares.
+///
+/// `key_shares` is ordered by client preference and also defines the
+/// `supported_groups` extension. The group IDs are the TLS NamedGroup values.
+pub fn construct_client_hello_with_key_shares(
+    client_random: &[u8; 32],
+    session_id: &[u8; 32],
+    key_shares: &[(u16, &[u8])],
+    server_name: &str,
+    cipher_suites: &[u16],
+    alpn_protocols: &[&str],
+) -> Result<Vec<u8>> {
+    if key_shares.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "at least one TLS key share is required",
+        ));
+    }
+
     let mut hello = Vec::with_capacity(512);
 
     // Handshake message type: ClientHello (0x01)
@@ -355,25 +385,76 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
     }
 
+    let supported_groups_len = key_shares.len().checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many supported groups",
+        )
+    })?;
+    let supported_groups_len =
+        u16::try_from(supported_groups_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "too many supported groups",
+            )
+        })?;
+    let supported_groups_extension_len =
+        supported_groups_len.checked_add(2).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "supported_groups extension too long",
+            )
+        })?;
+
     // 3. supported_groups extension (type 10)
     {
         extensions.extend_from_slice(&[0x00, 0x0a]); // Extension type: supported_groups
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Supported groups length: 2
-        extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
+        extensions.extend_from_slice(&supported_groups_extension_len.to_be_bytes());
+        extensions.extend_from_slice(&supported_groups_len.to_be_bytes());
+        for (group, _) in key_shares {
+            extensions.extend_from_slice(&group.to_be_bytes());
+        }
     }
 
     // 4. key_share extension (type 51)
     {
         extensions.extend_from_slice(&[0x00, 0x33]); // Extension type: key_share
-        let key_share_len = 2 + 4 + client_public_key.len();
-        extensions.extend_from_slice(&(key_share_len as u16).to_be_bytes()); // Extension length
-        let key_share_list_len = 4 + client_public_key.len();
-        extensions.extend_from_slice(&(key_share_list_len as u16).to_be_bytes()); // Key share list length
-        extensions.extend_from_slice(&[0x00, 0x1d]); // Group: x25519
-        extensions
-            .extend_from_slice(&(client_public_key.len() as u16).to_be_bytes()); // Key length
-        extensions.extend_from_slice(client_public_key); // Public key
+        let key_share_list_len =
+            key_shares.iter().try_fold(0usize, |total, (_, key)| {
+                total.checked_add(4 + key.len()).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "TLS key share list too long",
+                    )
+                })
+            })?;
+        let key_share_list_len =
+            u16::try_from(key_share_list_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS key share list too long",
+                )
+            })?;
+        let key_share_extension_len =
+            key_share_list_len.checked_add(2).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS key share extension too long",
+                )
+            })?;
+        extensions.extend_from_slice(&key_share_extension_len.to_be_bytes());
+        extensions.extend_from_slice(&key_share_list_len.to_be_bytes());
+        for (group, key) in key_shares {
+            let key_len = u16::try_from(key.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS key share too long",
+                )
+            })?;
+            extensions.extend_from_slice(&group.to_be_bytes());
+            extensions.extend_from_slice(&key_len.to_be_bytes());
+            extensions.extend_from_slice(key);
+        }
     }
 
     // 5. signature_algorithms extension (type 13)
@@ -465,6 +546,97 @@ pub fn write_record_header(record_type: u8, length: u16) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::reality::common::CONTENT_TYPE_HANDSHAKE;
+
+    fn client_hello_extensions(hello: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut offset = 4 + 2 + 32;
+        let session_id_len = hello[offset] as usize;
+        offset += 1 + session_id_len;
+        let cipher_suites_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2 + cipher_suites_len;
+        let compression_methods_len = hello[offset] as usize;
+        offset += 1 + compression_methods_len;
+        let extensions_len =
+            u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        let extensions_end = offset + extensions_len;
+        let mut extensions = Vec::new();
+        while offset < extensions_end {
+            let extension_type =
+                u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+            let extension_len =
+                u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+            offset += 4;
+            extensions
+                .push((extension_type, &hello[offset..offset + extension_len]));
+            offset += extension_len;
+        }
+        extensions
+    }
+
+    #[test]
+    fn client_hello_preserves_hybrid_and_x25519_key_share_order() {
+        let client_random = [0x11; 32];
+        let session_id = [0x22; 32];
+        let hybrid_share = [0x33; 1216];
+        let x25519_share = [0x44; 32];
+        let hello = construct_client_hello_with_key_shares(
+            &client_random,
+            &session_id,
+            &[(0x11ec, &hybrid_share), (0x001d, &x25519_share)],
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap();
+        let extensions = client_hello_extensions(&hello);
+
+        let supported_groups = extensions
+            .iter()
+            .find_map(|(kind, data)| (*kind == 10).then_some(*data))
+            .expect("supported_groups extension");
+        assert_eq!(supported_groups, &[0x00, 0x04, 0x11, 0xec, 0x00, 0x1d]);
+
+        let key_shares = extensions
+            .iter()
+            .find_map(|(kind, data)| (*kind == 51).then_some(*data))
+            .expect("key_share extension");
+        let mut offset = 2;
+        assert_eq!(
+            u16::from_be_bytes([key_shares[0], key_shares[1]]) as usize,
+            key_shares.len() - 2
+        );
+        for (expected_group, expected_key) in [
+            (0x11ec, hybrid_share.as_slice()),
+            (0x001d, x25519_share.as_slice()),
+        ] {
+            let group =
+                u16::from_be_bytes([key_shares[offset], key_shares[offset + 1]]);
+            let key_len =
+                u16::from_be_bytes([key_shares[offset + 2], key_shares[offset + 3]])
+                    as usize;
+            offset += 4;
+            assert_eq!(group, expected_group);
+            assert_eq!(&key_shares[offset..offset + key_len], expected_key);
+            offset += key_len;
+        }
+        assert_eq!(offset, key_shares.len());
+    }
+
+    #[test]
+    fn client_hello_rejects_empty_key_share_list() {
+        let error = construct_client_hello_with_key_shares(
+            &[0; 32],
+            &[0; 32],
+            &[],
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn test_construct_server_hello() {

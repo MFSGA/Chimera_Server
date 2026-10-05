@@ -1,7 +1,11 @@
 use super::*;
 
+#[cfg(feature = "vless-reverse")]
+use bytes::Bytes;
+
 #[cfg(feature = "trojan")]
 use crate::handler::trojan_udp::TrojanUdpStream;
+use crate::outbound::{VlessUdpOutboundStream, connect_vless_udp_via_outbound};
 
 pub(crate) async fn run_bidirectional_udp(
     mut server_stream: Box<dyn AsyncMessageStream>,
@@ -120,20 +124,119 @@ pub(crate) async fn run_bidirectional_udp(
                 ))
             }
         }
-        DirectOutboundAction::Socks { outbound }
-        | DirectOutboundAction::Vless { outbound } => Err(std::io::Error::new(
+        DirectOutboundAction::Vless { outbound } => {
+            traffic_context = traffic_context
+                .map(|context| context.with_outbound_tag(outbound.tag.clone()));
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            let mut proxy = connect_vless_udp_via_outbound(
+                &resolver,
+                &remote_location,
+                &runtime,
+                &outbound,
+            )
+            .await?;
+            copy_bidirectional_vless_udp_messages(
+                &mut *server_stream,
+                &mut proxy,
+                &remote_location,
+                traffic_context,
+            )
+            .await
+        }
+        DirectOutboundAction::Socks { outbound } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
+            format!(
+                "SOCKS outbound {} cannot be used for this UDP session type",
+                outbound.tag
+            ),
         )),
         #[cfg(feature = "vless-reverse")]
-        DirectOutboundAction::VlessReverse { tag } => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("VLESS Reverse outbound {tag} is TCP-only"),
-        )),
+        DirectOutboundAction::VlessReverse { tag } => {
+            traffic_context = traffic_context
+                .map(|context| context.with_outbound_tag(tag.clone()));
+            let _connection_guard = register_connection(traffic_context.as_ref());
+            let session = runtime.open_reverse_udp(
+                &tag,
+                remote_location.clone(),
+                peer_addr,
+                local_addr,
+            )?;
+            copy_bidirectional_reverse_udp_messages(
+                &mut *server_stream,
+                session,
+                traffic_context,
+            )
+            .await
+        }
     };
 
     let _ = shutdown_message(&mut *server_stream).await;
     result
+}
+
+async fn copy_bidirectional_vless_udp_messages(
+    stream: &mut dyn AsyncMessageStream,
+    proxy: &mut VlessUdpOutboundStream,
+    target: &NetLocation,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    let mut client_buffer = vec![0u8; UDP_BUFFER_SIZE];
+    let mut target_buffer = vec![0u8; UDP_BUFFER_SIZE];
+
+    loop {
+        tokio::select! {
+            result = read_message(stream, &mut client_buffer) => {
+                let len = result?;
+                if len == 0 {
+                    return Ok(());
+                }
+                proxy.send_to(target, &client_buffer[..len]).await?;
+                record_transfer(traffic_context.clone(), len as u64, 0);
+            }
+            result = proxy.recv_from(&mut target_buffer) => {
+                let (_source, len) = result?;
+                write_message(stream, &target_buffer[..len]).await?;
+                flush_message(stream).await?;
+                record_transfer(traffic_context.clone(), 0, len as u64);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vless-reverse")]
+async fn copy_bidirectional_reverse_udp_messages(
+    stream: &mut dyn AsyncMessageStream,
+    mut session: crate::handler::vless_reverse::worker::ReversePacketSession,
+    traffic_context: Option<TrafficContext>,
+) -> std::io::Result<()> {
+    let mut client_buffer = vec![0u8; UDP_BUFFER_SIZE];
+    let result = async {
+        loop {
+            tokio::select! {
+                result = read_message(stream, &mut client_buffer) => {
+                    let len = result?;
+                    if len == 0 {
+                        break Ok(());
+                    }
+                    session.send(Bytes::copy_from_slice(&client_buffer[..len]), None).await?;
+                    record_transfer(traffic_context.clone(), len as u64, 0);
+                }
+                result = session.recv() => {
+                    let (payload, _target_override) = match result? {
+                        Some(response) => response,
+                        None => break Ok(()),
+                    };
+                    write_message(stream, &payload).await?;
+                    flush_message(stream).await?;
+                    record_transfer(traffic_context.clone(), 0, payload.len() as u64);
+                }
+            }
+        }
+    }
+    .await;
+
+    let close_result = session.close().await;
+    result.and(close_result)
 }
 
 async fn consume_blackholed_udp_messages(

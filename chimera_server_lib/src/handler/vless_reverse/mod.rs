@@ -9,4 +9,5 @@ pub(crate) mod mux_io;
 pub(crate) mod portal;
 pub(crate) mod session_core;
 pub(crate) mod session_stream;
+pub(crate) mod site_policy;
 pub(crate) mod worker;

@@ -1357,7 +1357,11 @@ mod tests {
             stream,
             remote_location,
             Arc::new(NativeResolver::new()),
-            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
+            RuntimeState::new(
+                Vec::new(),
+                vec![crate::outbound::freedom_outbound_allow_loopback("direct")],
+            )
+            .data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43123)),
             None,
             traffic_context,
@@ -1542,7 +1546,11 @@ mod tests {
 
         let relay_task = tokio::spawn(run_session_based_udp(
             stream,
-            RuntimeState::new(Vec::new(), Vec::new()).data_plane(),
+            RuntimeState::new(
+                Vec::new(),
+                vec![crate::outbound::freedom_outbound_allow_loopback("direct")],
+            )
+            .data_plane(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 43141)),
             None,
             traffic_context,

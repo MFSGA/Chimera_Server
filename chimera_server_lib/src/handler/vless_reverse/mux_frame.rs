@@ -45,6 +45,10 @@ pub(crate) struct FrameOption(u8);
 impl FrameOption {
     pub(crate) const DATA: u8 = 0x01;
     pub(crate) const ERROR: u8 = 0x02;
+    // Chimera extension: carry a directional TCP FIN while leaving the Mux
+    // session available for data in the reverse direction. Xray ignores this
+    // reserved bit and retains its existing full-close interpretation of END.
+    pub(crate) const HALF_CLOSE: u8 = 0x04;
 
     pub(crate) fn with_data(mut self) -> Self {
         self.0 |= Self::DATA;
@@ -56,8 +60,17 @@ impl FrameOption {
         self
     }
 
+    pub(crate) fn with_half_close(mut self) -> Self {
+        self.0 |= Self::HALF_CLOSE;
+        self
+    }
+
     pub(crate) fn has_data(self) -> bool {
         self.0 & Self::DATA != 0
+    }
+
+    pub(crate) fn has_half_close(self) -> bool {
+        self.0 & Self::HALF_CLOSE != 0
     }
 
     fn raw(self) -> u8 {

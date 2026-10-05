@@ -18,6 +18,8 @@ use crate::handler::shadowsocks::ShadowsocksUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
 #[cfg(feature = "wireguard")]
+use crate::inbound::AlterInboundError;
+#[cfg(feature = "wireguard")]
 use crate::wireguard::WireGuardPeerStore;
 #[cfg(feature = "vmess")]
 use crate::{
@@ -25,7 +27,7 @@ use crate::{
 };
 use crate::{
     config::{def::PolicyConfig, server_config::ServerConfig},
-    inbound::{AlterInboundError, InboundFailure, InboundManager},
+    inbound::{InboundFailure, InboundManager},
     resolver::{NativeResolver, Resolver},
     routing_state::{
         BalancerTargetMap, OutboundObservation, RouteMatch, RoutingEvent,

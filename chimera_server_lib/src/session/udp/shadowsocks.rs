@@ -209,12 +209,17 @@ pub(crate) async fn relay_shadowsocks_udp_packet(
         DirectOutboundAction::Socks { outbound }
         | DirectOutboundAction::Vless { outbound } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("TCP proxy outbound {} cannot be used for UDP", outbound.tag),
+            format!(
+                "proxy outbound {} is not supported for Shadowsocks UDP sessions",
+                outbound.tag
+            ),
         )),
         #[cfg(feature = "vless-reverse")]
         DirectOutboundAction::VlessReverse { tag } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("VLESS Reverse outbound {tag} is TCP-only"),
+            format!(
+                "VLESS Reverse outbound {tag} is not supported for Shadowsocks UDP sessions"
+            ),
         )),
     }
 }

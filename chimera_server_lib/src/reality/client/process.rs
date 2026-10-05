@@ -1,6 +1,6 @@
 use std::io;
 
-use aws_lc_rs::{agreement, digest};
+use aws_lc_rs::{agreement, digest, kem::Ciphertext};
 
 use super::{HandshakeState, RealityClientConnection};
 use crate::reality::common::{
@@ -24,7 +24,7 @@ use crate::reality::reality_tls13_keys::{
 };
 use crate::reality::reality_tls13_messages::construct_finished;
 use crate::reality::reality_util::{
-    extract_server_cipher_suite, extract_server_public_key,
+    ServerKeyShare, extract_server_cipher_suite, extract_server_key_share,
 };
 
 // Matches the maximum handshake size accepted by shoes/Xray REALITY clients.
@@ -49,12 +49,12 @@ pub(super) fn process_server_hello(
     conn: &mut RealityClientConnection,
 ) -> io::Result<()> {
     // Extract state
-    let (client_private_key, auth_key) = match &conn.handshake_state {
+    let auth_key = match &conn.handshake_state {
         HandshakeState::AwaitingServerHello {
             client_hello_bytes: _,
-            client_private_key,
             auth_key,
-        } => (*client_private_key, *auth_key),
+            ..
+        } => *auth_key,
         _ => return Ok(()), // Wrong state
     };
 
@@ -85,8 +85,8 @@ pub(super) fn process_server_hello(
         server_hello
     );
 
-    // Extract server public key from ServerHello
-    let server_public_key = extract_server_public_key(&record)?;
+    // Extract the server-selected X25519 or X25519MLKEM768 key share.
+    let server_key_share = extract_server_key_share(&record)?;
     let cipher_suite_id = extract_server_cipher_suite(&record)?;
     let selected_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
         io::Error::new(
@@ -134,25 +134,60 @@ pub(super) fn process_server_hello(
         client_transcript.finish().as_ref().to_vec()
     };
 
-    // Perform ECDH for TLS 1.3 key derivation
-    let peer_public_key =
-        agreement::UnparsedPublicKey::new(&agreement::X25519, &server_public_key);
-    let my_private_key = agreement::PrivateKey::from_private_key(
-        &agreement::X25519,
-        &client_private_key,
-    )
-    .map_err(|_| io::Error::other("Failed to create private key"))?;
-
-    let mut tls_shared_secret = [0u8; 32];
-    agreement::agree(
-        &my_private_key,
-        peer_public_key,
-        io::Error::other("ECDH failed"),
-        |key_material| {
-            tls_shared_secret.copy_from_slice(key_material);
-            Ok(())
-        },
-    )?;
+    // The TLS 1.3 hybrid group combines ML-KEM-768 before X25519, matching
+    // draft-kwiatkowski-tls-ecdhe-mlkem-02 and the Xray REALITY implementation.
+    let tls_shared_secret = match (&conn.handshake_state, server_key_share) {
+        (
+            HandshakeState::AwaitingServerHello {
+                client_private_key, ..
+            },
+            ServerKeyShare::X25519 { public_key },
+        ) => perform_x25519(client_private_key, &public_key)?.to_vec(),
+        (
+            HandshakeState::AwaitingServerHello {
+                client_private_key,
+                mlkem_decapsulation_key: Some(decapsulation_key),
+                ..
+            },
+            ServerKeyShare::X25519MlKem768 {
+                ciphertext,
+                x25519_public_key,
+            },
+        ) => {
+            let mlkem_secret = decapsulation_key
+                .decapsulate(Ciphertext::from(ciphertext.as_slice()))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to decapsulate X25519MLKEM768 server key share",
+                    )
+                })?;
+            let x25519_secret =
+                perform_x25519(client_private_key, &x25519_public_key)?;
+            let mut shared_secret = Vec::with_capacity(64);
+            shared_secret.extend_from_slice(mlkem_secret.as_ref());
+            shared_secret.extend_from_slice(&x25519_secret);
+            shared_secret
+        }
+        (
+            HandshakeState::AwaitingServerHello {
+                mlkem_decapsulation_key: None,
+                ..
+            },
+            ServerKeyShare::X25519MlKem768 { .. },
+        ) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Server selected X25519MLKEM768 without a client decapsulation key",
+            ));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid REALITY handshake state for ServerHello key share",
+            ));
+        }
+    };
 
     // Derive handshake keys
     let hs_keys = derive_handshake_keys_for_suite(
@@ -190,6 +225,28 @@ pub(super) fn process_server_hello(
     };
 
     Ok(())
+}
+
+fn perform_x25519(
+    private_key: &[u8; 32],
+    public_key: &[u8; 32],
+) -> io::Result<[u8; 32]> {
+    let private_key =
+        agreement::PrivateKey::from_private_key(&agreement::X25519, private_key)
+            .map_err(|_| io::Error::other("Failed to create X25519 private key"))?;
+    let peer_public_key =
+        agreement::UnparsedPublicKey::new(&agreement::X25519, public_key);
+    let mut shared_secret = [0u8; 32];
+    agreement::agree(
+        &private_key,
+        peer_public_key,
+        io::Error::other("X25519 key agreement failed"),
+        |key_material| {
+            shared_secret.copy_from_slice(key_material);
+            Ok(())
+        },
+    )?;
+    Ok(shared_secret)
 }
 
 pub(super) fn process_encrypted_handshake(

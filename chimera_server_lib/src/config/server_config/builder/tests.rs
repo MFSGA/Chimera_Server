@@ -2014,7 +2014,7 @@ fn vless_builder_rejects_vision_without_tls_or_reality() {
     ));
 }
 
-#[cfg(feature = "vless")]
+#[cfg(all(feature = "vless", feature = "reality"))]
 #[test]
 fn vless_builder_accepts_mixed_plain_and_vision_users() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({

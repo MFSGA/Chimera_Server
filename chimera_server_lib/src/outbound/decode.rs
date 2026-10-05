@@ -1,6 +1,11 @@
 use prost::Message;
 
+use super::freedom_rules::{FreedomFinalRule, decode_final_rules};
 use super::*;
+#[cfg(feature = "vless-reverse")]
+use crate::handler::vless_reverse::site_policy::{
+    SiteToSiteConfig, SiteToSitePolicy,
+};
 
 fn normalize_xhttp_positive_range(
     range: Option<XhttpRangePayload>,
@@ -89,8 +94,14 @@ fn normalize_xhttp_uplink_chunk_size(
 pub(super) fn decode_freedom_proxy_protocol(
     outbound: &OutboundSummary,
 ) -> std::io::Result<u32> {
+    decode_freedom_settings(outbound).map(|(proxy_protocol, _)| proxy_protocol)
+}
+
+pub(super) fn decode_freedom_settings(
+    outbound: &OutboundSummary,
+) -> std::io::Result<(u32, Vec<FreedomFinalRule>)> {
     let Some(message_type) = outbound.proxy_settings_type.as_deref() else {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     };
     let message_type = message_type.trim_start_matches('.');
     if message_type != TYPE_PROXY_FREEDOM_CONFIG
@@ -105,7 +116,7 @@ pub(super) fn decode_freedom_proxy_protocol(
         ));
     }
     let Some(value) = outbound.proxy_settings_value.as_deref() else {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     };
     let config = FreedomConfigPayload::decode(value).map_err(|error| {
         std::io::Error::new(
@@ -125,7 +136,53 @@ pub(super) fn decode_freedom_proxy_protocol(
             ),
         ));
     }
-    Ok(config.proxy_protocol)
+    if config.domain_strategy != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} domainStrategy is not implemented",
+                outbound.tag
+            ),
+        ));
+    }
+    if config.destination_override.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} destinationOverride is not implemented",
+                outbound.tag
+            ),
+        ));
+    }
+    if config.user_level != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} userLevel is not implemented",
+                outbound.tag
+            ),
+        ));
+    }
+    if config.fragment.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} fragment is not implemented",
+                outbound.tag
+            ),
+        ));
+    }
+    if !config.noises.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "freedom outbound {} noises are not implemented",
+                outbound.tag
+            ),
+        ));
+    }
+    let final_rules = decode_final_rules(&config.final_rules, &outbound.tag)?;
+    Ok((config.proxy_protocol, final_rules))
 }
 
 pub(super) fn decode_socks_outbound(
@@ -224,7 +281,7 @@ pub(super) fn decode_vless_outbound(
     if let Some(reverse) = account.reverse.as_ref() {
         #[cfg(not(feature = "vless-reverse"))]
         {
-            let _ = (&reverse.tag, &reverse.sniffing);
+            let _ = (&reverse.tag, &reverse.sniffing, &reverse.site_to_site_json);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "VLESS outbound reverse requires the vless-reverse feature",
@@ -233,7 +290,7 @@ pub(super) fn decode_vless_outbound(
 
         #[cfg(feature = "vless-reverse")]
         {
-            let _ = (&reverse.tag, &reverse.sniffing);
+            let _ = (&reverse.tag, &reverse.sniffing, &reverse.site_to_site_json);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "VLESS Reverse Bridge account cannot be used as a normal forward outbound",
@@ -268,6 +325,18 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
         ));
     }
     let sniffing = decode_reverse_sniffing(reverse.sniffing.as_ref())?;
+    let site_to_site = decode_reverse_site_to_site(&reverse.site_to_site_json)?;
+    if site_to_site.is_some()
+        && sniffing.as_ref().is_some_and(|sniffing| {
+            !sniffing.route_only
+                && (sniffing.dest_override_http || sniffing.dest_override_tls)
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VLESS Reverse siteToSite cannot use sniffing destOverride unless routeOnly is true",
+        ));
+    }
     validate_vless_outbound_account(outbound, &account)?;
     let user_id = parse_xray_uuid(&account.id).map_err(|error| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
@@ -281,7 +350,32 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
         policy_identity: account.id.clone(),
         user_level,
         sniffing,
+        site_to_site,
     }))
+}
+
+#[cfg(feature = "vless-reverse")]
+fn decode_reverse_site_to_site(
+    site_to_site_json: &str,
+) -> std::io::Result<Option<SiteToSitePolicy>> {
+    if site_to_site_json.is_empty() {
+        return Ok(None);
+    }
+    let config: SiteToSiteConfig =
+        serde_json::from_str(site_to_site_json).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid VLESS Reverse siteToSite config: {error}"),
+            )
+        })?;
+    SiteToSitePolicy::compile(&config)
+        .map(Some)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid VLESS Reverse siteToSite config: {error}"),
+            )
+        })
 }
 
 #[cfg(feature = "vless-reverse")]
@@ -846,16 +940,17 @@ pub(super) fn decode_sender_transport(
             let mut tls = tls.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    "XHTTP outbound currently requires TLS/H2",
+                    "XHTTP outbound currently requires TLS",
                 )
             })?;
             if tls.alpn.is_empty() {
                 tls.alpn.push("h2".to_string());
-            } else if tls.alpn.as_slice() != ["h2"] {
+            } else if tls.alpn.as_slice() != ["h2"] && tls.alpn.as_slice() != ["h3"]
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     format!(
-                        "XHTTP outbound currently supports only TLS ALPN h2; configured ALPN {:?} selects an unimplemented HTTP version",
+                        "XHTTP outbound supports only a single TLS ALPN h2 or h3; configured ALPN {:?} selects an unimplemented HTTP version",
                         tls.alpn
                     ),
                 ));

@@ -675,7 +675,7 @@ pub(super) async fn forward_udp_payload(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "TCP proxy outbound {} cannot be used for UDP",
+                    "proxy outbound {} is not supported for TUIC UDP sessions",
                     outbound.tag
                 ),
             ));
@@ -684,7 +684,9 @@ pub(super) async fn forward_udp_payload(
         DirectOutboundAction::VlessReverse { tag } => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("VLESS Reverse outbound {tag} is TCP-only"),
+                format!(
+                    "VLESS Reverse outbound {tag} is not supported for TUIC UDP sessions"
+                ),
             ));
         }
     }

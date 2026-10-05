@@ -472,6 +472,7 @@ mod tests {
             routing_user: "bridge@example.test".to_string(),
             policy_identity: "3ac9b383-75a1-431c-8184-106c80eb2273".to_string(),
             user_level: 7,
+            site_to_site: None,
         };
 
         let context =
@@ -497,7 +498,15 @@ mod tests {
         let item: OutboundItem = serde_json::from_value(serde_json::json!({
             "protocol": "freedom",
             "tag": "direct",
-            "settings": {"proxyProtocol": 1}
+            "settings": {
+                "proxyProtocol": 1,
+                "finalRules": [{
+                    "action": "allow",
+                    "network": "tcp",
+                    "port": target_addr.port(),
+                    "ip": target_addr.ip().to_string()
+                }]
+            }
         }))
         .expect("parse freedom proxyProtocol outbound");
         let outbound = compile_static_outbound(&item)
