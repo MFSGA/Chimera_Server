@@ -4,8 +4,15 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_mode=${1:-full}
 gateway_mtu=${TUN_GATEWAY_MTU:-1500}
-if (( $# > 1 )) || [[ "$test_mode" != full && "$test_mode" != --hub-policy-only && "$test_mode" != --tcp-iperf-diagnostic && "$test_mode" != --reverse-offline-only ]]; then
-    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only]\n' "$0" >&2
+stress_seconds=${TUN_GATEWAY_STRESS_SECONDS:-60}
+if (( $# > 1 )) || [[ "$test_mode" != full && "$test_mode" != --hub-policy-only && "$test_mode" != --tcp-iperf-diagnostic && "$test_mode" != --reverse-offline-only && "$test_mode" != --iperf-stress-only ]]; then
+    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 TUN_GATEWAY_STRESS_SECONDS=10..3600 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only|--iperf-stress-only]\n' "$0" >&2
+    exit 2
+fi
+if [[ "$test_mode" == --iperf-stress-only ]] \
+    && { [[ ! "$stress_seconds" =~ ^[0-9]+$ ]] \
+        || (( stress_seconds < 10 || stress_seconds > 3600 )); }; then
+    printf 'TUN_GATEWAY_STRESS_SECONDS must be an integer from 10 to 3600 in --iperf-stress-only mode.\n' >&2
     exit 2
 fi
 if [[ ! "$gateway_mtu" =~ ^[0-9]+$ ]] \
@@ -58,11 +65,12 @@ unshare \
     --map-users="0:${test_host_uid}:1" \
     --map-users="1:${test_subuid_start}:${test_subuid_count}" \
     --net \
-    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" <<'NAMESPACE_SCRIPT'
+    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" "$stress_seconds" <<'NAMESPACE_SCRIPT'
 set -euo pipefail
 test_mode=$1
 gateway_mtu=$2
 xray_bin=$3
+stress_seconds=$4
 trap 'exit_status=$?; printf "Namespace smoke failed with status %s at line %s: %s\\n" "$exit_status" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 lan_ns_pid=
@@ -1177,6 +1185,74 @@ if [[ "$test_mode" == --tcp-iperf-diagnostic ]]; then
     if (( tcp_iperf_exit_status != 0 )); then
         exit "$tcp_iperf_exit_status"
     fi
+    exit 0
+fi
+
+if [[ "$test_mode" == --iperf-stress-only ]]; then
+    for attempt in $(seq 1 50); do
+        if grep -q 'Server listening on 5201' "$edge_iperf_log_file"; then
+            break
+        fi
+        sleep 0.1
+    done
+    grep -q 'Server listening on 5201' "$edge_iperf_log_file"
+
+    nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
+        --client 10.44.0.20 \
+        --port 5201 \
+        --time "$stress_seconds" \
+        --json \
+        >"$iperf_client_result_file" \
+        2>"$iperf_client_error_file"
+    python3 - "$iperf_client_result_file" "$stress_seconds" tcp <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text())
+expected_seconds = int(sys.argv[2])
+sent = report["end"]["sum_sent"]
+received = report["end"]["sum_received"]
+for name, direction in (("sent", sent), ("received", received)):
+    if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
+        raise SystemExit(f"TCP iperf3 {name} stream did not sustain the requested interval: {direction!r}")
+print(
+    f"TCP sustained {expected_seconds}s: sent={sent['bytes']} bytes "
+    f"received={received['bytes']} bytes"
+)
+PY
+
+    nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
+        --client 10.44.0.20 \
+        --port 5201 \
+        --udp \
+        --bandwidth 5M \
+        --length 1200 \
+        --time "$stress_seconds" \
+        --json \
+        >"$iperf_client_result_file" \
+        2>"$iperf_client_error_file"
+    python3 - "$iperf_client_result_file" "$stress_seconds" udp <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text())
+expected_seconds = int(sys.argv[2])
+sent = report["end"]["sum_sent"]
+received = report["end"]["sum_received"]
+for name, direction in (("sent", sent), ("received", received)):
+    if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
+        raise SystemExit(f"UDP iperf3 {name} stream did not sustain the requested interval: {direction!r}")
+if received["packets"] <= 0 or not 0 <= received["lost_percent"] <= 1.0:
+    raise SystemExit(f"UDP iperf3 loss exceeded the 1% stress threshold: {received!r}")
+print(
+    f"UDP sustained {expected_seconds}s at 5 Mbit/s: sent={sent['bytes']} bytes "
+    f"received={received['bytes']} bytes loss={received['lost_percent']:.2f}%"
+)
+PY
+
+    printf 'Sustained TCP and UDP traffic completed across the live TUN/Reverse/Edge path.\n'
     exit 0
 fi
 
