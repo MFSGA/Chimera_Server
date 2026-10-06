@@ -26,6 +26,22 @@ if (( test_subuid_count < 1 )); then
     printf 'The subordinate UID range for %s is empty.\n' "$test_user_name" >&2
     exit 1
 fi
+xray_bin=${XRAY_BIN:-}
+if [[ -n "$xray_bin" ]]; then
+    if [[ "$xray_bin" != /* ]]; then
+        xray_bin="$repo_root/$xray_bin"
+    fi
+    if [[ ! -x "$xray_bin" ]]; then
+        printf 'XRAY_BIN must name an executable Xray binary: %s\n' "$xray_bin" >&2
+        exit 1
+    fi
+    xray_version=$("$xray_bin" version)
+    if [[ "$xray_version" != "Xray 26.9.9 "* ]]; then
+        printf 'TUN management interoperability requires the pinned Xray 26.9.9 baseline; got: %s\n' "$xray_version" >&2
+        exit 1
+    fi
+    printf 'Using fixed Xray management client: %s\n' "$xray_version"
+fi
 
 for command_name in cargo unshare nsenter ip setpriv sysctl python3 iperf3; do
     command -v "$command_name" >/dev/null
@@ -33,17 +49,20 @@ done
 
 cd "$repo_root"
 cargo build -p chimera_server_app --no-default-features --features full,tun-gateway --locked
-cargo build -p chimera_server_app --no-default-features --features full,tun-gateway --example tun_policy_update --locked
+if [[ -z "$xray_bin" ]]; then
+    cargo build -p chimera_server_app --no-default-features --features full,tun-gateway --example tun_policy_update --locked
+fi
 
 unshare \
     --user \
     --map-users="0:${test_host_uid}:1" \
     --map-users="1:${test_subuid_start}:${test_subuid_count}" \
     --net \
-bash -s -- "$test_mode" "$gateway_mtu" <<'NAMESPACE_SCRIPT'
+    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" <<'NAMESPACE_SCRIPT'
 set -euo pipefail
 test_mode=$1
 gateway_mtu=$2
+xray_bin=$3
 trap 'exit_status=$?; printf "Namespace smoke failed with status %s at line %s: %s\\n" "$exit_status" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 lan_ns_pid=
@@ -132,6 +151,9 @@ edge_hub_policy_echo_log_file=$(mktemp)
 live_update_client_log_file=$(mktemp)
 live_update_ready_file=$(mktemp)
 live_update_resume_file=$(mktemp)
+live_update_rule_file=$(mktemp --suffix=.json)
+live_update_api_log_file=$(mktemp)
+live_update_rules_file=$(mktemp)
 health_http_log_file=$(mktemp)
 server_pid=
 hub_pid=
@@ -331,6 +353,9 @@ cleanup() {
         "$live_update_client_log_file" \
         "$live_update_ready_file" \
         "$live_update_resume_file" \
+        "$live_update_rule_file" \
+        "$live_update_api_log_file" \
+        "$live_update_rules_file" \
         "$health_http_log_file"
     exit "$exit_status"
 }
@@ -1444,7 +1469,32 @@ PY
     done
     grep -q 'ready' "$live_update_ready_file"
 
-    target/debug/examples/tun_policy_update 127.0.0.1:39649
+    if [[ -n "$xray_bin" ]]; then
+        cat > "$live_update_rule_file" <<'JSON'
+{
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "ruleTag": "tun-live-update-tcp-udp-deny",
+        "inboundTag": ["hub-vless-in"],
+        "user": ["office-gateway@example.test"],
+        "network": ["tcp", "udp"],
+        "ip": ["10.44.0.0/24"],
+        "outboundTag": "overlay-default-deny"
+      }
+    ]
+  }
+}
+JSON
+        "$xray_bin" api adrules --server=127.0.0.1:39649 "$live_update_rule_file" \
+            >"$live_update_api_log_file" 2>&1
+        "$xray_bin" api lsrules --server=127.0.0.1:39649 \
+            >"$live_update_rules_file" 2>&1
+        grep -q 'tun-live-update-tcp-udp-deny' "$live_update_rules_file"
+    else
+        target/debug/examples/tun_policy_update 127.0.0.1:39649
+    fi
     touch "$live_update_resume_file"
     wait "$live_update_client_pid"
     live_update_client_pid=
