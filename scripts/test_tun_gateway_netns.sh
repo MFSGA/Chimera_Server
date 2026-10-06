@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_mode=${1:-full}
 gateway_mtu=${TUN_GATEWAY_MTU:-1500}
-if (( $# > 1 )) || [[ "$test_mode" != full && "$test_mode" != --hub-policy-only && "$test_mode" != --tcp-iperf-diagnostic ]]; then
-    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 %s [--hub-policy-only|--tcp-iperf-diagnostic]\n' "$0" >&2
+if (( $# > 1 )) || [[ "$test_mode" != full && "$test_mode" != --hub-policy-only && "$test_mode" != --tcp-iperf-diagnostic && "$test_mode" != --reverse-offline-only ]]; then
+    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only]\n' "$0" >&2
     exit 2
 fi
 if [[ ! "$gateway_mtu" =~ ^[0-9]+$ ]] \
@@ -142,6 +142,7 @@ udp_echo_pid=
 edge_tcp_echo_pid=
 active_tcp_client_pid=
 active_udp_client_pid=
+offline_udp_client_pid=
 edge_udp_echo_pid=
 edge_udp_second_echo_pid=
 edge_dns_pid=
@@ -198,6 +199,10 @@ cleanup() {
     if [[ -n "$active_udp_client_pid" ]] && kill -0 "$active_udp_client_pid" 2>/dev/null; then
         kill -TERM "$active_udp_client_pid" 2>/dev/null || true
         wait "$active_udp_client_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$offline_udp_client_pid" ]] && kill -0 "$offline_udp_client_pid" 2>/dev/null; then
+        kill -TERM "$offline_udp_client_pid" 2>/dev/null || true
+        wait "$offline_udp_client_pid" 2>/dev/null || true
     fi
     if [[ -n "$tcp_echo_pid" ]] && kill -0 "$tcp_echo_pid" 2>/dev/null; then
         kill -TERM "$tcp_echo_pid" 2>/dev/null || true
@@ -476,6 +481,9 @@ tunGateway:
   maxUdpSessions: 8
 YAML
 sed -i "/^tunGateway:/a\\  mtu: ${gateway_mtu}" "$smoke_config_file"
+if [[ "$test_mode" == --reverse-offline-only ]]; then
+    sed -i '/^observatory:/,/^routing:/{ /^routing:/!d; }' "$smoke_config_file"
+fi
 
 cat > "$ipv6_failure_config_file" <<'YAML'
 log:
@@ -732,6 +740,7 @@ while True:
         b"office-lan-",
         b"hub-acl-office-lan-",
         b"live-update-",
+        b"reverse-offline-",
     )):
         print(f"udp-limit-received {payload!r} from {peer}", flush=True)
     elif payload.startswith((b"fragment-pressure-v4-", b"fragment-pressure-v6-")):
@@ -1046,7 +1055,11 @@ if ! kill -0 "$edge_pid" 2>/dev/null; then
     exit 1
 fi
 
-RUST_LOG=chimera_server_lib::routing_observer=debug,chimera_server_lib::tun_gateway=warn,chimera_server_lib::traffic::traffic_noop=error,watfaq_netstack=warn target/debug/chimera_server_app \
+server_log_filter=chimera_server_lib::routing_observer=debug,chimera_server_lib::tun_gateway=warn,chimera_server_lib::traffic::traffic_noop=error,watfaq_netstack=warn
+if [[ "$test_mode" == --reverse-offline-only ]]; then
+    server_log_filter=chimera_server_lib::routing_observer=debug,chimera_server_lib::tun_gateway=debug,chimera_server_lib::handler::vless_reverse=debug,chimera_server_lib::traffic::traffic_noop=error,watfaq_netstack=warn
+fi
+RUST_LOG="$server_log_filter" target/debug/chimera_server_app \
     --config "$smoke_config_file" \
     >"$server_log_file" 2>&1 &
 server_pid=$!
@@ -1067,7 +1080,9 @@ if [[ "$tun_created" != true ]]; then
     printf 'Chimera did not create its TUN device.\n' >&2
     exit 1
 fi
-wait_health_observation true 1
+if [[ "$test_mode" != --reverse-offline-only ]]; then
+    wait_health_observation true 1
+fi
 
 link_state=$(ip -o link show dev chimera-smoke)
 case "$link_state" in
@@ -1448,6 +1463,139 @@ PY
 
     printf 'Ordinary Office LAN dual-stack TUN → identity-specific Hub TCP/UDP allow, scope-deny, wrong-identity and default-deny checks passed.\n'
     printf 'Live RoutingService update preserved active TUN TCP/UDP flows and denied new TCP/UDP flows.\n'
+    exit 0
+fi
+
+if [[ "$test_mode" == --reverse-offline-only ]]; then
+    offline_udp_client_program=$(cat <<'PY'
+import socket
+import sys
+
+target = ("10.44.0.20", 39642)
+baseline = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+baseline.settimeout(5)
+
+baseline_payload = b"reverse-offline-before"
+baseline.sendto(baseline_payload, target)
+reply, source = baseline.recvfrom(128)
+if reply != baseline_payload or source != target:
+    raise SystemExit(f"unexpected baseline UDP echo: {reply!r} from {source!r}")
+
+print("udp-ready", flush=True)
+
+if sys.stdin.readline().strip() != "probe-offline":
+    raise SystemExit("missing offline UDP probe trigger")
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(1)
+sock.sendto(b"reverse-offline-no-worker", target)
+source_port = sock.getsockname()[1]
+try:
+    reply, source = sock.recvfrom(128)
+except TimeoutError:
+    print("udp-dropped-without-worker", flush=True)
+else:
+    raise SystemExit(f"offline Reverse UDP unexpectedly replied: {reply!r} from {source!r}")
+
+if sock.getsockname()[1] != source_port:
+    raise SystemExit("UDP source port changed during the offline probe")
+if sys.stdin.readline().strip() != "probe-recovered":
+    raise SystemExit("missing recovered UDP probe trigger")
+
+sent_payloads = set()
+for attempt in range(1, 13):
+    payload = f"reverse-offline-recovered-{attempt}".encode()
+    sent_payloads.add(payload)
+    sock.sendto(payload, target)
+    sock.settimeout(0.5)
+    try:
+        reply, source = sock.recvfrom(128)
+    except TimeoutError:
+        continue
+    if reply not in sent_payloads or source != target:
+        raise SystemExit(f"unexpected recovered UDP reply: {reply!r} from {source!r}")
+    if sock.getsockname()[1] != source_port:
+        raise SystemExit("UDP source port changed during recovery")
+    print(f"udp-recovered-same-tuple-{attempt}", flush=True)
+    break
+else:
+    raise SystemExit("same-tuple Reverse UDP did not recover after Bridge reattachment")
+
+baseline.close()
+sock.close()
+PY
+)
+    coproc REVERSE_OFFLINE_UDP_CLIENT {
+        setpriv --reuid=1 python3 -u -c "$offline_udp_client_program"
+    }
+    offline_udp_client_pid=$REVERSE_OFFLINE_UDP_CLIENT_PID
+    offline_udp_read_fd=${REVERSE_OFFLINE_UDP_CLIENT[0]}
+    offline_udp_write_fd=${REVERSE_OFFLINE_UDP_CLIENT[1]}
+    if ! IFS= read -r -t 5 offline_udp_state <&"$offline_udp_read_fd" \
+        || [[ "$offline_udp_state" != udp-ready ]]; then
+        printf 'Live TUN Reverse UDP baseline did not become ready.\n' >&2
+        exit 1
+    fi
+
+    kill -TERM "$edge_pid"
+    wait "$edge_pid"
+    edge_pid=
+    if ! kill -0 "$hub_pid" 2>/dev/null || ! kill -0 "$server_pid" 2>/dev/null; then
+        printf 'Hub or TUN Gateway exited while stopping the Edge Bridge.\n' >&2
+        exit 1
+    fi
+    printf 'probe-offline\n' >&"$offline_udp_write_fd"
+    if ! IFS= read -r -t 5 offline_udp_state <&"$offline_udp_read_fd" \
+        || [[ "$offline_udp_state" != udp-dropped-without-worker ]]; then
+        printf 'Live TUN Reverse UDP did not fail closed while its only Bridge was offline.\n' >&2
+        exit 1
+    fi
+    grep -Fq 'no ACTIVE Reverse Mux client worker available' "$hub_log_file"
+    if grep -Fq "udp-limit-received b'reverse-offline-no-worker'" "$edge_udp_echo_log_file"; then
+        printf 'The Edge LAN received a UDP packet while its Bridge was offline.\n' >&2
+        exit 1
+    fi
+
+    target/debug/chimera_server_app \
+        --config "$edge_config_file" \
+        >>"$edge_log_file" 2>&1 &
+    edge_pid=$!
+    worker_attached=false
+    for attempt in $(seq 1 100); do
+        if (( $(grep -Fc 'attached VLESS Reverse Portal worker' "$hub_log_file") >= 2 )); then
+            worker_attached=true
+            break
+        fi
+        if ! kill -0 "$edge_pid" 2>/dev/null; then
+            printf 'Edge Bridge exited before reattaching to the Hub.\n' >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    if [[ "$worker_attached" != true ]]; then
+        printf 'Hub did not observe the Edge Reverse worker reattach.\n' >&2
+        exit 1
+    fi
+    printf 'probe-recovered\n' >&"$offline_udp_write_fd"
+    if ! IFS= read -r -t 8 offline_udp_state <&"$offline_udp_read_fd" \
+        || [[ "$offline_udp_state" != udp-recovered-same-tuple-* ]]; then
+        printf 'Live TUN UDP tuple did not recover after the Bridge reattached.\n' >&2
+        exit 1
+    fi
+    if ! wait "$offline_udp_client_pid"; then
+        printf 'Live TUN Reverse UDP outage client exited with an error.\n' >&2
+        exit 1
+    fi
+    offline_udp_client_pid=
+    grep -Fq "udp-limit-received b'reverse-offline-before'" "$edge_udp_echo_log_file"
+    grep -Fq "udp-limit-received b'reverse-offline-recovered-" "$edge_udp_echo_log_file"
+    if grep -Fq "udp-limit-received b'reverse-offline-no-worker'" "$edge_udp_echo_log_file"; then
+        printf 'The Edge LAN received the offline-only UDP marker.\n' >&2
+        exit 1
+    fi
+    kill -0 "$hub_pid"
+    kill -0 "$server_pid"
+    printf 'Live Linux TUN UDP failed closed with no Reverse worker and recovered on the same source/target tuple after Bridge reattachment.\n'
     exit 0
 fi
 
