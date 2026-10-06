@@ -574,7 +574,8 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - 更新 materialized examples、支持矩阵、配置文档和 ARCHITECTURE 实施状态。
 - 未验证组合保持 Partial/Missing，不因主路径通过改成完整支持。
 - 2026-10-06 增加真实 TCP listener 的未知 command 负向验收：使用已认证 Reverse-only UUID 发送 command `0xff` 和有效目标地址，Chimera 与固定 Xray 26.9.9 均关闭请求且未拨号目标；随后同一 listener 仍能用普通 VLESS 用户完成 TCP echo。验证命令：`XRAY_BIN=./xray cargo test -p chimera_server_app --test vless_invalid_command_xray_e2e --all-features --locked -- --exact chimera_and_xray_reject_unknown_vless_command_without_dialing_target --nocapture`，以及 `XRAY_BIN=./xray cargo test -p chimera_server_app --no-default-features --features vless-reverse --test vless_invalid_command_xray_e2e --locked -- --exact chimera_and_xray_reject_unknown_vless_command_without_dialing_target --nocapture`；两条均 1 passed。Xray 客户端为 `26.9.9 Custom (go1.27rc2 linux/amd64)`，参考提交 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`。此结果只覆盖该错误 command 与 listener 存活路径，不代表完整认证、重放或异常帧矩阵已通过。
-- Batch J 仍未完成：多物理 Reverse 线路的真实故障切换与完整发布门槛仍需逐项核验。2026-10-01 原暂缓的真实网络测试现已开始按小切片恢复；在全部收口之前继续维持 Partial 支持声明。
+- 2026-10-06 多物理 Reverse 故障切换验收通过：两条独立 Xray `26.9.9 Custom (go1.27rc2 linux/amd64)` Bridge 同时连接 Chimera Portal 并建立控制 session；其中一条进程退出后，剩余 Bridge 连续承接三条新的 TCP/RAW DokodemoDoor echo session。命令：`XRAY_BIN=./xray cargo test -p chimera_server_app --test vless_reverse_xray_e2e --all-features --locked -- --exact multiple_xray_bridges_keep_chimera_portal_usable_after_one_disconnects --nocapture`，结果 1 passed。Xray 参考提交为 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`。这验证本地 loopback 单 Portal tag 下的存活线路接管，不覆盖真实 LAN/广域网抖动、并发故障竞态或全平台行为。
+- Batch J 仍未完成：剩余兼容矩阵、故障/异常帧/生命周期场景和完整发布门槛仍需逐项核验。2026-10-01 原暂缓的真实网络测试现已按小切片恢复；在全部收口之前继续维持 Partial 支持声明。
 
 ## 10. 测试与验证矩阵
 
@@ -601,7 +602,7 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - Xray Bridge 先启动、后启动、断线重连与公网 listener 持续健康；
 - 多个外部并发 TCP 连接映射到同一内网目标；
 - 后续阶段覆盖 UDP/XUDP 多目标、域名保留、GlobalID、断开重附着；
-- 多条物理 Reverse 连接的选择和故障摘除；
+- 多条物理 Reverse 连接的选择和故障摘除（Batch J 的固定 Xray 双 Bridge TCP/RAW 故障切换验收已覆盖；完整发布门槛仍未完成）；
 - Bridge 失败退避、恢复、删除配置和 whole-server shutdown；
 - source IP、sniffing、routing、policy 和 traffic 统计。
 

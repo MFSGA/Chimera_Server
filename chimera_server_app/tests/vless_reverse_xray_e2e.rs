@@ -83,6 +83,17 @@ impl ReverseSecurity {
             _ => false,
         }
     }
+
+    fn is_reality(self) -> bool {
+        #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
+        {
+            matches!(self, Self::Reality)
+        }
+        #[cfg(not(any(feature = "full", feature = "vless-reverse-reality")))]
+        {
+            false
+        }
+    }
 }
 
 #[test]
@@ -108,6 +119,12 @@ fn chimera_bridge_preserves_reverse_source_for_freedom_proxy_protocol() {
 #[test]
 fn chimera_bridge_xhttp_forwarded_source_does_not_replace_reverse_client_source() {
     run_chimera_bridge_xhttp_forwarded_source_interop();
+}
+
+#[cfg(any(feature = "full", feature = "vless-reverse"))]
+#[test]
+fn multiple_xray_bridges_keep_chimera_portal_usable_after_one_disconnects() {
+    run_multiple_xray_bridge_failover();
 }
 
 #[test]
@@ -4788,14 +4805,14 @@ fn run_chimera_bridge_interop(
         }
     });
     write_json(&chimera_config, chimera_config_value.clone());
-    if matches!(security, ReverseSecurity::Reality) {
+    if security.is_reality() {
         let mut bad_auth = chimera_config_value;
         bad_auth["outbounds"][0]["streamSettings"]["realitySettings"]["shortId"] =
             json!("0000000000000000");
         write_json(&chimera_bad_auth_config, bad_auth);
     }
 
-    let bridge_config = if matches!(security, ReverseSecurity::Reality) {
+    let bridge_config = if security.is_reality() {
         &chimera_bad_auth_config
     } else {
         &chimera_config
@@ -4815,7 +4832,7 @@ fn run_chimera_bridge_interop(
     xray.assert_running();
 
     let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
-    if matches!(security, ReverseSecurity::Reality) {
+    if security.is_reality() {
         std::thread::sleep(Duration::from_millis(2300));
         assert_reverse_echo_unavailable(public_addr);
         assert_eq!(
@@ -4861,6 +4878,179 @@ fn run_chimera_bridge_interop(
 
     chimera.assert_running();
     xray.assert_running();
+}
+
+fn run_multiple_xray_bridge_failover() {
+    let workspace = workspace_root();
+    let xray_binary = xray_binary(&workspace);
+    if !xray_binary.is_file() {
+        eprintln!(
+            "skipping multi-Bridge Reverse failover test because {} is unavailable; set XRAY_BIN to enable it",
+            xray_binary.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir("vless-reverse-multi-bridge-failover");
+    let bridge_a_dir = work_dir.join("bridge-a");
+    let bridge_b_dir = work_dir.join("bridge-b");
+    fs::create_dir_all(&bridge_a_dir).expect("create first Xray Bridge directory");
+    fs::create_dir_all(&bridge_b_dir).expect("create second Xray Bridge directory");
+
+    let (echo_addr, echoed_bytes) = start_observed_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let bridge_a_config = bridge_a_dir.join("xray.json");
+    let bridge_b_config = bridge_b_dir.join("xray.json");
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "multi-bridge@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-echo",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["public-echo"],
+                    "network": "tcp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+    let bridge_config = xray_bridge_config(reverse_port);
+    write_json(&bridge_a_config, bridge_config.clone());
+    write_json(&bridge_b_config, bridge_config);
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    let reverse_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port));
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    wait_for_tcp(reverse_addr);
+    wait_for_tcp(public_addr);
+    chimera.assert_running();
+
+    let mut bridge_a = start_xray(&workspace, &bridge_a_dir, &bridge_a_config);
+    let mut bridge_b = start_xray(&workspace, &bridge_b_dir, &bridge_b_config);
+    bridge_a.assert_running();
+    bridge_b.assert_running();
+    wait_for_xray_reverse_control_session(
+        &bridge_a_dir.join("xray.stdout.log"),
+        "first Bridge",
+    );
+    wait_for_xray_reverse_control_session(
+        &bridge_b_dir.join("xray.stdout.log"),
+        "second Bridge",
+    );
+    assert_reverse_echo_with_retry(
+        public_addr,
+        b"traffic before a Bridge exits",
+        &echoed_bytes,
+    );
+    chimera.assert_running();
+    bridge_a.assert_running();
+    bridge_b.assert_running();
+
+    // Killing either physical Bridge must remove only its worker. The other
+    // Bridge must continue serving new TCP sessions on the same Portal tag.
+    drop(bridge_a);
+    bridge_b.assert_running();
+
+    for payload in [
+        b"traffic after first Bridge exit".as_slice(),
+        b"second recovery request".as_slice(),
+        b"steady traffic on surviving Bridge".as_slice(),
+    ] {
+        assert_reverse_echo_with_retry(public_addr, payload, &echoed_bytes);
+    }
+    chimera.assert_running();
+    bridge_b.assert_running();
+}
+
+fn xray_bridge_config(reverse_port: u16) -> serde_json::Value {
+    json!({
+        "log": {"loglevel": "debug"},
+        "outbounds": [
+            {
+                "tag": "reverse-bridge",
+                "protocol": "vless",
+                "settings": {
+                    "address": "127.0.0.1",
+                    "port": reverse_port,
+                    "id": TEST_UUID,
+                    "encryption": "none",
+                    "reverse": {"tag": "bridge-in"}
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            },
+            {
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "ip": ["127.0.0.0/8"]
+                    }]
+                }
+            }
+        ],
+        "routing": {
+            "rules": [{
+                "type": "field",
+                "inboundTag": ["bridge-in"],
+                "network": "tcp",
+                "outboundTag": "direct"
+            }]
+        }
+    })
+}
+
+fn wait_for_xray_reverse_control_session(log_path: &Path, bridge_name: &str) {
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    loop {
+        let log = fs::read_to_string(log_path).unwrap_or_default();
+        if log.contains("received request for udp:reverse:0") {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {bridge_name} to receive the Reverse control session; log={log}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn run_reverse_interop(security: ReverseSecurity) {
