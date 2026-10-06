@@ -1198,6 +1198,93 @@ if [[ "$test_mode" == --tcp-iperf-diagnostic ]]; then
 fi
 
 if [[ "$test_mode" == --iperf-stress-only ]]; then
+    run_stress_iperf() {
+        local client_pid
+        local monitor_pid
+        local client_status
+
+        nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
+            --client 10.44.0.20 \
+            --port 5201 \
+            "$@" \
+            --json \
+            >"$iperf_client_result_file" \
+            2>"$iperf_client_error_file" &
+        client_pid=$!
+
+        python3 - "$client_pid" "$server_pid" "$hub_pid" "$edge_pid" <<'PY' &
+import os
+import sys
+import time
+from pathlib import Path
+
+client_pid = int(sys.argv[1])
+services = {
+    "OfficeGateway": int(sys.argv[2]),
+    "Hub": int(sys.argv[3]),
+    "Edge": int(sys.argv[4]),
+}
+clock_ticks = os.sysconf("SC_CLK_TCK")
+
+def state(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    return raw[raw.rfind(")") + 2 :].split()[0]
+
+def sample(pid):
+    status = Path(f"/proc/{pid}/status").read_text().splitlines()
+    values = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in status if ":" in line}
+    rss_kib = int(values["VmRSS"].split()[0])
+    cpu_ticks_total = 0
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            fields = (task / "stat").read_text()
+        except FileNotFoundError:
+            continue
+        fields = fields[fields.rfind(")") + 2 :].split()
+        cpu_ticks_total += int(fields[11]) + int(fields[12])
+    return cpu_ticks_total, rss_kib
+
+baseline = {name: sample(pid) for name, pid in services.items()}
+sampled_peak_rss = {name: baseline[name][1] for name in services}
+final = baseline.copy()
+
+while True:
+    try:
+        if state(client_pid) in {"Z", "X"}:
+            break
+    except FileNotFoundError:
+        break
+    for name, pid in services.items():
+        try:
+            final[name] = sample(pid)
+        except (FileNotFoundError, KeyError, ProcessLookupError) as error:
+            raise SystemExit(f"resource monitor lost {name} process {pid}: {error}")
+        sampled_peak_rss[name] = max(sampled_peak_rss[name], final[name][1])
+    time.sleep(0.1)
+
+for name, pid in services.items():
+    try:
+        final[name] = sample(pid)
+    except (FileNotFoundError, KeyError, ProcessLookupError) as error:
+        raise SystemExit(f"resource monitor lost {name} process {pid}: {error}")
+    sampled_peak_rss[name] = max(sampled_peak_rss[name], final[name][1])
+    cpu_seconds = max(0, final[name][0] - baseline[name][0]) / clock_ticks
+    print(
+        f"Resource sample {name}: CPU +{cpu_seconds:.2f}s, "
+        f"RSS baseline={baseline[name][1]} KiB, sampled peak={sampled_peak_rss[name]} KiB"
+    )
+PY
+        monitor_pid=$!
+
+        if wait "$client_pid"; then
+            client_status=0
+        else
+            client_status=$?
+        fi
+        wait "$monitor_pid"
+        return "$client_status"
+    }
+
     for attempt in $(seq 1 50); do
         if grep -q 'Server listening on 5201' "$edge_iperf_log_file"; then
             break
@@ -1206,14 +1293,9 @@ if [[ "$test_mode" == --iperf-stress-only ]]; then
     done
     grep -q 'Server listening on 5201' "$edge_iperf_log_file"
 
-    nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
-        --client 10.44.0.20 \
-        --port 5201 \
+    run_stress_iperf \
         --parallel "$stress_parallel" \
-        --time "$stress_seconds" \
-        --json \
-        >"$iperf_client_result_file" \
-        2>"$iperf_client_error_file"
+        --time "$stress_seconds"
     python3 - "$iperf_client_result_file" "$stress_seconds" "$stress_parallel" <<'PY'
 import json
 import sys
@@ -1236,17 +1318,12 @@ print(
 )
 PY
 
-    nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
-        --client 10.44.0.20 \
-        --port 5201 \
+    run_stress_iperf \
         --parallel "$stress_parallel" \
         --udp \
         --bandwidth 5M \
         --length 1200 \
-        --time "$stress_seconds" \
-        --json \
-        >"$iperf_client_result_file" \
-        2>"$iperf_client_error_file"
+        --time "$stress_seconds"
     python3 - "$iperf_client_result_file" "$stress_seconds" "$stress_parallel" <<'PY'
 import json
 import sys
