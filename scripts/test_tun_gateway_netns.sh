@@ -5,10 +5,15 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_mode=${1:-full}
 gateway_mtu=${TUN_GATEWAY_MTU:-1500}
 stress_seconds=${TUN_GATEWAY_STRESS_SECONDS:-60}
+stress_clients=${TUN_GATEWAY_STRESS_CLIENTS:-1}
 # The fixture allows eight TCP/UDP sessions; keep room for iperf3's control flow.
-stress_parallel=${TUN_GATEWAY_STRESS_PARALLEL:-4}
+stress_parallel_default=4
+if [[ "$stress_clients" == 2 ]]; then
+    stress_parallel_default=1
+fi
+stress_parallel=${TUN_GATEWAY_STRESS_PARALLEL:-$stress_parallel_default}
 if (( $# > 1 )) || [[ "$test_mode" != full && "$test_mode" != --hub-policy-only && "$test_mode" != --tcp-iperf-diagnostic && "$test_mode" != --reverse-offline-only && "$test_mode" != --iperf-stress-only ]]; then
-    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 TUN_GATEWAY_STRESS_SECONDS=10..3600 TUN_GATEWAY_STRESS_PARALLEL=1..6 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only|--iperf-stress-only]\n' "$0" >&2
+    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 TUN_GATEWAY_STRESS_SECONDS=10..3600 TUN_GATEWAY_STRESS_CLIENTS=1..2 TUN_GATEWAY_STRESS_PARALLEL=1..6 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only|--iperf-stress-only]\n' "$0" >&2
     exit 2
 fi
 if [[ "$test_mode" == --iperf-stress-only ]] \
@@ -18,9 +23,19 @@ if [[ "$test_mode" == --iperf-stress-only ]] \
     exit 2
 fi
 if [[ "$test_mode" == --iperf-stress-only ]] \
+    && { [[ ! "$stress_clients" =~ ^[0-9]+$ ]] \
+        || (( stress_clients < 1 || stress_clients > 2 )); }; then
+    printf 'TUN_GATEWAY_STRESS_CLIENTS must be an integer from 1 to 2 in --iperf-stress-only mode.\n' >&2
+    exit 2
+fi
+stress_parallel_max=6
+if [[ "$stress_clients" == 2 ]]; then
+    stress_parallel_max=2
+fi
+if [[ "$test_mode" == --iperf-stress-only ]] \
     && { [[ ! "$stress_parallel" =~ ^[0-9]+$ ]] \
-        || (( stress_parallel < 1 || stress_parallel > 6 )); }; then
-    printf 'TUN_GATEWAY_STRESS_PARALLEL must be an integer from 1 to 6 in --iperf-stress-only mode.\n' >&2
+        || (( stress_parallel < 1 || stress_parallel > stress_parallel_max )); }; then
+    printf 'TUN_GATEWAY_STRESS_PARALLEL must be an integer from 1 to %s in this mode.\n' "$stress_parallel_max" >&2
     exit 2
 fi
 if [[ ! "$gateway_mtu" =~ ^[0-9]+$ ]] \
@@ -73,13 +88,14 @@ unshare \
     --map-users="0:${test_host_uid}:1" \
     --map-users="1:${test_subuid_start}:${test_subuid_count}" \
     --net \
-    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" "$stress_seconds" "$stress_parallel" <<'NAMESPACE_SCRIPT'
+    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" "$stress_seconds" "$stress_parallel" "$stress_clients" <<'NAMESPACE_SCRIPT'
 set -euo pipefail
 test_mode=$1
 gateway_mtu=$2
 xray_bin=$3
 stress_seconds=$4
 stress_parallel=$5
+stress_clients=$6
 trap 'exit_status=$?; printf "Namespace smoke failed with status %s at line %s: %s\\n" "$exit_status" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 lan_ns_pid=
@@ -158,8 +174,11 @@ edge_udp_echo_log_file=$(mktemp)
 edge_udp_second_echo_log_file=$(mktemp)
 edge_dns_log_file=$(mktemp)
 edge_iperf_log_file=$(mktemp)
+edge_iperf_second_log_file=$(mktemp)
 iperf_client_result_file=$(mktemp)
 iperf_client_error_file=$(mktemp)
+iperf_client_second_result_file=$(mktemp)
+iperf_client_second_error_file=$(mktemp)
 office_udp_client_a_log_file=$(mktemp)
 office_udp_client_b_log_file=$(mktemp)
 edge_tcp_v6_echo_log_file=$(mktemp)
@@ -186,6 +205,7 @@ edge_udp_echo_pid=
 edge_udp_second_echo_pid=
 edge_dns_pid=
 edge_iperf_server_pid=
+edge_iperf_second_server_pid=
 office_udp_client_a_pid=
 office_udp_client_b_pid=
 edge_tcp_v6_echo_pid=
@@ -271,6 +291,10 @@ cleanup() {
         kill -TERM "$edge_iperf_server_pid" 2>/dev/null || true
         wait "$edge_iperf_server_pid" 2>/dev/null || true
     fi
+    if [[ -n "$edge_iperf_second_server_pid" ]] && kill -0 "$edge_iperf_second_server_pid" 2>/dev/null; then
+        kill -TERM "$edge_iperf_second_server_pid" 2>/dev/null || true
+        wait "$edge_iperf_second_server_pid" 2>/dev/null || true
+    fi
     if [[ -n "$edge_tcp_v6_echo_pid" ]] && kill -0 "$edge_tcp_v6_echo_pid" 2>/dev/null; then
         kill -TERM "$edge_tcp_v6_echo_pid" 2>/dev/null || true
         wait "$edge_tcp_v6_echo_pid" 2>/dev/null || true
@@ -310,8 +334,12 @@ cleanup() {
         cat "$edge_dns_log_file" >&2 || true
         printf '\n--- Edge iperf3 server log ---\n' >&2
         cat "$edge_iperf_log_file" >&2 || true
+        printf '\n--- Edge second-target iperf3 server log ---\n' >&2
+        cat "$edge_iperf_second_log_file" >&2 || true
         printf '\n--- Office iperf3 client error log ---\n' >&2
         cat "$iperf_client_error_file" >&2 || true
+        printf '\n--- Second Office iperf3 client error log ---\n' >&2
+        cat "$iperf_client_second_error_file" >&2 || true
         printf '\n--- Office client A UDP log ---\n' >&2
         cat "$office_udp_client_a_log_file" >&2 || true
         printf '\n--- Office client B UDP log ---\n' >&2
@@ -360,8 +388,11 @@ cleanup() {
         "$edge_udp_second_echo_log_file" \
         "$edge_dns_log_file" \
         "$edge_iperf_log_file" \
+        "$edge_iperf_second_log_file" \
         "$iperf_client_result_file" \
         "$iperf_client_error_file" \
+        "$iperf_client_second_result_file" \
+        "$iperf_client_second_error_file" \
         "$office_udp_client_a_log_file" \
         "$office_udp_client_b_log_file" \
         "$edge_tcp_v6_echo_log_file" \
@@ -637,6 +668,9 @@ outbounds:
               ip: [198.18.0.20/32]
               ports: ["5201"]
             - network: [tcp, udp]
+              ip: [198.18.0.21/32]
+              ports: ["5201"]
+            - network: [tcp, udp]
               ip: [198.18.0.20/32]
               ports: ["39647"]
             - network: [tcp, udp]
@@ -660,6 +694,10 @@ outbounds:
         - action: allow
           network: [tcp, udp]
           ip: [198.18.0.20/32]
+          port: "5201"
+        - action: allow
+          network: [tcp, udp]
+          ip: [198.18.0.21/32]
           port: "5201"
         - action: allow
           network: [tcp, udp]
@@ -934,6 +972,14 @@ nsenter --net="/proc/$lan_ns_pid/ns/net" iperf3 \
     "${iperf_server_debug_args[@]}" \
     >"$edge_iperf_log_file" 2>&1 &
 edge_iperf_server_pid=$!
+if [[ "$test_mode" == --iperf-stress-only && "$stress_clients" == 2 ]]; then
+    nsenter --net="/proc/$lan_ns_pid/ns/net" iperf3 \
+        --server \
+        --bind 198.18.0.21 \
+        --port 5201 \
+        >"$edge_iperf_second_log_file" 2>&1 &
+    edge_iperf_second_server_pid=$!
+fi
 
 nsenter --net="/proc/$lan_ns_pid/ns/net" python3 -u - <<'PY' >"$edge_tcp_v6_echo_log_file" 2>&1 &
 import socket
@@ -1200,8 +1246,10 @@ fi
 if [[ "$test_mode" == --iperf-stress-only ]]; then
     run_stress_iperf() {
         local client_pid
+        local second_client_pid=0
         local monitor_pid
         local client_status
+        local second_client_status
 
         nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
             --client 10.44.0.20 \
@@ -1211,24 +1259,40 @@ if [[ "$test_mode" == --iperf-stress-only ]]; then
             >"$iperf_client_result_file" \
             2>"$iperf_client_error_file" &
         client_pid=$!
+        if [[ "$stress_clients" == 2 ]]; then
+            nsenter --net="/proc/$office_client_2_ns_pid/ns/net" iperf3 \
+                --client 10.44.0.21 \
+                --port 5201 \
+                "$@" \
+                --json \
+                >"$iperf_client_second_result_file" \
+                2>"$iperf_client_second_error_file" &
+            second_client_pid=$!
+        fi
 
-        python3 - "$client_pid" "$server_pid" "$hub_pid" "$edge_pid" <<'PY' &
+        python3 - "$client_pid" "$second_client_pid" "$server_pid" "$hub_pid" "$edge_pid" <<'PY' &
 import os
 import sys
 import time
 from pathlib import Path
 
-client_pid = int(sys.argv[1])
+client_pids = [int(pid) for pid in sys.argv[1:3] if int(pid) > 0]
 services = {
-    "OfficeGateway": int(sys.argv[2]),
-    "Hub": int(sys.argv[3]),
-    "Edge": int(sys.argv[4]),
+    "OfficeGateway": int(sys.argv[3]),
+    "Hub": int(sys.argv[4]),
+    "Edge": int(sys.argv[5]),
 }
 clock_ticks = os.sysconf("SC_CLK_TCK")
 
 def state(pid):
     raw = Path(f"/proc/{pid}/stat").read_text()
     return raw[raw.rfind(")") + 2 :].split()[0]
+
+def alive(pid):
+    try:
+        return state(pid) not in {"Z", "X"}
+    except FileNotFoundError:
+        return False
 
 def sample(pid):
     status = Path(f"/proc/{pid}/status").read_text().splitlines()
@@ -1248,12 +1312,7 @@ baseline = {name: sample(pid) for name, pid in services.items()}
 sampled_peak_rss = {name: baseline[name][1] for name in services}
 final = baseline.copy()
 
-while True:
-    try:
-        if state(client_pid) in {"Z", "X"}:
-            break
-    except FileNotFoundError:
-        break
+while any(alive(pid) for pid in client_pids):
     for name, pid in services.items():
         try:
             final[name] = sample(pid)
@@ -1281,7 +1340,18 @@ PY
         else
             client_status=$?
         fi
+        second_client_status=0
+        if (( second_client_pid > 0 )); then
+            if wait "$second_client_pid"; then
+                second_client_status=0
+            else
+                second_client_status=$?
+            fi
+        fi
         wait "$monitor_pid"
+        if (( client_status != 0 || second_client_status != 0 )); then
+            return 1
+        fi
         return "$client_status"
     }
 
@@ -1292,29 +1362,63 @@ PY
         sleep 0.1
     done
     grep -q 'Server listening on 5201' "$edge_iperf_log_file"
+    if [[ "$stress_clients" == 2 ]]; then
+        second_iperf_ready=false
+        for attempt in $(seq 1 50); do
+            if nsenter --net="/proc/$lan_ns_pid/ns/net" python3 - <<'PY'
+import socket
+
+probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+probe.settimeout(0.2)
+result = probe.connect_ex(("198.18.0.21", 5201))
+probe.close()
+raise SystemExit(result)
+PY
+            then
+                second_iperf_ready=true
+                break
+            fi
+            if ! kill -0 "$edge_iperf_second_server_pid" 2>/dev/null; then
+                cat "$edge_iperf_second_log_file" >&2
+                printf 'Second Edge iperf3 server exited before listening.\n' >&2
+                exit 1
+            fi
+            sleep 0.1
+        done
+        if [[ "$second_iperf_ready" != true ]]; then
+            printf 'Second Edge iperf3 server did not open 198.18.0.21:5201.\n' >&2
+            exit 1
+        fi
+    fi
 
     run_stress_iperf \
         --parallel "$stress_parallel" \
         --time "$stress_seconds"
-    python3 - "$iperf_client_result_file" "$stress_seconds" "$stress_parallel" <<'PY'
+    python3 - "$iperf_client_result_file" "$iperf_client_second_result_file" "$stress_seconds" "$stress_parallel" "$stress_clients" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-report = json.loads(Path(sys.argv[1]).read_text())
-expected_seconds = int(sys.argv[2])
-parallel_streams = int(sys.argv[3])
-streams = report["end"].get("streams", [])
-if len(streams) != parallel_streams:
-    raise SystemExit(f"TCP iperf3 expected {parallel_streams} parallel streams, got {len(streams)}")
-sent = report["end"]["sum_sent"]
-received = report["end"]["sum_received"]
-for name, direction in (("sent", sent), ("received", received)):
-    if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
-        raise SystemExit(f"TCP iperf3 {name} stream did not sustain the requested interval: {direction!r}")
+expected_seconds = int(sys.argv[3])
+parallel_streams = int(sys.argv[4])
+client_count = int(sys.argv[5])
+total_sent = 0
+total_received = 0
+for index, result_path in enumerate(sys.argv[1:1 + client_count]):
+    report = json.loads(Path(result_path).read_text())
+    streams = report["end"].get("streams", [])
+    if len(streams) != parallel_streams:
+        raise SystemExit(f"TCP iperf3 client {index + 1} expected {parallel_streams} streams, got {len(streams)}")
+    sent = report["end"]["sum_sent"]
+    received = report["end"]["sum_received"]
+    for name, direction in (("sent", sent), ("received", received)):
+        if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
+            raise SystemExit(f"TCP iperf3 client {index + 1} {name} stream did not sustain the requested interval: {direction!r}")
+    total_sent += sent["bytes"]
+    total_received += received["bytes"]
 print(
-    f"TCP sustained {expected_seconds}s across {parallel_streams} streams: sent={sent['bytes']} bytes "
-    f"received={received['bytes']} bytes"
+    f"TCP sustained {expected_seconds}s across {client_count} Office host(s), "
+    f"{parallel_streams} streams per host: sent={total_sent} bytes received={total_received} bytes"
 )
 PY
 
@@ -1324,31 +1428,40 @@ PY
         --bandwidth 5M \
         --length 1200 \
         --time "$stress_seconds"
-    python3 - "$iperf_client_result_file" "$stress_seconds" "$stress_parallel" <<'PY'
+    python3 - "$iperf_client_result_file" "$iperf_client_second_result_file" "$stress_seconds" "$stress_parallel" "$stress_clients" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-report = json.loads(Path(sys.argv[1]).read_text())
-expected_seconds = int(sys.argv[2])
-parallel_streams = int(sys.argv[3])
-streams = report["end"].get("streams", [])
-if len(streams) != parallel_streams:
-    raise SystemExit(f"UDP iperf3 expected {parallel_streams} parallel streams, got {len(streams)}")
-sent = report["end"]["sum_sent"]
-received = report["end"]["sum_received"]
-for name, direction in (("sent", sent), ("received", received)):
-    if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
-        raise SystemExit(f"UDP iperf3 {name} stream did not sustain the requested interval: {direction!r}")
-if received["packets"] <= 0 or not 0 <= received["lost_percent"] <= 1.0:
-    raise SystemExit(f"UDP iperf3 loss exceeded the 1% stress threshold: {received!r}")
+expected_seconds = int(sys.argv[3])
+parallel_streams = int(sys.argv[4])
+client_count = int(sys.argv[5])
+total_sent = 0
+total_received = 0
+maximum_loss_percent = 0.0
+for index, result_path in enumerate(sys.argv[1:1 + client_count]):
+    report = json.loads(Path(result_path).read_text())
+    streams = report["end"].get("streams", [])
+    if len(streams) != parallel_streams:
+        raise SystemExit(f"UDP iperf3 client {index + 1} expected {parallel_streams} streams, got {len(streams)}")
+    sent = report["end"]["sum_sent"]
+    received = report["end"]["sum_received"]
+    for name, direction in (("sent", sent), ("received", received)):
+        if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
+            raise SystemExit(f"UDP iperf3 client {index + 1} {name} stream did not sustain the requested interval: {direction!r}")
+    if received["packets"] <= 0 or not 0 <= received["lost_percent"] <= 1.0:
+        raise SystemExit(f"UDP iperf3 client {index + 1} loss exceeded the 1% stress threshold: {received!r}")
+    total_sent += sent["bytes"]
+    total_received += received["bytes"]
+    maximum_loss_percent = max(maximum_loss_percent, received["lost_percent"])
 print(
-    f"UDP sustained {expected_seconds}s at 5 Mbit/s across {parallel_streams} streams: sent={sent['bytes']} bytes "
-    f"received={received['bytes']} bytes loss={received['lost_percent']:.2f}%"
+    f"UDP sustained {expected_seconds}s at 5 Mbit/s per stream across {client_count} Office host(s), "
+    f"{parallel_streams} streams per host: sent={total_sent} bytes received={total_received} bytes "
+    f"max reported loss={maximum_loss_percent:.2f}%"
 )
 PY
 
-    printf 'Sustained TCP and UDP traffic completed across the live TUN/Reverse/Edge path with %s parallel streams.\n' "$stress_parallel"
+    printf 'Sustained TCP and UDP traffic completed across the live TUN/Reverse/Edge path for %s Office host(s).\n' "$stress_clients"
     exit 0
 fi
 
