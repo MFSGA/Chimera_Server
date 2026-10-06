@@ -1811,6 +1811,14 @@ import socket
 import sys
 
 target = ("10.44.0.20", 39642)
+tcp_target = ("10.44.0.20", 39641)
+with socket.create_connection(tcp_target, timeout=5) as baseline_tcp:
+    baseline_tcp.settimeout(5)
+    baseline_tcp.sendall(b"reverse-offline-before-tcp")
+    baseline_tcp_reply = baseline_tcp.recv(128)
+    if baseline_tcp_reply != b"reverse-offline-before-tcp":
+        raise SystemExit(f"unexpected baseline TCP echo: {baseline_tcp_reply!r}")
+
 baseline = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 baseline.settimeout(5)
 
@@ -1838,6 +1846,24 @@ else:
 
 if sock.getsockname()[1] != source_port:
     raise SystemExit("UDP source port changed during the offline probe")
+
+offline_tcp_marker = b"reverse-offline-no-worker-tcp"
+try:
+    offline_tcp = socket.create_connection(tcp_target, timeout=1)
+except OSError:
+    pass
+else:
+    offline_tcp.settimeout(1)
+    with offline_tcp:
+        try:
+            offline_tcp.sendall(offline_tcp_marker)
+            response = offline_tcp.recv(128)
+        except (OSError, TimeoutError):
+            response = b""
+        if response:
+            raise SystemExit(f"offline Reverse TCP unexpectedly returned data: {response!r}")
+print("tcp-dropped-without-worker", flush=True)
+
 if sys.stdin.readline().strip() != "probe-recovered":
     raise SystemExit("missing recovered UDP probe trigger")
 
@@ -1859,6 +1885,16 @@ for attempt in range(1, 13):
     break
 else:
     raise SystemExit("same-tuple Reverse UDP did not recover after Bridge reattachment")
+
+recovered_tcp = socket.create_connection(tcp_target, timeout=5)
+recovered_tcp.settimeout(5)
+recovered_tcp_marker = b"reverse-offline-recovered-tcp"
+recovered_tcp.sendall(recovered_tcp_marker)
+recovered_tcp_reply = recovered_tcp.recv(128)
+recovered_tcp.close()
+if recovered_tcp_reply != recovered_tcp_marker:
+    raise SystemExit(f"Reverse TCP did not recover after Bridge reattachment: {recovered_tcp_reply!r}")
+print("tcp-recovered-after-worker-attach", flush=True)
 
 baseline.close()
 sock.close()
@@ -1889,9 +1925,18 @@ PY
         printf 'Live TUN Reverse UDP did not fail closed while its only Bridge was offline.\n' >&2
         exit 1
     fi
+    if ! IFS= read -r -t 5 offline_tcp_state <&"$offline_udp_read_fd" \
+        || [[ "$offline_tcp_state" != tcp-dropped-without-worker ]]; then
+        printf 'Live TUN Reverse TCP did not fail closed while its only Bridge was offline.\n' >&2
+        exit 1
+    fi
     grep -Fq 'no ACTIVE Reverse Mux client worker available' "$hub_log_file"
     if grep -Fq "udp-limit-received b'reverse-offline-no-worker'" "$edge_udp_echo_log_file"; then
         printf 'The Edge LAN received a UDP packet while its Bridge was offline.\n' >&2
+        exit 1
+    fi
+    if grep -Fq "tcp-received b'reverse-offline-no-worker-tcp'" "$edge_tcp_echo_log_file"; then
+        printf 'The Edge LAN received a TCP payload while its Bridge was offline.\n' >&2
         exit 1
     fi
 
@@ -1921,6 +1966,11 @@ PY
         printf 'Live TUN UDP tuple did not recover after the Bridge reattached.\n' >&2
         exit 1
     fi
+    if ! IFS= read -r -t 8 offline_tcp_state <&"$offline_udp_read_fd" \
+        || [[ "$offline_tcp_state" != tcp-recovered-after-worker-attach ]]; then
+        printf 'Live TUN TCP did not recover after the Bridge reattached.\n' >&2
+        exit 1
+    fi
     if ! wait "$offline_udp_client_pid"; then
         printf 'Live TUN Reverse UDP outage client exited with an error.\n' >&2
         exit 1
@@ -1928,13 +1978,19 @@ PY
     offline_udp_client_pid=
     grep -Fq "udp-limit-received b'reverse-offline-before'" "$edge_udp_echo_log_file"
     grep -Fq "udp-limit-received b'reverse-offline-recovered-" "$edge_udp_echo_log_file"
+    grep -Fq "tcp-received b'reverse-offline-before-tcp'" "$edge_tcp_echo_log_file"
+    grep -Fq "tcp-received b'reverse-offline-recovered-tcp'" "$edge_tcp_echo_log_file"
     if grep -Fq "udp-limit-received b'reverse-offline-no-worker'" "$edge_udp_echo_log_file"; then
         printf 'The Edge LAN received the offline-only UDP marker.\n' >&2
         exit 1
     fi
+    if grep -Fq "tcp-received b'reverse-offline-no-worker-tcp'" "$edge_tcp_echo_log_file"; then
+        printf 'The Edge LAN received the offline-only TCP marker.\n' >&2
+        exit 1
+    fi
     kill -0 "$hub_pid"
     kill -0 "$server_pid"
-    printf 'Live Linux TUN UDP failed closed with no Reverse worker and recovered on the same source/target tuple after Bridge reattachment.\n'
+    printf 'Live Linux TUN TCP/UDP failed closed with no Reverse worker and recovered after Bridge reattachment.\n'
     exit 0
 fi
 
