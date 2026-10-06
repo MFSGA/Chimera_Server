@@ -3,7 +3,7 @@
 > 站点到站点 TUN Gateway 是 2026-10-03 新启动的独立纵向专项，依赖这里已有的 Reverse Portal/Bridge 能力；其 TUN、VLESS UDP 出站、Overlay 映射与验收状态统一维护于 [SITE_TO_SITE_DESIGN.md](SITE_TO_SITE_DESIGN.md)。该专项为 Chimera-to-Chimera TCP 增加了 Mux option bit `0x04` 的方向性 half-close 扩展；Xray 标准 END 语义不变，且不宣称 Xray peer 支持该扩展。本文件其余 Reverse wire/role 兼容范围不会因新专项自动扩大。
 
 - 状态：Batch A–I 已实现，Batch J 收口进行中；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。普通静态 VLESS outbound 另已支持并通过 TUN→固定 Xray Hub 的 XHTTP/TLS H3 `packet-up`/`stream-up`/`auto` 验证；这不扩展本文件的 Reverse Bridge 主动拨号组合。RAW 双向互操作现额外锁定 256 KiB 连续回显、4 路并发 TCP session 和 Xray Mux `END` 的整会话关闭语义；Xray Bridge -> Chimera Portal 还验证错误 UUID 不会建立 Reverse worker 或拨号目标，listener 保持健康并可随后接受正确 Bridge。VLESS Reverse Bridge 的 XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
-- 更新日期：2026-10-03
+- 更新日期：2026-10-06
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
 - 最新字段复核：Xray-core 官方 `main` 提交
@@ -573,7 +573,8 @@ Chimera Bridge、UDP/XUDP 与更完整的 Reverse 兼容面。每批完成并提
 - Xray Bridge -> Chimera Portal RAW 路径新增错误 UUID 负向阶段：错误凭据持续拨入时 Reverse route 不可用、目标端保持零新增字节、Chimera listener 继续运行；停止错误 Bridge 后，同一 listener 可由正确凭据建立 worker 并完成后续互通。
 - 更新 materialized examples、支持矩阵、配置文档和 ARCHITECTURE 实施状态。
 - 未验证组合保持 Partial/Missing，不因主路径通过改成完整支持。
-- Batch J 尚未据此标记完成：多物理 Reverse 线路的真实故障切换、错误 command 的真实网络负向覆盖，以及完整发布门槛仍需逐项核验。2026-10-01 用户决定这些额外真实网络测试暂缓，不作为当前代码迭代的阻塞项；后续准备做发布级兼容收口时再恢复执行，并在完成前继续维持 Partial 支持声明。
+- 2026-10-06 增加真实 TCP listener 的未知 command 负向验收：使用已认证 Reverse-only UUID 发送 command `0xff` 和有效目标地址，Chimera 与固定 Xray 26.9.9 均关闭请求且未拨号目标；随后同一 listener 仍能用普通 VLESS 用户完成 TCP echo。验证命令：`XRAY_BIN=./xray cargo test -p chimera_server_app --test vless_invalid_command_xray_e2e --all-features --locked -- --exact chimera_and_xray_reject_unknown_vless_command_without_dialing_target --nocapture`，以及 `XRAY_BIN=./xray cargo test -p chimera_server_app --no-default-features --features vless-reverse --test vless_invalid_command_xray_e2e --locked -- --exact chimera_and_xray_reject_unknown_vless_command_without_dialing_target --nocapture`；两条均 1 passed。Xray 客户端为 `26.9.9 Custom (go1.27rc2 linux/amd64)`，参考提交 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`。此结果只覆盖该错误 command 与 listener 存活路径，不代表完整认证、重放或异常帧矩阵已通过。
+- Batch J 仍未完成：多物理 Reverse 线路的真实故障切换与完整发布门槛仍需逐项核验。2026-10-01 原暂缓的真实网络测试现已开始按小切片恢复；在全部收口之前继续维持 Partial 支持声明。
 
 ## 10. 测试与验证矩阵
 
