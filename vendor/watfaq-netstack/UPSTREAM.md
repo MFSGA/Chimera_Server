@@ -38,7 +38,7 @@ coverage for shutdown and diagnostic redaction.
 The vendored base was compared with the Client checkout at
 `8fc9b2b3821a571f806cda6cc4df68bef8ad1b46`; Client changes are retained and
 the Server delta adds UDP source fragmentation, idle fragment-state expiry
-scans, and their regression tests. The package tests pass: 19 unit tests and 34 integration tests. Its
+scans, and their regression tests. The package tests pass: 20 unit tests and 34 integration tests. Its
 all-target/all-feature Clippy check passes with warnings denied:
 
 ```sh

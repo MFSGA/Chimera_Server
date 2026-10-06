@@ -707,6 +707,116 @@ mod tests {
     }
 
     #[test]
+    fn fragment_reassembly_discards_conflicting_end_lengths_and_recovers() {
+        let payload = (0u8..24).collect::<Vec<_>>();
+        let build_ipv4 = |offset: usize, more: bool, bytes: &[u8]| {
+            let mut header = etherparse::Ipv4Header::new(
+                bytes.len() as u16,
+                64,
+                etherparse::ip_number::UDP,
+                [1, 1, 1, 1],
+                [2, 2, 2, 2],
+            )
+            .unwrap();
+            header.identification = 0x7b7b;
+            header.dont_fragment = false;
+            header.more_fragments = more;
+            header.fragment_offset =
+                etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap();
+            header.header_checksum = header.calc_header_checksum();
+            [header.to_bytes().as_slice(), bytes].concat()
+        };
+
+        let mut ipv4 = FragmentReassembler::new(etherparse::ip_number::UDP, "test");
+        assert!(
+            ipv4.push(&build_ipv4(0, true, &payload[..8]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ipv4.push(&build_ipv4(16, false, &payload[16..]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(ipv4.push(&build_ipv4(8, false, &payload[8..16])).is_err());
+        assert!(ipv4.active.is_empty(), "conflicting IPv4 tails clear state");
+
+        assert!(
+            ipv4.push(&build_ipv4(0, true, &payload[..8]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ipv4.push(&build_ipv4(8, true, &payload[8..16]))
+                .unwrap()
+                .is_none()
+        );
+        let recovered_ipv4 = ipv4
+            .push(&build_ipv4(16, false, &payload[16..]))
+            .unwrap()
+            .expect(
+                "valid IPv4 fragments must recover with the same identification",
+            );
+        assert_eq!(recovered_ipv4.payload, payload);
+
+        let build_ipv6 = |offset: usize, more: bool, bytes: &[u8]| {
+            let header = etherparse::Ipv6Header {
+                payload_length: (etherparse::Ipv6FragmentHeader::LEN + bytes.len())
+                    as u16,
+                next_header: etherparse::ip_number::IPV6_FRAG,
+                hop_limit: 64,
+                source: [1; 16],
+                destination: [2; 16],
+                ..Default::default()
+            };
+            let fragment = etherparse::Ipv6FragmentHeader::new(
+                etherparse::ip_number::UDP,
+                etherparse::IpFragOffset::try_new((offset / 8) as u16).unwrap(),
+                more,
+                0x7b7b_7b7b,
+            );
+            [
+                header.to_bytes().as_slice(),
+                fragment.to_bytes().as_slice(),
+                bytes,
+            ]
+            .concat()
+        };
+
+        let mut ipv6 = FragmentReassembler::new(etherparse::ip_number::UDP, "test");
+        assert!(
+            ipv6.push(&build_ipv6(0, true, &payload[..8]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ipv6.push(&build_ipv6(16, false, &payload[16..]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(ipv6.push(&build_ipv6(8, false, &payload[8..16])).is_err());
+        assert!(ipv6.active.is_empty(), "conflicting IPv6 tails clear state");
+
+        assert!(
+            ipv6.push(&build_ipv6(0, true, &payload[..8]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ipv6.push(&build_ipv6(8, true, &payload[8..16]))
+                .unwrap()
+                .is_none()
+        );
+        let recovered_ipv6 = ipv6
+            .push(&build_ipv6(16, false, &payload[16..]))
+            .unwrap()
+            .expect(
+                "valid IPv6 fragments must recover with the same identification",
+            );
+        assert_eq!(recovered_ipv6.payload, payload);
+    }
+
+    #[test]
     fn fragment_reassembly_propagates_ce_for_ipv6() {
         let source = [0x20; 16];
         let destination = [0x21; 16];
