@@ -57,6 +57,9 @@ enum ReverseSecurity {
     XhttpTls,
     XhttpTlsAuto,
     XhttpTlsPacketUp,
+    XhttpTlsH3PacketUp,
+    XhttpTlsH3StreamUp,
+    XhttpTlsH3Auto,
     XhttpTlsObfs,
 }
 
@@ -71,6 +74,9 @@ impl ReverseSecurity {
             Self::XhttpTls => "xhttp-tls",
             Self::XhttpTlsAuto => "xhttp-tls-auto",
             Self::XhttpTlsPacketUp => "xhttp-tls-packet-up",
+            Self::XhttpTlsH3PacketUp => "xhttp-tls-h3-packet-up",
+            Self::XhttpTlsH3StreamUp => "xhttp-tls-h3-stream-up",
+            Self::XhttpTlsH3Auto => "xhttp-tls-h3-auto",
             Self::XhttpTlsObfs => "xhttp-tls-obfs",
         }
     }
@@ -92,6 +98,23 @@ impl ReverseSecurity {
         #[cfg(not(any(feature = "full", feature = "vless-reverse-reality")))]
         {
             false
+        }
+    }
+
+    fn is_xhttp_h3(self) -> bool {
+        matches!(
+            self,
+            Self::XhttpTlsH3PacketUp
+                | Self::XhttpTlsH3StreamUp
+                | Self::XhttpTlsH3Auto
+        )
+    }
+
+    fn xhttp_mode(self) -> &'static str {
+        match self {
+            Self::XhttpTlsAuto | Self::XhttpTlsH3Auto => "auto",
+            Self::XhttpTlsPacketUp | Self::XhttpTlsH3PacketUp => "packet-up",
+            _ => "stream-up",
         }
     }
 }
@@ -175,6 +198,21 @@ fn chimera_bridge_round_trips_xray_portal_over_xhttp_tls_packet_up_vless_reverse
 #[test]
 fn xray_bridge_round_trips_chimera_portal_over_xhttp_tls_packet_up_vless_reverse() {
     run_reverse_interop(ReverseSecurity::XhttpTlsPacketUp);
+}
+
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_xhttp_h3_packet_up_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTlsH3PacketUp);
+}
+
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_xhttp_h3_stream_up_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTlsH3StreamUp);
+}
+
+#[test]
+fn xray_bridge_round_trips_chimera_portal_over_xhttp_h3_auto_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::XhttpTlsH3Auto);
 }
 
 #[test]
@@ -4800,19 +4838,14 @@ fn run_chimera_bridge_interop(
         | ReverseSecurity::XhttpTlsAuto
         | ReverseSecurity::XhttpTlsPacketUp => {
             let (cert_path, key_path) = generate_test_certificate(&work_dir);
-            let mode = match security {
-                ReverseSecurity::XhttpTlsAuto => "auto",
-                ReverseSecurity::XhttpTlsPacketUp => "packet-up",
-                _ => "stream-up",
-            };
-            let alpn = "h2";
+            let mode = security.xhttp_mode();
             (
                 json!({
                     "network": "xhttp",
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": "localhost",
-                        "alpn": [alpn],
+                        "alpn": ["h2"],
                         "certificates": [{
                             "certificateFile": cert_path,
                             "keyFile": key_path
@@ -4837,7 +4870,7 @@ fn run_chimera_bridge_interop(
                     "security": "tls",
                     "tlsSettings": {
                         "serverName": "localhost",
-                        "alpn": [alpn],
+                        "alpn": ["h2"],
                         "disableSystemRoot": true,
                         "certificates": [{
                             "certificateFile": cert_path,
@@ -4921,6 +4954,11 @@ fn run_chimera_bridge_interop(
                     }
                 }),
             )
+        }
+        ReverseSecurity::XhttpTlsH3PacketUp
+        | ReverseSecurity::XhttpTlsH3StreamUp
+        | ReverseSecurity::XhttpTlsH3Auto => {
+            unreachable!("Chimera Bridge -> Xray Portal Reverse H3 is fail-closed")
         }
     };
 
@@ -5328,7 +5366,11 @@ fn run_reverse_interop(security: ReverseSecurity) {
     let _serial = serial_xray_guard();
     let work_dir = create_test_dir(&format!("vless-reverse-{}", security.name()));
     let (echo_addr, echoed_bytes) = start_observed_echo_server();
-    let reverse_port = free_localhost_port();
+    let reverse_port = if security.is_xhttp_h3() {
+        free_localhost_udp_port()
+    } else {
+        free_localhost_port()
+    };
     let public_port = free_localhost_port();
     let chimera_config = work_dir.join("chimera.json");
     let xray_config = work_dir.join("xray.json");
@@ -5399,15 +5441,14 @@ fn run_reverse_interop(security: ReverseSecurity) {
         }
         ReverseSecurity::XhttpTls
         | ReverseSecurity::XhttpTlsAuto
-        | ReverseSecurity::XhttpTlsPacketUp => {
+        | ReverseSecurity::XhttpTlsPacketUp
+        | ReverseSecurity::XhttpTlsH3PacketUp
+        | ReverseSecurity::XhttpTlsH3StreamUp
+        | ReverseSecurity::XhttpTlsH3Auto => {
             let (cert_path, key_path) = generate_test_certificate(&work_dir);
             let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
-            let mode = match security {
-                ReverseSecurity::XhttpTlsAuto => "auto",
-                ReverseSecurity::XhttpTlsPacketUp => "packet-up",
-                _ => "stream-up",
-            };
-            let alpn = "h2";
+            let mode = security.xhttp_mode();
+            let alpn = if security.is_xhttp_h3() { "h3" } else { "h2" };
             (
                 json!({
                     "network": "xhttp",
@@ -5626,7 +5667,9 @@ fn run_reverse_interop(security: ReverseSecurity) {
     }
 
     let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
-    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    if !security.is_xhttp_h3() {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    }
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
     chimera.assert_running();
 

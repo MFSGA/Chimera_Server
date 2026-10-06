@@ -2,7 +2,7 @@
 
 > 站点到站点 TUN Gateway 是 2026-10-03 新启动的独立纵向专项，依赖这里已有的 Reverse Portal/Bridge 能力；其 TUN、VLESS UDP 出站、Overlay 映射与验收状态统一维护于 [SITE_TO_SITE_DESIGN.md](SITE_TO_SITE_DESIGN.md)。该专项为 Chimera-to-Chimera TCP 增加了 Mux option bit `0x04` 的方向性 half-close 扩展；Xray 标准 END 语义不变，且不宣称 Xray peer 支持该扩展。本文件其余 Reverse wire/role 兼容范围不会因新专项自动扩大。
 
-- 状态：Batch A–I 已实现，Batch J 收口进行中；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。普通静态 VLESS outbound 另已支持并通过 TUN→固定 Xray Hub 的 XHTTP/TLS H3 `packet-up`/`stream-up`/`auto` 验证；这不扩展本文件的 Reverse Bridge 主动拨号组合。RAW 双向互操作现额外锁定 256 KiB 连续回显、4 路并发 TCP session 和 Xray Mux `END` 的整会话关闭语义；Xray Bridge -> Chimera Portal 还验证错误 UUID 不会建立 Reverse worker 或拨号目标，listener 保持健康并可随后接受正确 Bridge。VLESS Reverse Bridge 的 XHTTP H1/H3、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
+- 状态：Batch A–I 已实现，Batch J 收口进行中；RAW/TLS TCP、RAW UDP、WebSocket（无 early data），以及 XHTTP TLS/H2 的 `stream-up`、显式 `packet-up` 与默认 `auto` 均有固定 Xray 双向互操作（`auto` 在此 TLS/H2 路径选择 packet-up）。XHTTP TLS/H3 的 Reverse Portal 方向（Xray Bridge -> Chimera Portal）已验证 `packet-up`、`stream-up`、`auto` 三种模式；反方向 Chimera Bridge -> Xray Portal 尚未实现并保持 fail closed，实验中目标收到回包但 Xray 侧连接未收到 echo。普通静态 VLESS outbound 的 H3 互通不代表该 Reverse Bridge 拨号组合已支持。RAW 双向互操作现额外锁定 256 KiB 连续回显、4 路并发 TCP session 和 Xray Mux `END` 的整会话关闭语义；Xray Bridge -> Chimera Portal 还验证错误 UUID 不会建立 Reverse worker 或拨号目标，listener 保持健康并可随后接受正确 Bridge。VLESS Reverse Bridge 的 XHTTP H1、`stream-one`、xmux、`downloadSettings` 和其他未列 transport/security 组合仍待完成或验证
 - 更新日期：2026-10-06
 - 当前本地 Xray 基线：`ref/xray-core` `v26.9.9`，提交
   `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`
@@ -438,7 +438,8 @@ Reverse 是 VLESS account/command 能力，物理连接继续使用 VLESS outbou
 | RAW/TLS | 第一阶段部署验收；Chimera 只需已有 inbound TLS，主动拨号由 Xray Bridge 完成 |
 | TCP/REALITY | 固定 Xray 26.9.9 双向互通通过：Xray Bridge → Chimera Portal 与 Chimera Bridge → Xray Portal。Bridge client 发送 X25519MLKEM768 + X25519 fallback，并解析 hybrid ServerHello；其他 REALITY transport/security 组合仍需逐项验证 |
 | WebSocket | Chimera Bridge -> Xray Portal 已验证（无 early data） |
-| XHTTP `auto` / `stream-up` / `packet-up` + TLS/H2 | 三种配置 mode 均完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；当前 Xray TLS/H2 `auto` 在运行时选择 packet-up。显式 packet-up 另验证自定义 header 序号、header payload 分块与 `uplinkChunkSize`。既有 stream-up 用例验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。request-shape/config 回归覆盖 session path/query/header/cookie、seq/data header/cookie 与 padding placements。普通静态 VLESS outbound 的 H3 `packet-up`/`stream-up` 互通不构成本 Reverse Bridge 组合的支持证据；该角色的 H1/H3 ALPN fail closed，`stream-one`、xmux、`downloadSettings` 仍暂不声明 |
+| XHTTP + TLS/H2 | `auto` / `stream-up` / `packet-up` 三种 mode 均完成 Chimera Bridge <-> Xray Portal 双向固定 Xray 互操作；当前 Xray TLS/H2 `auto` 在运行时选择 packet-up。显式 packet-up 另验证自定义 header 序号、header payload 分块与 `uplinkChunkSize`。既有 stream-up 用例验证 HTTP authority/`host` 与 TLS SNI 分离、已有 path query、custom headers、`sessionIDPlacement=header`、reconnect，以及 `xPaddingObfsMode` 的 `queryInHeader` + `tokenish` 组合。request-shape/config 回归覆盖 session path/query/header/cookie、seq/data header/cookie 与 padding placements。|
+| XHTTP + TLS/H3 | 固定 Xray 26.9.9 互操作验证 Xray Bridge -> Chimera Portal 的 `packet-up` / `stream-up` / `auto` Reverse 流量。Chimera Bridge -> Xray Portal 的对应方向仍在配置编译与连接阶段 fail closed：实验收到目标回包并写出 Mux KEEP，但 Xray Portal 侧未向调用方返回 echo。普通静态 VLESS outbound 的 H3 互通不构成本 Reverse Bridge 组合的双向支持证据。|
 | HTTPUpgrade / gRPC | 按现有 feature 和 connector 能力分别验证 |
 | Vision | 独立 VLESS flow 能力，不因 Reverse 自动宣称支持 |
 | ML-KEM VLESS Encryption | 独立加密能力，不因当前字段存在而静默接受 |
