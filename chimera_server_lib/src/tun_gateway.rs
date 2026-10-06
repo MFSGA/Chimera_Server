@@ -1752,6 +1752,34 @@ mod tests {
         fragments
     }
 
+    #[cfg(feature = "vless-reverse")]
+    fn ipv4_fragment_piece(
+        packet: &[u8],
+        identification: u16,
+        offset: usize,
+        length: usize,
+        more_fragments: bool,
+    ) -> Vec<u8> {
+        let header_len = usize::from(packet[0] & 0x0f) * 4;
+        assert_eq!(packet[0] >> 4, 4, "expected IPv4 packet");
+        assert_eq!(offset % 8, 0, "IPv4 fragment offset uses 8-byte units");
+        let payload = &packet[header_len..];
+        assert!(offset + length <= payload.len());
+
+        let mut fragment = packet[..header_len].to_vec();
+        fragment.extend_from_slice(&payload[offset..offset + length]);
+        let total_len = fragment.len() as u16;
+        fragment[2..4].copy_from_slice(&total_len.to_be_bytes());
+        fragment[4..6].copy_from_slice(&identification.to_be_bytes());
+        let mut flags_offset = (offset / 8) as u16;
+        if more_fragments {
+            flags_offset |= 0x2000;
+        }
+        fragment[6..8].copy_from_slice(&flags_offset.to_be_bytes());
+        update_ipv4_header_checksum(&mut fragment);
+        fragment
+    }
+
     fn fragment_ipv6_packet(
         packet: &[u8],
         identification: u32,
@@ -1790,6 +1818,38 @@ mod tests {
             offset += length;
         }
         fragments
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    fn ipv6_fragment_piece(
+        packet: &[u8],
+        identification: u32,
+        offset: usize,
+        length: usize,
+        more_fragments: bool,
+    ) -> Vec<u8> {
+        const IPV6_HEADER_LEN: usize = 40;
+        let fragment_header_len = etherparse::Ipv6FragmentHeader::LEN;
+        assert_eq!(packet[0] >> 4, 6, "expected IPv6 packet");
+        assert_eq!(packet[6], etherparse::ip_number::UDP.0);
+        assert_eq!(offset % 8, 0, "IPv6 fragment offset uses 8-byte units");
+        let payload = &packet[IPV6_HEADER_LEN..];
+        assert!(offset + length <= payload.len());
+
+        let mut fragment = packet[..IPV6_HEADER_LEN].to_vec();
+        fragment[4..6]
+            .copy_from_slice(&((fragment_header_len + length) as u16).to_be_bytes());
+        fragment[6] = etherparse::ip_number::IPV6_FRAG.0;
+        let header = etherparse::Ipv6FragmentHeader::new(
+            etherparse::ip_number::UDP,
+            etherparse::IpFragOffset::try_new((offset / 8) as u16)
+                .expect("IPv6 fragment offset is in range"),
+            more_fragments,
+            identification,
+        );
+        fragment.extend_from_slice(&header.to_bytes());
+        fragment.extend_from_slice(&payload[offset..offset + length]);
+        fragment
     }
 
     #[cfg(feature = "vless-reverse")]
@@ -3164,6 +3224,182 @@ mod tests {
         .expect("read valid Reverse UDP frame");
         assert_eq!(request.metadata.status, SessionStatus::New);
         assert_eq!(request.payload.as_ref(), b"valid-after-overlap");
+
+        drop(bridge_peer);
+        drop(incoming);
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("TUN service did not stop after device closure")
+            .expect("TUN service task panicked")
+            .expect_err("device closure must be reported as a service failure");
+        runtime_state.close_inbound_connection_tasks();
+        let _ = runtime_state
+            .drain_inbound_connection_tasks(Duration::from_secs(1))
+            .await;
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tun_udp_conflicting_fragment_end_lengths_are_dropped_and_recover_for_both_families()
+     {
+        let runtime_state = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "reverse-out".into(),
+                protocol: "vless-reverse".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
+            }],
+        );
+        runtime_state.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    inbound_tag: vec!["office-tun".into()],
+                    network: NetworkListConfig(vec!["udp".into()]),
+                    outbound_tag: Some("reverse-out".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("compile TUN UDP to Reverse route"),
+        );
+        let runtime = runtime_state.data_plane();
+        let (physical, mut bridge_peer) = tokio::io::duplex(16 * 1024);
+        let _lease = runtime
+            .attach_reverse_portal(
+                "reverse-out",
+                Box::new(ReverseSessionStream::new(physical)),
+            )
+            .await
+            .expect("attach Reverse Portal worker");
+        let control = read_frame_with_source_and_local(&mut bridge_peer, true)
+            .await
+            .expect("read Reverse worker control frame");
+        assert_eq!(control.metadata.status, SessionStatus::New);
+
+        let (incoming, input) = mpsc::channel(8);
+        let (output, _packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let service = tokio::spawn(run_server(
+            device,
+            TunGatewayPlan::try_from(config()).expect("valid gateway plan"),
+            runtime.clone(),
+            CancellationToken::new(),
+        ));
+
+        const CLIENT_PORT: u16 = 45_570;
+        let ipv4_target: SocketAddr =
+            "192.0.2.60:5353".parse().expect("IPv4 Overlay target");
+        let ipv4_payload = [0x41; 16];
+        let ipv4_packet = udp_datagram(CLIENT_PORT, ipv4_target, &ipv4_payload);
+        for fragment in [
+            ipv4_fragment_piece(&ipv4_packet, 0x7171, 0, 8, true),
+            ipv4_fragment_piece(&ipv4_packet, 0x7171, 16, 8, false),
+            ipv4_fragment_piece(&ipv4_packet, 0x7171, 8, 8, false),
+        ] {
+            incoming
+                .send(fragment)
+                .await
+                .expect("inject conflicting IPv4 final fragments");
+        }
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                read_frame_with_source_and_local(&mut bridge_peer, true),
+            )
+            .await
+            .is_err(),
+            "conflicting IPv4 fragment end lengths must not reach Reverse"
+        );
+
+        for fragment in [
+            ipv4_fragment_piece(&ipv4_packet, 0x7171, 0, 8, true),
+            ipv4_fragment_piece(&ipv4_packet, 0x7171, 8, 8, true),
+            ipv4_fragment_piece(&ipv4_packet, 0x7171, 16, 8, false),
+        ] {
+            incoming
+                .send(fragment)
+                .await
+                .expect("inject valid IPv4 fragments after conflicting tails");
+        }
+        let ipv4_request = timeout(
+            Duration::from_secs(3),
+            read_frame_with_source_and_local(&mut bridge_peer, true),
+        )
+        .await
+        .expect("valid IPv4 packet did not recover after conflicting tails")
+        .expect("read recovered IPv4 Reverse frame");
+        assert_eq!(ipv4_request.metadata.status, SessionStatus::New);
+        assert_eq!(ipv4_request.payload.as_ref(), ipv4_payload.as_slice());
+        assert_eq!(
+            ipv4_request
+                .metadata
+                .target
+                .as_ref()
+                .expect("IPv4 Reverse target")
+                .location,
+            NetLocation::from_ip_addr(ipv4_target.ip(), ipv4_target.port())
+        );
+
+        let ipv6_target: SocketAddr = "[2001:db8:44::60]:5353"
+            .parse()
+            .expect("IPv6 Overlay target");
+        let ipv6_payload = [0x42; 16];
+        let ipv6_packet =
+            udp_datagram_ipv6(CLIENT_PORT + 1, ipv6_target, &ipv6_payload);
+        for fragment in [
+            ipv6_fragment_piece(&ipv6_packet, 0x7171_7171, 0, 8, true),
+            ipv6_fragment_piece(&ipv6_packet, 0x7171_7171, 16, 8, false),
+            ipv6_fragment_piece(&ipv6_packet, 0x7171_7171, 8, 8, false),
+        ] {
+            incoming
+                .send(fragment)
+                .await
+                .expect("inject conflicting IPv6 final fragments");
+        }
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                read_frame_with_source_and_local(&mut bridge_peer, true),
+            )
+            .await
+            .is_err(),
+            "conflicting IPv6 fragment end lengths must not reach Reverse"
+        );
+
+        for fragment in [
+            ipv6_fragment_piece(&ipv6_packet, 0x7171_7171, 0, 8, true),
+            ipv6_fragment_piece(&ipv6_packet, 0x7171_7171, 8, 8, true),
+            ipv6_fragment_piece(&ipv6_packet, 0x7171_7171, 16, 8, false),
+        ] {
+            incoming
+                .send(fragment)
+                .await
+                .expect("inject valid IPv6 fragments after conflicting tails");
+        }
+        let ipv6_request = timeout(
+            Duration::from_secs(3),
+            read_frame_with_source_and_local(&mut bridge_peer, true),
+        )
+        .await
+        .expect("valid IPv6 packet did not recover after conflicting tails")
+        .expect("read recovered IPv6 Reverse frame");
+        assert_eq!(ipv6_request.metadata.status, SessionStatus::New);
+        assert_eq!(ipv6_request.payload.as_ref(), ipv6_payload.as_slice());
+        assert_eq!(
+            ipv6_request
+                .metadata
+                .target
+                .as_ref()
+                .expect("IPv6 Reverse target")
+                .location,
+            NetLocation::from_ip_addr(ipv6_target.ip(), ipv6_target.port())
+        );
 
         drop(bridge_peer);
         drop(incoming);
