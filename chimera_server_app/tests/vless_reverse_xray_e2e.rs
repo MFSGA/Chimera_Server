@@ -271,6 +271,11 @@ fn xray_socks_udp_reattaches_global_id_after_vless_tcp_disconnect() {
 }
 
 #[test]
+fn xray_socks_udp_fails_closed_without_reverse_worker_and_recovers() {
+    run_xray_socks_udp_without_worker_recovery();
+}
+
+#[test]
 fn xray_clients_are_isolated_by_hub_overlay_access_rules_before_edge_dispatch() {
     run_hub_overlay_access_interop();
 }
@@ -3820,6 +3825,198 @@ fn run_reverse_udp_interop(reattach_after_disconnect: bool) {
 
     chimera.assert_running();
     xray.assert_running();
+}
+
+fn run_xray_socks_udp_without_worker_recovery() {
+    let workspace = workspace_root();
+    let xray_binary = xray_binary(&workspace);
+    if !xray_binary.is_file() {
+        eprintln!(
+            "skipping VLESS Reverse UDP Xray interoperability test because {} is unavailable; set XRAY_BIN to enable it",
+            xray_binary.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir = create_test_dir("vless-reverse-xray-socks-udp-no-worker");
+    let bridge_dir = work_dir.join("bridge");
+    let client_dir = work_dir.join("client");
+    fs::create_dir_all(&bridge_dir).expect("create Xray Bridge work directory");
+    fs::create_dir_all(&client_dir).expect("create Xray client work directory");
+
+    let (echo_addr, echoed_bytes) = start_observed_udp_echo_server();
+    let reverse_port = free_localhost_port();
+    let vless_udp_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config = work_dir.join("chimera.json");
+    let bridge_config = bridge_dir.join("xray.json");
+    let client_config = client_dir.join("xray.json");
+
+    write_json(
+        &chimera_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "tag": "reverse-vless-in",
+                    "settings": {
+                        "clients": [{
+                            "id": TEST_UUID,
+                            "email": "xray-socks-no-worker-bridge@example.test",
+                            "reverse": {"tag": "reverse-out"}
+                        }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": vless_udp_port,
+                    "protocol": "vless",
+                    "tag": "vless-udp-in",
+                    "settings": {
+                        "clients": [{"id": TEST_UUID, "email": "xray-socks-udp@example.test"}],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                }
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["vless-udp-in"],
+                    "network": "udp",
+                    "outboundTag": "reverse-out"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &bridge_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "tag": "reverse-bridge",
+                    "protocol": "vless",
+                    "settings": {
+                        "address": "127.0.0.1",
+                        "port": reverse_port,
+                        "id": TEST_UUID,
+                        "encryption": "none",
+                        "reverse": {"tag": "bridge-in"}
+                    },
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                },
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {"finalRules": [loopback_allow_rule("udp", echo_addr)]}
+                }
+            ],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["bridge-in"],
+                    "network": "udp",
+                    "outboundTag": "direct"
+                }]
+            }
+        }),
+    );
+
+    write_json(
+        &client_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "tag": "xray-socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "outbounds": [{
+                "tag": "to-chimera-vless-udp",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": vless_udp_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "routing": {
+                "rules": [{
+                    "type": "field",
+                    "inboundTag": ["xray-socks"],
+                    "network": "udp",
+                    "outboundTag": "to-chimera-vless-udp"
+                }]
+            }
+        }),
+    );
+
+    let mut chimera = start_chimera(&workspace, &work_dir, &chimera_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, vless_udp_port)));
+    chimera.assert_running();
+
+    let mut xray_client = start_xray(&workspace, &client_dir, &client_config);
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port)));
+    xray_client.assert_running();
+    let association = XraySocksUdpAssociation::connect(SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        xray_socks_port,
+    )));
+    let source_port = association
+        .udp
+        .local_addr()
+        .expect("read Xray SOCKS UDP source tuple")
+        .port();
+
+    association
+        .send_and_expect_no_response(echo_addr, b"xray-socks-no-reverse-worker");
+    assert_eq!(
+        echoed_bytes.load(Ordering::SeqCst),
+        0,
+        "UDP must not reach its target while the Reverse Portal has no Bridge worker"
+    );
+    chimera.assert_running();
+    xray_client.assert_running();
+
+    let mut xray_bridge = start_xray(&workspace, &bridge_dir, &bridge_config);
+    association.send_until_echo(
+        echo_addr,
+        b"xray-socks-recovered-after-reverse-worker-attach",
+        Duration::from_secs(12),
+    );
+    assert_eq!(
+        association
+            .udp
+            .local_addr()
+            .expect("read recovered Xray SOCKS UDP source tuple")
+            .port(),
+        source_port,
+        "recovery must use the original SOCKS UDP client socket"
+    );
+    association.send_and_expect_echo(
+        echo_addr,
+        b"xray-socks-stable-after-reverse-worker-attach",
+    );
+
+    chimera.assert_running();
+    xray_client.assert_running();
+    xray_bridge.assert_running();
 }
 
 struct XraySocksUdpAssociation {
