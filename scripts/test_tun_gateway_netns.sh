@@ -823,6 +823,8 @@ while True:
         b"reverse-offline-",
     )):
         print(f"udp-limit-received {payload!r} from {peer}", flush=True)
+    elif payload.startswith(b"tail-v4-recovery"):
+        print(f"fragment-tail-recovery-v4 {payload!r} from {peer}", flush=True)
     elif payload.startswith((b"fragment-pressure-v4-", b"fragment-pressure-v6-")):
         family, marker = payload.split(b"-", 2)[2].split(b"-", 1)
         print(
@@ -1005,9 +1007,11 @@ import socket
 listener = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
 listener.bind(("fd18:198:18::20", 39645))
 print("udp-v6-ready", flush=True)
-for _ in range(68):
+for _ in range(69):
     payload, peer = listener.recvfrom(8192)
-    if payload.startswith(b"fragment-pressure-v6-"):
+    if payload == b"tail-v6-recovery":
+        print(f"fragment-tail-recovery-v6 {payload!r} from {peer}", flush=True)
+    elif payload.startswith(b"fragment-pressure-v6-"):
         marker = b"fragment-pressure-v6-"
         print(
             f"udp-v6-fragment-pressure-received "
@@ -2336,6 +2340,61 @@ if received_fragments != set(range(1, 65)):
 fragment_replies.close()
 print("tun-fragment-pressure-v4-64-of-65-passed", flush=True)
 
+# Conflicting final fragment lengths must drop the datagram before Reverse
+# dispatch, then clear the reassembly key so a valid packet can reuse its ID.
+tail_recovery_v4 = b"tail-v4-recovery"
+if len(tail_recovery_v4) != 16:
+    raise SystemExit("IPv4 fragment-tail recovery payload must be 16 bytes")
+source_port_tail_v4 = source_port
+target_port_tail_v4 = 39_642
+datagram_tail_v4 = (
+    struct.pack("!HHHH", source_port_tail_v4, target_port_tail_v4, 24, 0)
+    + tail_recovery_v4
+)
+receiver_tail_v4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+receiver_tail_v4.bind((str(source_ip), source_port_tail_v4))
+receiver_tail_v4.settimeout(0.5)
+raw_tail_v4 = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+raw_tail_v4.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+for offset, more, piece in (
+    (0, True, datagram_tail_v4[:8]),
+    (16, False, datagram_tail_v4[16:24]),
+    (8, False, datagram_tail_v4[8:16]),
+):
+    raw_tail_v4.sendto(
+        ipv4_fragment(0x7171, offset, more, piece),
+        (str(target_ip), 0),
+    )
+    time.sleep(0.01)
+raw_tail_v4.close()
+try:
+    unexpected, peer = receiver_tail_v4.recvfrom(128)
+except socket.timeout:
+    pass
+else:
+    raise SystemExit(f"conflicting IPv4 fragment tails reached Reverse target: {unexpected!r} from {peer!r}")
+receiver_tail_v4.settimeout(5)
+raw_tail_v4 = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+raw_tail_v4.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+for offset, more, piece in (
+    (0, True, datagram_tail_v4[:8]),
+    (8, True, datagram_tail_v4[8:16]),
+    (16, False, datagram_tail_v4[16:24]),
+):
+    raw_tail_v4.sendto(
+        ipv4_fragment(0x7171, offset, more, piece),
+        (str(target_ip), 0),
+    )
+raw_tail_v4.close()
+recovered, recovered_source = receiver_tail_v4.recvfrom(128)
+if recovered != tail_recovery_v4 or recovered_source != (str(target_ip), target_port_tail_v4):
+    raise SystemExit(
+        f"IPv4 fragment ID did not recover after conflicting tails: "
+        f"{recovered!r} from {recovered_source!r}"
+    )
+receiver_tail_v4.close()
+print("tun-fragment-tail-recovery-v4-passed", flush=True)
+
 source_ip_v6 = ipaddress.IPv6Address("fd18:251::2")
 target_ip_v6 = ipaddress.IPv6Address("2001:db8:44::20")
 source_port_v6 = 45_001
@@ -2427,6 +2486,69 @@ if received_fragments_v6 != set(range(1, 65)):
     raise SystemExit(f"unexpected completed IPv6 fragment IDs: {sorted(received_fragments_v6)!r}")
 fragment_replies_v6.close()
 print("tun-fragment-pressure-v6-64-of-65-passed", flush=True)
+
+tail_recovery_v6 = b"tail-v6-recovery"
+if len(tail_recovery_v6) != 16:
+    raise SystemExit("IPv6 fragment-tail recovery payload must be 16 bytes")
+source_port_tail_v6 = source_port_v6
+target_port_tail_v6 = 39_645
+datagram_tail_v6 = struct.pack(
+    "!HHHH", source_port_tail_v6, target_port_tail_v6, 24, 0
+) + tail_recovery_v6
+pseudo_header_tail_v6 = (
+    source_ip_v6.packed
+    + target_ip_v6.packed
+    + struct.pack("!I3xB", len(datagram_tail_v6), socket.IPPROTO_UDP)
+)
+checksum_tail_v6 = checksum(pseudo_header_tail_v6 + datagram_tail_v6) or 0xFFFF
+datagram_tail_v6 = (
+    datagram_tail_v6[:6]
+    + struct.pack("!H", checksum_tail_v6)
+    + datagram_tail_v6[8:]
+)
+receiver_tail_v6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+receiver_tail_v6.bind((str(source_ip_v6), source_port_tail_v6, 0, 0))
+receiver_tail_v6.settimeout(0.5)
+raw_tail_v6 = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_RAW)
+raw_tail_v6.setsockopt(socket.IPPROTO_IPV6, 36, 1)  # Linux IPV6_HDRINCL.
+for offset, more, piece in (
+    (0, True, datagram_tail_v6[:8]),
+    (16, False, datagram_tail_v6[16:24]),
+    (8, False, datagram_tail_v6[8:16]),
+):
+    raw_tail_v6.sendto(
+        ipv6_udp_fragment(0x7171_7171, offset, more, piece),
+        (str(target_ip_v6), 0, 0, 0),
+    )
+    time.sleep(0.01)
+raw_tail_v6.close()
+try:
+    unexpected, peer = receiver_tail_v6.recvfrom(128)
+except socket.timeout:
+    pass
+else:
+    raise SystemExit(f"conflicting IPv6 fragment tails reached Reverse target: {unexpected!r} from {peer!r}")
+receiver_tail_v6.settimeout(5)
+raw_tail_v6 = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_RAW)
+raw_tail_v6.setsockopt(socket.IPPROTO_IPV6, 36, 1)  # Linux IPV6_HDRINCL.
+for offset, more, piece in (
+    (0, True, datagram_tail_v6[:8]),
+    (8, True, datagram_tail_v6[8:16]),
+    (16, False, datagram_tail_v6[16:24]),
+):
+    raw_tail_v6.sendto(
+        ipv6_udp_fragment(0x7171_7171, offset, more, piece),
+        (str(target_ip_v6), 0, 0, 0),
+    )
+raw_tail_v6.close()
+recovered, recovered_source = receiver_tail_v6.recvfrom(128)
+if recovered != tail_recovery_v6 or recovered_source[:2] != (str(target_ip_v6), target_port_tail_v6):
+    raise SystemExit(
+        f"IPv6 fragment ID did not recover after conflicting tails: "
+        f"{recovered!r} from {recovered_source!r}"
+    )
+receiver_tail_v6.close()
+print("tun-fragment-tail-recovery-v6-passed", flush=True)
 
 target_v6 = ("2001:db8:44::20", 39644)
 with socket.create_connection(target_v6, timeout=5) as connection:
@@ -2862,6 +2984,8 @@ grep -Fq "udp-limit-received b'reverse-udp-after-hub-restart'" "$edge_udp_echo_l
 grep -Fq "udp-limit-received b'office-lan-udp'" "$edge_udp_echo_log_file"
 [[ $(grep -c 'udp-limit-received fragment-pressure family=v4 id=.* bytes=1192' "$edge_udp_echo_log_file") -eq 64 ]]
 [[ $(grep -c 'udp-v6-fragment-pressure-received id=.* bytes=1192' "$edge_udp_v6_echo_log_file") -eq 64 ]]
+[[ $(grep -c "fragment-tail-recovery-v4 b'tail-v4-recovery'" "$edge_udp_echo_log_file") -eq 1 ]]
+[[ $(grep -c "fragment-tail-recovery-v6 b'tail-v6-recovery'" "$edge_udp_v6_echo_log_file") -eq 1 ]]
 grep -q 'evicting oldest UDP fragment reassembly because active limit (64) was reached' "$server_log_file"
 grep -Fq "udp-second-target-received b'office-lan-multi-target'" "$edge_udp_second_echo_log_file"
 [[ $(grep -c 'dns-query-served cycle=' "$edge_dns_log_file") -eq 3 ]]
