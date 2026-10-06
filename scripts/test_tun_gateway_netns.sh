@@ -5,14 +5,22 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_mode=${1:-full}
 gateway_mtu=${TUN_GATEWAY_MTU:-1500}
 stress_seconds=${TUN_GATEWAY_STRESS_SECONDS:-60}
+# The fixture allows eight TCP/UDP sessions; keep room for iperf3's control flow.
+stress_parallel=${TUN_GATEWAY_STRESS_PARALLEL:-4}
 if (( $# > 1 )) || [[ "$test_mode" != full && "$test_mode" != --hub-policy-only && "$test_mode" != --tcp-iperf-diagnostic && "$test_mode" != --reverse-offline-only && "$test_mode" != --iperf-stress-only ]]; then
-    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 TUN_GATEWAY_STRESS_SECONDS=10..3600 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only|--iperf-stress-only]\n' "$0" >&2
+    printf 'Usage: TUN_GATEWAY_MTU=1280..9000 TUN_GATEWAY_STRESS_SECONDS=10..3600 TUN_GATEWAY_STRESS_PARALLEL=1..6 %s [--hub-policy-only|--tcp-iperf-diagnostic|--reverse-offline-only|--iperf-stress-only]\n' "$0" >&2
     exit 2
 fi
 if [[ "$test_mode" == --iperf-stress-only ]] \
     && { [[ ! "$stress_seconds" =~ ^[0-9]+$ ]] \
         || (( stress_seconds < 10 || stress_seconds > 3600 )); }; then
     printf 'TUN_GATEWAY_STRESS_SECONDS must be an integer from 10 to 3600 in --iperf-stress-only mode.\n' >&2
+    exit 2
+fi
+if [[ "$test_mode" == --iperf-stress-only ]] \
+    && { [[ ! "$stress_parallel" =~ ^[0-9]+$ ]] \
+        || (( stress_parallel < 1 || stress_parallel > 6 )); }; then
+    printf 'TUN_GATEWAY_STRESS_PARALLEL must be an integer from 1 to 6 in --iperf-stress-only mode.\n' >&2
     exit 2
 fi
 if [[ ! "$gateway_mtu" =~ ^[0-9]+$ ]] \
@@ -65,12 +73,13 @@ unshare \
     --map-users="0:${test_host_uid}:1" \
     --map-users="1:${test_subuid_start}:${test_subuid_count}" \
     --net \
-    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" "$stress_seconds" <<'NAMESPACE_SCRIPT'
+    bash -s -- "$test_mode" "$gateway_mtu" "$xray_bin" "$stress_seconds" "$stress_parallel" <<'NAMESPACE_SCRIPT'
 set -euo pipefail
 test_mode=$1
 gateway_mtu=$2
 xray_bin=$3
 stress_seconds=$4
+stress_parallel=$5
 trap 'exit_status=$?; printf "Namespace smoke failed with status %s at line %s: %s\\n" "$exit_status" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 lan_ns_pid=
@@ -1200,24 +1209,29 @@ if [[ "$test_mode" == --iperf-stress-only ]]; then
     nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
         --client 10.44.0.20 \
         --port 5201 \
+        --parallel "$stress_parallel" \
         --time "$stress_seconds" \
         --json \
         >"$iperf_client_result_file" \
         2>"$iperf_client_error_file"
-    python3 - "$iperf_client_result_file" "$stress_seconds" tcp <<'PY'
+    python3 - "$iperf_client_result_file" "$stress_seconds" "$stress_parallel" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 report = json.loads(Path(sys.argv[1]).read_text())
 expected_seconds = int(sys.argv[2])
+parallel_streams = int(sys.argv[3])
+streams = report["end"].get("streams", [])
+if len(streams) != parallel_streams:
+    raise SystemExit(f"TCP iperf3 expected {parallel_streams} parallel streams, got {len(streams)}")
 sent = report["end"]["sum_sent"]
 received = report["end"]["sum_received"]
 for name, direction in (("sent", sent), ("received", received)):
     if direction["bytes"] <= 0 or direction["seconds"] < expected_seconds * 0.95:
         raise SystemExit(f"TCP iperf3 {name} stream did not sustain the requested interval: {direction!r}")
 print(
-    f"TCP sustained {expected_seconds}s: sent={sent['bytes']} bytes "
+    f"TCP sustained {expected_seconds}s across {parallel_streams} streams: sent={sent['bytes']} bytes "
     f"received={received['bytes']} bytes"
 )
 PY
@@ -1225,6 +1239,7 @@ PY
     nsenter --net="/proc/$office_client_ns_pid/ns/net" iperf3 \
         --client 10.44.0.20 \
         --port 5201 \
+        --parallel "$stress_parallel" \
         --udp \
         --bandwidth 5M \
         --length 1200 \
@@ -1232,13 +1247,17 @@ PY
         --json \
         >"$iperf_client_result_file" \
         2>"$iperf_client_error_file"
-    python3 - "$iperf_client_result_file" "$stress_seconds" udp <<'PY'
+    python3 - "$iperf_client_result_file" "$stress_seconds" "$stress_parallel" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 report = json.loads(Path(sys.argv[1]).read_text())
 expected_seconds = int(sys.argv[2])
+parallel_streams = int(sys.argv[3])
+streams = report["end"].get("streams", [])
+if len(streams) != parallel_streams:
+    raise SystemExit(f"UDP iperf3 expected {parallel_streams} parallel streams, got {len(streams)}")
 sent = report["end"]["sum_sent"]
 received = report["end"]["sum_received"]
 for name, direction in (("sent", sent), ("received", received)):
@@ -1247,12 +1266,12 @@ for name, direction in (("sent", sent), ("received", received)):
 if received["packets"] <= 0 or not 0 <= received["lost_percent"] <= 1.0:
     raise SystemExit(f"UDP iperf3 loss exceeded the 1% stress threshold: {received!r}")
 print(
-    f"UDP sustained {expected_seconds}s at 5 Mbit/s: sent={sent['bytes']} bytes "
+    f"UDP sustained {expected_seconds}s at 5 Mbit/s across {parallel_streams} streams: sent={sent['bytes']} bytes "
     f"received={received['bytes']} bytes loss={received['lost_percent']:.2f}%"
 )
 PY
 
-    printf 'Sustained TCP and UDP traffic completed across the live TUN/Reverse/Edge path.\n'
+    printf 'Sustained TCP and UDP traffic completed across the live TUN/Reverse/Edge path with %s parallel streams.\n' "$stress_parallel"
     exit 0
 fi
 
