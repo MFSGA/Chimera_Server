@@ -4961,6 +4961,16 @@ fn run_multiple_xray_bridge_failover() {
     wait_for_tcp(public_addr);
     chimera.assert_running();
 
+    let bytes_before_offline_probe = echoed_bytes.load(Ordering::SeqCst);
+    wait_for_reverse_route_unavailable(public_addr);
+    assert_eq!(
+        echoed_bytes.load(Ordering::SeqCst),
+        bytes_before_offline_probe,
+        "a Reverse Portal without Bridge workers must not fall back to the direct target"
+    );
+    wait_for_tcp(reverse_addr);
+    chimera.assert_running();
+
     let mut bridge_a = start_xray(&workspace, &bridge_a_dir, &bridge_a_config);
     let mut bridge_b = start_xray(&workspace, &bridge_b_dir, &bridge_b_config);
     bridge_a.assert_running();
@@ -4996,6 +5006,32 @@ fn run_multiple_xray_bridge_failover() {
     }
     chimera.assert_running();
     bridge_b.assert_running();
+
+    drop(bridge_b);
+    wait_for_reverse_route_unavailable(public_addr);
+    let bytes_before_second_offline_probe = echoed_bytes.load(Ordering::SeqCst);
+    assert_reverse_echo_unavailable(public_addr);
+    assert_eq!(
+        echoed_bytes.load(Ordering::SeqCst),
+        bytes_before_second_offline_probe,
+        "when all Bridge workers exit, the Portal must not send the request to the direct target"
+    );
+    wait_for_tcp(reverse_addr);
+    chimera.assert_running();
+
+    let mut recovered_bridge =
+        start_xray(&workspace, &bridge_b_dir, &bridge_b_config);
+    wait_for_xray_reverse_control_session(
+        &bridge_b_dir.join("xray.stdout.log"),
+        "reconnected Bridge",
+    );
+    assert_reverse_echo_with_retry(
+        public_addr,
+        b"traffic after all Bridges reconnect",
+        &echoed_bytes,
+    );
+    chimera.assert_running();
+    recovered_bridge.assert_running();
 }
 
 fn xray_bridge_config(reverse_port: u16) -> serde_json::Value {
@@ -5562,6 +5598,33 @@ fn assert_reverse_echo_unavailable(public_addr: SocketAddr) {
                 | std::io::ErrorKind::TimedOut
         ),
         "unexpected unavailable-route error: {error}"
+    );
+}
+
+fn wait_for_reverse_route_unavailable(public_addr: SocketAddr) {
+    let deadline = Instant::now() + REVERSE_READY_TIMEOUT;
+    while Instant::now() < deadline {
+        match reverse_echo_once(public_addr, b"reverse-offline-probe") {
+            Ok(()) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) {
+                    return;
+                }
+                panic!("unexpected Reverse offline-probe error: {error}");
+            }
+        }
+    }
+
+    panic!(
+        "Reverse route at {public_addr} remained usable without a Bridge worker; the target kept echoing offline probes"
     );
 }
 
