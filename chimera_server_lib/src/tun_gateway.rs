@@ -2408,7 +2408,7 @@ mod tests {
     #[cfg(feature = "vless-reverse")]
     #[tokio::test]
     async fn tun_reverse_udp_idle_expiry_reuses_single_session_slot_repeatedly() {
-        const SESSION_CYCLES: usize = 3;
+        const SESSION_CYCLES: usize = 32;
         const CLIENT_PORT: u16 = 45_561;
 
         let target = HostUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
