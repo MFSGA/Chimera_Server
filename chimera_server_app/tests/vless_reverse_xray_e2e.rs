@@ -271,7 +271,7 @@ fn xray_socks_udp_reattaches_global_id_after_vless_tcp_disconnect() {
 }
 
 #[test]
-fn xray_socks_udp_fails_closed_without_reverse_worker_and_recovers() {
+fn xray_socks_udp_fails_closed_recovers_after_attach_and_idle_expiry() {
     run_xray_socks_udp_without_worker_recovery();
 }
 
@@ -4012,6 +4012,34 @@ fn run_xray_socks_udp_without_worker_recovery() {
     association.send_and_expect_echo(
         echo_addr,
         b"xray-socks-stable-after-reverse-worker-attach",
+    );
+    let idle_baseline = echoed_bytes.load(Ordering::SeqCst);
+
+    // The production UDP worker idle timeout is 60 seconds. Keep the same
+    // Xray SOCKS association silent beyond it before sending again.
+    thread::sleep(Duration::from_secs(65));
+    assert_eq!(
+        echoed_bytes.load(Ordering::SeqCst),
+        idle_baseline,
+        "the echo target must receive no UDP traffic during the idle interval"
+    );
+    association.send_until_echo(
+        echo_addr,
+        b"xray-socks-recovered-after-udp-idle-expiry",
+        Duration::from_secs(12),
+    );
+    assert_eq!(
+        association
+            .udp
+            .local_addr()
+            .expect("read post-idle Xray SOCKS UDP source tuple")
+            .port(),
+        source_port,
+        "post-idle recovery must use the original SOCKS UDP client socket"
+    );
+    assert!(
+        echoed_bytes.load(Ordering::SeqCst) > idle_baseline,
+        "UDP echo must recover after the production idle timeout"
     );
 
     chimera.assert_running();
