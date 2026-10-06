@@ -196,6 +196,26 @@ fn chimera_bridge_round_trips_xray_portal_over_xhttp_tls_packet_up_vless_reverse
 }
 
 #[test]
+fn chimera_bridge_round_trips_xray_portal_over_xhttp_h3_packet_up_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTlsH3PacketUp, None);
+}
+
+#[test]
+fn chimera_bridge_round_trips_xray_portal_over_xhttp_h3_stream_up_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTlsH3StreamUp, None);
+}
+
+#[test]
+fn chimera_bridge_round_trips_xray_portal_over_xhttp_h3_auto_vless_reverse() {
+    run_chimera_bridge_interop(ReverseSecurity::XhttpTlsH3Auto, None);
+}
+
+#[test]
+fn xray_bridge_round_trips_xray_portal_over_xhttp_h3_packet_up_reference() {
+    run_xray_to_xray_h3_reference("packet-up");
+}
+
+#[test]
 fn xray_bridge_round_trips_chimera_portal_over_xhttp_tls_packet_up_vless_reverse() {
     run_reverse_interop(ReverseSecurity::XhttpTlsPacketUp);
 }
@@ -4836,7 +4856,10 @@ fn run_chimera_bridge_interop(
         ),
         ReverseSecurity::XhttpTls
         | ReverseSecurity::XhttpTlsAuto
-        | ReverseSecurity::XhttpTlsPacketUp => {
+        | ReverseSecurity::XhttpTlsPacketUp
+        | ReverseSecurity::XhttpTlsH3PacketUp
+        | ReverseSecurity::XhttpTlsH3StreamUp
+        | ReverseSecurity::XhttpTlsH3Auto => {
             let (cert_path, key_path) = generate_test_certificate(&work_dir);
             let mode = security.xhttp_mode();
             (
@@ -4954,11 +4977,6 @@ fn run_chimera_bridge_interop(
                     }
                 }),
             )
-        }
-        ReverseSecurity::XhttpTlsH3PacketUp
-        | ReverseSecurity::XhttpTlsH3StreamUp
-        | ReverseSecurity::XhttpTlsH3Auto => {
-            unreachable!("Chimera Bridge -> Xray Portal Reverse H3 is fail-closed")
         }
     };
 
@@ -5090,7 +5108,9 @@ fn run_chimera_bridge_interop(
     chimera.assert_running();
 
     let mut xray = start_xray(&workspace, &work_dir, &xray_config);
-    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    if !security.is_xhttp_h3() {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    }
     wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, public_port)));
     xray.assert_running();
 
@@ -5122,7 +5142,9 @@ fn run_chimera_bridge_interop(
     // Reverse worker must observe EOF and the monitor must create a new worker.
     drop(xray);
     let mut xray = start_xray(&workspace, &work_dir, &xray_config);
-    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    if !security.is_xhttp_h3() {
+        wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, reverse_port)));
+    }
     wait_for_tcp(public_addr);
     xray.assert_running();
 
@@ -5141,6 +5163,129 @@ fn run_chimera_bridge_interop(
 
     chimera.assert_running();
     xray.assert_running();
+}
+
+fn run_xray_to_xray_h3_reference(mode: &str) {
+    let workspace = workspace_root();
+    let xray = xray_binary(&workspace);
+    if !xray.is_file() {
+        eprintln!(
+            "skipping Xray-to-Xray Reverse baseline probe because {} is unavailable; set XRAY_BIN to enable it",
+            xray.display()
+        );
+        return;
+    }
+
+    let _serial = serial_xray_guard();
+    let work_dir =
+        create_test_dir(&format!("vless-reverse-xray-h3-reference-{mode}"));
+    let portal_dir = work_dir.join("portal");
+    let bridge_dir = work_dir.join("bridge");
+    fs::create_dir_all(&portal_dir).expect("create Xray Portal directory");
+    fs::create_dir_all(&bridge_dir).expect("create Xray Bridge directory");
+
+    let (echo_addr, echoed_bytes) = start_observed_echo_server();
+    let reverse_port = free_localhost_port();
+    let public_port = free_localhost_port();
+    let (cert_path, key_path) = generate_test_certificate(&work_dir);
+    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+    let portal_config = portal_dir.join("xray.json");
+    let bridge_config = bridge_dir.join("xray.json");
+    let portal_stream = json!({
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+            "serverName": "localhost",
+            "alpn": ["h3"],
+            "certificates": [{
+                "certificateFile": cert_path,
+                "keyFile": key_path
+            }]
+        },
+        "xhttpSettings": {
+            "host": "cdn.reverse.test",
+            "path": "/reverse-xhttp/?edge=portal",
+            "mode": mode,
+            "sessionIDPlacement": "header",
+            "sessionIDKey": "X-Reverse-Session",
+            "xPaddingBytes": 1
+        }
+    });
+    write_json(
+        &portal_config,
+        json!({
+            "log": {"loglevel": "debug"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": reverse_port,
+                    "protocol": "vless",
+                    "settings": {
+                        "clients": [{"id": TEST_UUID, "reverse": {"tag": "reverse-out"}}],
+                        "decryption": "none"
+                    },
+                    "streamSettings": portal_stream
+                },
+                {
+                    "listen": "127.0.0.1",
+                    "port": public_port,
+                    "protocol": "dokodemo-door",
+                    "tag": "public-echo",
+                    "settings": {
+                        "address": echo_addr.ip().to_string(),
+                        "port": echo_addr.port(),
+                        "network": "tcp",
+                        "followRedirect": false
+                    },
+                    "streamSettings": {"network": "tcp"}
+                }
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [{
+                "type": "field",
+                "inboundTag": ["public-echo"],
+                "network": "tcp",
+                "outboundTag": "reverse-out"
+            }]}
+        }),
+    );
+
+    let mut bridge = xray_bridge_config(reverse_port);
+    bridge["outbounds"][0]["streamSettings"] = json!({
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+            "serverName": "localhost",
+            "alpn": ["h3"],
+            "pinnedPeerCertSha256": pinned_peer_cert_sha256
+        },
+        "xhttpSettings": {
+            "host": "cdn.reverse.test",
+            "path": "/reverse-xhttp/?edge=bridge",
+            "mode": mode,
+            "sessionIDPlacement": "header",
+            "sessionIDKey": "X-Reverse-Session",
+            "xPaddingBytes": 1,
+            "headers": {
+                "User-Agent": "xray-reverse-xhttp",
+                "X-Reverse-Edge": "chimera-bridge"
+            }
+        }
+    });
+    write_json(&bridge_config, bridge);
+
+    let mut portal = start_xray(&workspace, &portal_dir, &portal_config);
+    let public_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, public_port));
+    wait_for_tcp(public_addr);
+    portal.assert_running();
+    let mut bridge = start_xray(&workspace, &bridge_dir, &bridge_config);
+    assert_reverse_echo_with_retry(
+        public_addr,
+        b"Xray Bridge to Xray Portal XHTTP H3 baseline",
+        &echoed_bytes,
+    );
+    portal.assert_running();
+    bridge.assert_running();
 }
 
 fn run_multiple_xray_bridge_failover() {

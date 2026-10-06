@@ -351,13 +351,7 @@ pub(crate) fn prepare_vless_reverse_bridge(
             #[cfg(feature = "ws")]
             Ok(Some(endpoint))
         }
-        OutboundTransport::Xhttp { tls, .. } => {
-            if tls.alpn.as_slice() == ["h3"] {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "VLESS Reverse Bridge XHTTP/3 is not implemented yet",
-                ));
-            }
+        OutboundTransport::Xhttp { .. } => {
             #[cfg(feature = "tls")]
             {
                 Ok(Some(endpoint))
@@ -400,16 +394,27 @@ pub(crate) async fn connect_vless_reverse_bridge(
     endpoint: &VlessReverseBridgeEndpoint,
 ) -> std::io::Result<Box<dyn AsyncStream>> {
     let transport = decode_outbound_transport(outbound)?;
-    if matches!(
-        &transport,
-        OutboundTransport::Xhttp { tls, .. } if tls.alpn.as_slice() == ["h3"]
-    ) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "VLESS Reverse Bridge XHTTP/3 is not implemented yet",
-        ));
-    }
     let target = resolve_single_address(resolver, &endpoint.server).await?;
+    if let OutboundTransport::Xhttp { tls, settings } = &transport
+        && tls.alpn.as_slice() == ["h3"]
+    {
+        #[cfg(feature = "tls")]
+        {
+            let mut stream: Box<dyn AsyncStream> = Box::new(
+                connect_xhttp_h3(target, tls, settings, &endpoint.server).await?,
+            );
+            vless_reverse_connect(&mut *stream, endpoint).await?;
+            return Ok(stream);
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = settings;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "VLESS Reverse Bridge XHTTP/3 requires the tls feature",
+            ));
+        }
+    }
     let socket = new_tcp_socket(None, target.is_ipv6())?;
     let raw_stream = socket.connect(target).await?;
     if let Err(error) = raw_stream.set_nodelay(true) {

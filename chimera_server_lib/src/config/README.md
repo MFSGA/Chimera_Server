@@ -79,10 +79,12 @@ socket and is covered with fixed Xray 26.9.9 for `packet-up`, `stream-up`, and
 `auto` over TCP, UDP, and 4 KiB UDP through the Office TUN → Hub → Reverse
 Portal → Edge mapping path. H3 wrong-SNI and unknown-UUID denial is verified
 for `packet-up` and `stream-up`. H3 custom header/cookie placements and non-default QUIC
-tuning remain unverified. Other
-ordinary VLESS transport or security combinations remain explicitly unsupported;
-VLESS Reverse Bridge still rejects XHTTP H3 and has its separately documented
-transport support. Nonempty `tcpSettings` and `sockopt` options remain
+tuning remain unverified. VLESS Reverse Bridge supports XHTTP with TLS ALPN `h2` or `h3`;
+fixed Xray 26.9.9 loopback tests verify H2 and H3 `packet-up`, `stream-up`, and `auto`
+in both Bridge/Portal directions, with Bridge-to-Portal restart recovery. Reverse H3
+custom sequence/data placement and non-default QUIC tuning remain unverified. Other
+ordinary VLESS transport or security combinations remain explicitly unsupported.
+Nonempty `tcpSettings` and `sockopt` options remain
 unsupported; XHTTP also rejects `finalmask` instead of silently ignoring it.
 `allowInsecure` is rejected, in line with the current Xray baseline; use a
 trusted certificate or explicit CA instead. Outbound client certificates are

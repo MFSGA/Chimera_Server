@@ -331,7 +331,7 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[test]
-    fn plan_rejects_xhttp_h3_until_reverse_runtime_is_implemented() {
+    fn plan_accepts_xhttp_h3_for_reverse_bridge() {
         for mode in ["packet-up", "stream-up", "auto"] {
             let outbound =
                 reverse_outbound_with_stream_settings(serde_json::json!({
@@ -347,12 +347,11 @@ mod tests {
                         "xPaddingBytes": 1
                     }
                 }));
-            let error = prepare_reverse_bridge_plans(&[outbound])
-                .expect_err("XHTTP/3 Reverse Bridge must fail closed");
-            assert!(
-                error.to_string().contains("VLESS Reverse Bridge XHTTP/3"),
-                "XHTTP/3 {mode}: {error}"
-            );
+            let plans =
+                prepare_reverse_bridge_plans(&[outbound]).unwrap_or_else(|error| {
+                    panic!("XHTTP/3 {mode} Reverse Bridge should compile: {error}")
+                });
+            assert_eq!(plans.len(), 1, "XHTTP/3 {mode}");
         }
     }
 
