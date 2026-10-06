@@ -2544,6 +2544,159 @@ mod tests {
 
     #[cfg(feature = "vless-reverse")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tun_reverse_udp_without_worker_drops_packet_and_recovers_on_same_tuple()
+    {
+        const CLIENT_PORT: u16 = 45_562;
+        const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 44, 0, 2);
+
+        let target = HostUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Reverse UDP fail-closed target");
+        let target_addr = target.local_addr().expect("read Reverse UDP target");
+        let runtime_state = RuntimeState::new(
+            Vec::new(),
+            vec![
+                OutboundSummary {
+                    tag: "reverse-out".into(),
+                    protocol: "vless-reverse".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
+                },
+                OutboundSummary {
+                    tag: "direct".into(),
+                    protocol: "freedom".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
+                },
+            ],
+        );
+        runtime_state.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![RuleConfig {
+                    inbound_tag: vec!["office-tun".into()],
+                    network: NetworkListConfig(vec!["udp".into()]),
+                    outbound_tag: Some("reverse-out".into()),
+                    ..RuleConfig::default()
+                }],
+                ..RoutingConfig::default()
+            }))
+            .expect("compile TUN UDP route to Reverse"),
+        );
+        let hub_runtime = runtime_state.data_plane();
+        let plan = TunGatewayPlan::try_from(config()).expect("valid gateway plan");
+        let (incoming, input) = mpsc::channel(8);
+        let (output, mut packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let service = tokio::spawn(run_server(
+            device,
+            plan,
+            hub_runtime.clone(),
+            CancellationToken::new(),
+        ));
+
+        incoming
+            .send(udp_datagram(CLIENT_PORT, target_addr, b"without-bridge"))
+            .await
+            .expect("inject UDP datagram while Reverse has no workers");
+        let mut payload = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(300), target.recv_from(&mut payload))
+                .await
+                .is_err(),
+            "an offline Reverse route must not fall back to the configured Freedom outbound"
+        );
+        timeout(Duration::from_secs(1), async {
+            while runtime_state.tracked_inbound_connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed offline UDP relay must release its task ownership");
+
+        let (portal_stream, mut bridge_stream) = tokio::io::duplex(64 * 1024);
+        let portal_lease = hub_runtime
+            .attach_reverse_portal(
+                "reverse-out",
+                Box::new(ReverseSessionStream::new(portal_stream)),
+            )
+            .await
+            .expect("attach recovered Hub Reverse worker");
+        let control = read_frame_with_source_and_local(&mut bridge_stream, true)
+            .await
+            .expect("read recovered Reverse control frame");
+        assert_eq!(control.metadata.status, SessionStatus::New);
+        let edge_runtime = RuntimeState::new(
+            Vec::new(),
+            vec![crate::outbound::freedom_outbound_allow_loopback("direct")],
+        )
+        .data_plane();
+        let edge_worker = MuxServerWorker::new_with_context(
+            Box::new(ReverseSessionStream::new(bridge_stream)),
+            "bridge-in".into(),
+            Arc::new(edge_runtime),
+            BridgeDispatchContext::default(),
+        );
+
+        let echo_task = tokio::spawn(async move {
+            let (length, peer) = target
+                .recv_from(&mut payload)
+                .await
+                .expect("receive recovered Reverse UDP packet");
+            assert_eq!(&payload[..length], b"after-bridge-recovery");
+            target
+                .send_to(&payload[..length], peer)
+                .await
+                .expect("reply to recovered Reverse UDP packet");
+        });
+        incoming
+            .send(udp_datagram(
+                CLIENT_PORT,
+                target_addr,
+                b"after-bridge-recovery",
+            ))
+            .await
+            .expect("inject UDP datagram again on the original tuple");
+        assert_eq!(
+            next_udp_payload(&mut packets, b"after-bridge-recovery").await,
+            (
+                Ipv4Addr::LOCALHOST,
+                CLIENT_IP,
+                target_addr.port(),
+                CLIENT_PORT,
+            ),
+            "recovered UDP must retain the original target/source tuple"
+        );
+        echo_task.await.expect("recovered UDP echo task failed");
+        assert_eq!(runtime_state.tracked_inbound_connection_count(), 1);
+
+        drop(incoming);
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("TUN service did not stop after device closure")
+            .expect("TUN service task panicked")
+            .expect_err("device closure must be reported as a service failure");
+        edge_worker.close();
+        edge_worker.wait_closed().await;
+        drop(edge_worker);
+        drop(portal_lease);
+        runtime_state.close_inbound_connection_tasks();
+        let shutdown = runtime_state
+            .drain_inbound_connection_tasks(Duration::ZERO)
+            .await;
+        assert!(!shutdown.drained);
+        assert_eq!(shutdown.cancelled_tasks, 1);
+        assert_eq!(runtime_state.tracked_inbound_connection_count(), 0);
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tun_tcp_packet_routes_through_reverse_portal_and_returns_to_stack() {
         let runtime_state = RuntimeState::new(
             Vec::new(),
