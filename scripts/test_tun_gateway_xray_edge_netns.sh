@@ -32,7 +32,12 @@ if [[ ! -x "$xray_bin" ]]; then
     printf 'Xray executable not found at %s; set XRAY_BIN to the fixed Xray 26.9.9 binary.\n' "$xray_bin" >&2
     exit 1
 fi
-printf 'Using %s\n' "$("$xray_bin" version | head -n 1)"
+xray_version=$("$xray_bin" version | head -n 1)
+if [[ "$xray_version" != "Xray 26.9.9 "* ]]; then
+    printf 'This interoperability probe requires Xray 26.9.9; got: %s\n' "$xray_version" >&2
+    exit 1
+fi
+printf 'Using %s\n' "$xray_version"
 cd "$repo_root"
 cargo build -p chimera_server_app --no-default-features --features tun-gateway,vless-reverse-tls --locked
 export XRAY_BIN="$xray_bin"
@@ -58,7 +63,7 @@ udp_echo_pid=
 tcp_echo_v6_pid=
 udp_echo_v6_pid=
 policy_probe_pid=
-offline_udp_client_pid=
+offline_client_pid=
 smoke_dir=$(mktemp -d)
 server_log_file=$smoke_dir/server.log
 hub_log_file=$smoke_dir/hub.log
@@ -76,7 +81,7 @@ xray_config_file=$smoke_dir/xray.json
 cleanup() {
     exit_status=$?
     trap - EXIT
-    for process_pid in "$server_pid" "$xray_pid" "$hub_pid" "$tcp_echo_pid" "$udp_echo_pid" "$tcp_echo_v6_pid" "$udp_echo_v6_pid" "$policy_probe_pid" "$offline_udp_client_pid"; do
+    for process_pid in "$server_pid" "$xray_pid" "$hub_pid" "$tcp_echo_pid" "$udp_echo_pid" "$tcp_echo_v6_pid" "$udp_echo_v6_pid" "$policy_probe_pid" "$offline_client_pid"; do
         if [[ -n "$process_pid" ]] && kill -0 "$process_pid" 2>/dev/null; then
             kill -TERM "$process_pid" 2>/dev/null || true
             wait "$process_pid" 2>/dev/null || true
@@ -326,7 +331,10 @@ listener.bind(("fd18:198:18::20", 39642))
 print("udp-v6-ready", flush=True)
 while True:
     payload, peer = listener.recvfrom(8192)
-    print(f"udp-v6-received {len(payload)} bytes from {peer}", flush=True)
+    if payload.startswith(b"xray-bridge-offline-"):
+        print(f"udp-v6-marker-received {payload!r} from {peer}", flush=True)
+    else:
+        print(f"udp-v6-received {len(payload)} bytes from {peer}", flush=True)
     listener.sendto(payload, peer)
 PY
 udp_echo_v6_pid=$!
@@ -472,71 +480,144 @@ sysctl -q -w net.ipv4.conf.all.rp_filter=0
 sysctl -q -w net.ipv4.conf.office-gw.rp_filter=0
 
 if [[ "$test_mode" == --xray-bridge-offline-only ]]; then
-    offline_udp_client_program=$(cat <<'PY'
+    offline_client_program=$(cat <<'PY'
 import socket
 import sys
+import time
 
-target = ("198.18.0.20", 39642)
-baseline = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-baseline.settimeout(5)
-baseline_marker = b"xray-bridge-offline-baseline"
-baseline.sendto(baseline_marker, target)
-reply, source = baseline.recvfrom(128)
-if reply != baseline_marker or source != target:
-    raise SystemExit(f"unexpected baseline UDP echo: {reply!r} from {source!r}")
-print("baseline-ready", flush=True)
+tcp_targets = (
+    (socket.AF_INET, ("198.18.0.20", 39641)),
+    (socket.AF_INET6, ("fd18:198:18::20", 39641, 0, 0)),
+)
+udp_targets = (
+    (socket.AF_INET, ("198.18.0.20", 39642)),
+    (socket.AF_INET6, ("fd18:198:18::20", 39642, 0, 0)),
+)
+
+def tcp_echo(family, target, payload, expect_reply):
+    reply = b""
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1)
+            connection.connect(target)
+            connection.sendall(payload)
+            while len(reply) < len(payload):
+                chunk = connection.recv(128)
+                if not chunk:
+                    break
+                reply += chunk
+    except OSError:
+        if expect_reply:
+            return False
+        if reply:
+            raise SystemExit(f"TCP unexpectedly returned partial data with Xray Bridge offline: {reply!r}")
+        return True
+    if expect_reply:
+        if reply != payload:
+            if not reply:
+                return False
+            raise SystemExit(f"unexpected TCP echo: {reply!r} for {payload!r}")
+        return True
+    if reply:
+        raise SystemExit(f"TCP unexpectedly returned data with Xray Bridge offline: {reply!r}")
+    return True
+
+def wait_for_tcp_echo(family, target, label, stage):
+    for attempt in range(1, 13):
+        payload = f"xray-bridge-offline-tcp-{stage}-{label}-{attempt}".encode()
+        if tcp_echo(family, target, payload, expect_reply=True):
+            print(f"tcp-{stage}-{label}-{attempt}", flush=True)
+            return
+        time.sleep(0.1)
+    raise SystemExit(f"TCP {label} did not {stage} after Xray Bridge state change")
+
+for family, target in tcp_targets:
+    label = "v4" if family == socket.AF_INET else "v6"
+    wait_for_tcp_echo(family, target, label, "baseline")
+
+udp_clients = []
+for family, target in udp_targets:
+    label = "v4" if family == socket.AF_INET else "v6"
+    client = socket.socket(family, socket.SOCK_DGRAM)
+    client.settimeout(5)
+    marker = f"xray-bridge-offline-baseline-{label}".encode()
+    client.sendto(marker, target)
+    reply, source = client.recvfrom(128)
+    if reply != marker or source[:2] != target[:2]:
+        raise SystemExit(f"unexpected {label} baseline UDP echo: {reply!r} from {source!r}")
+    source_port = client.getsockname()[1]
+    udp_clients.append((label, client, target, source_port))
+    print(f"udp-baseline-{label}", flush=True)
 
 if sys.stdin.readline().strip() != "probe-offline":
-    raise SystemExit("missing offline UDP probe trigger")
+    raise SystemExit("missing offline probe trigger")
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(1)
-sock.sendto(b"xray-bridge-offline-no-worker", target)
-source_port = sock.getsockname()[1]
-try:
-    reply, source = sock.recvfrom(128)
-except TimeoutError:
-    print("udp-dropped-no-worker", flush=True)
-else:
-    raise SystemExit(f"UDP unexpectedly replied while Xray Bridge was offline: {reply!r} from {source!r}")
+for family, target in tcp_targets:
+    label = "v4" if family == socket.AF_INET else "v6"
+    marker = f"xray-bridge-offline-tcp-no-worker-{label}".encode()
+    if not tcp_echo(family, target, marker, expect_reply=False):
+        raise SystemExit(f"TCP {label} unexpectedly returned data while Xray Bridge was offline")
+    print(f"tcp-dropped-no-worker-{label}", flush=True)
+
+for label, client, target, _ in udp_clients:
+    client.settimeout(1)
+    client.sendto(f"xray-bridge-offline-udp-no-worker-{label}".encode(), target)
+    try:
+        reply, source = client.recvfrom(128)
+    except TimeoutError:
+        print(f"udp-dropped-no-worker-{label}", flush=True)
+    else:
+        raise SystemExit(f"UDP {label} unexpectedly replied while Xray Bridge was offline: {reply!r} from {source!r}")
 
 if sys.stdin.readline().strip() != "probe-recovered":
-    raise SystemExit("missing recovered UDP probe trigger")
+    raise SystemExit("missing recovered probe trigger")
 
-sent_payloads = set()
-for attempt in range(1, 13):
-    payload = f"xray-bridge-offline-recovered-{attempt}".encode()
-    sent_payloads.add(payload)
-    sock.sendto(payload, target)
-    sock.settimeout(0.5)
-    try:
-        reply, source = sock.recvfrom(128)
-    except TimeoutError:
-        continue
-    if reply not in sent_payloads or source != target:
-        raise SystemExit(f"unexpected recovered UDP echo: {reply!r} from {source!r}")
-    if sock.getsockname()[1] != source_port:
-        raise SystemExit("UDP source port changed across Bridge outage recovery")
-    print(f"udp-recovered-same-tuple-{attempt}", flush=True)
-    break
-else:
-    raise SystemExit("same-tuple UDP did not recover after Xray Bridge reattachment")
+for family, target in tcp_targets:
+    label = "v4" if family == socket.AF_INET else "v6"
+    wait_for_tcp_echo(family, target, label, "recovered")
 
-baseline.close()
-sock.close()
+for label, client, target, source_port in udp_clients:
+    for attempt in range(1, 13):
+        payload = f"xray-bridge-offline-recovered-{label}-{attempt}".encode()
+        client.sendto(payload, target)
+        client.settimeout(0.5)
+        try:
+            reply, source = client.recvfrom(128)
+        except TimeoutError:
+            continue
+        if reply != payload or source[:2] != target[:2]:
+            raise SystemExit(f"unexpected recovered {label} UDP echo: {reply!r} from {source!r}")
+        if client.getsockname()[1] != source_port:
+            raise SystemExit(f"UDP {label} source port changed across Bridge outage recovery")
+        print(f"udp-recovered-same-tuple-{label}-{attempt}", flush=True)
+        break
+    else:
+        raise SystemExit(f"same-tuple UDP {label} did not recover after Xray Bridge reattachment")
+
+for _, client, _, _ in udp_clients:
+    client.close()
 PY
 )
-    coproc XRAY_OFFLINE_UDP_CLIENT {
-        nsenter --net="/proc/$office_ns_pid/ns/net" python3 -u -c "$offline_udp_client_program"
+    coproc XRAY_OFFLINE_CLIENT {
+        nsenter --net="/proc/$office_ns_pid/ns/net" python3 -u -c "$offline_client_program"
     }
-    offline_udp_client_pid=$XRAY_OFFLINE_UDP_CLIENT_PID
-    offline_udp_read_fd=${XRAY_OFFLINE_UDP_CLIENT[0]}
-    offline_udp_write_fd=${XRAY_OFFLINE_UDP_CLIENT[1]}
-    if ! IFS= read -r -t 8 offline_udp_state <&"$offline_udp_read_fd" \
-        || [[ "$offline_udp_state" != baseline-ready ]]; then
-        printf 'Xray Edge baseline UDP path did not become ready.\n' >&2
-        exit 1
-    fi
+    offline_client_pid=$XRAY_OFFLINE_CLIENT_PID
+    offline_client_read_fd=${XRAY_OFFLINE_CLIENT[0]}
+    offline_client_write_fd=${XRAY_OFFLINE_CLIENT[1]}
+    for label in v4 v6; do
+        if ! IFS= read -r -t 12 offline_client_state <&"$offline_client_read_fd" \
+            || [[ "$offline_client_state" != tcp-baseline-"$label"-* ]]; then
+            printf 'Xray Edge baseline %s TCP path did not become ready.\n' "$label" >&2
+            exit 1
+        fi
+    done
+    for label in v4 v6; do
+        if ! IFS= read -r -t 8 offline_client_state <&"$offline_client_read_fd" \
+            || [[ "$offline_client_state" != udp-baseline-"$label" ]]; then
+            printf 'Xray Edge baseline %s UDP path did not become ready.\n' "$label" >&2
+            exit 1
+        fi
+    done
 
     portal_attach_count_before_outage=$(grep -c 'vless_reverse_portal_worker_attached' "$hub_log_file" || true)
     if (( portal_attach_count_before_outage != 1 )); then
@@ -551,14 +632,29 @@ PY
         printf 'Hub or TUN Gateway exited while stopping the Xray Bridge.\n' >&2
         exit 1
     fi
-    printf 'probe-offline\n' >&"$offline_udp_write_fd"
-    if ! IFS= read -r -t 5 offline_udp_state <&"$offline_udp_read_fd" \
-        || [[ "$offline_udp_state" != udp-dropped-no-worker ]]; then
-        printf 'Live TUN UDP did not fail closed while the only Xray Bridge was offline.\n' >&2
+    printf 'probe-offline\n' >&"$offline_client_write_fd"
+    for label in v4 v6; do
+        if ! IFS= read -r -t 5 offline_client_state <&"$offline_client_read_fd" \
+            || [[ "$offline_client_state" != tcp-dropped-no-worker-"$label" ]]; then
+            printf 'Live TUN %s TCP did not fail closed while the only Xray Bridge was offline.\n' "$label" >&2
+            exit 1
+        fi
+    done
+    for label in v4 v6; do
+        if ! IFS= read -r -t 5 offline_client_state <&"$offline_client_read_fd" \
+            || [[ "$offline_client_state" != udp-dropped-no-worker-"$label" ]]; then
+            printf 'Live TUN %s UDP did not fail closed while the only Xray Bridge was offline.\n' "$label" >&2
+            exit 1
+        fi
+    done
+    if grep -Fq "tcp-received b'xray-bridge-offline-tcp-no-worker-v4'" "$tcp_echo_log_file" \
+        || grep -Fq "tcp-v6-received b'xray-bridge-offline-tcp-no-worker-v6'" "$tcp_echo_v6_log_file"; then
+        printf 'The Edge LAN received an offline-only TCP marker.\n' >&2
         exit 1
     fi
-    if grep -Fq "udp-marker-received b'xray-bridge-offline-no-worker'" "$udp_echo_log_file"; then
-        printf 'The Edge LAN received the offline-only UDP marker.\n' >&2
+    if grep -Fq "udp-marker-received b'xray-bridge-offline-udp-no-worker-v4'" "$udp_echo_log_file" \
+        || grep -Fq "udp-v6-marker-received b'xray-bridge-offline-udp-no-worker-v6'" "$udp_echo_v6_log_file"; then
+        printf 'The Edge LAN received an offline-only UDP marker.\n' >&2
         exit 1
     fi
 
@@ -581,28 +677,51 @@ PY
         printf 'Xray TLS Reverse Bridge did not reattach after outage within 30 seconds.\n' >&2
         exit 1
     fi
-    printf 'probe-recovered\n' >&"$offline_udp_write_fd"
-    if ! IFS= read -r -t 8 offline_udp_state <&"$offline_udp_read_fd" \
-        || [[ "$offline_udp_state" != udp-recovered-same-tuple-* ]]; then
-        printf 'Live TUN UDP tuple did not recover after Xray Bridge reattachment.\n' >&2
+    printf 'probe-recovered\n' >&"$offline_client_write_fd"
+    for label in v4 v6; do
+        if ! IFS= read -r -t 8 offline_client_state <&"$offline_client_read_fd" \
+            || [[ "$offline_client_state" != tcp-recovered-"$label"-* ]]; then
+            printf 'Live TUN %s TCP did not recover after Xray Bridge reattachment.\n' "$label" >&2
+            exit 1
+        fi
+    done
+    for label in v4 v6; do
+        if ! IFS= read -r -t 8 offline_client_state <&"$offline_client_read_fd" \
+            || [[ "$offline_client_state" != udp-recovered-same-tuple-"$label"-* ]]; then
+            printf 'Live TUN %s UDP tuple did not recover after Xray Bridge reattachment.\n' "$label" >&2
+            exit 1
+        fi
+    done
+    if ! wait "$offline_client_pid"; then
+        printf 'Xray Bridge outage client exited with an error.\n' >&2
         exit 1
     fi
-    if ! wait "$offline_udp_client_pid"; then
-        printf 'Xray Bridge outage UDP client exited with an error.\n' >&2
+    offline_client_pid=
+    for marker in xray-bridge-offline-tcp-baseline-v4 xray-bridge-offline-tcp-recovered-v4; do
+        grep -Fq "tcp-received b'$marker" "$tcp_echo_log_file"
+    done
+    for marker in xray-bridge-offline-tcp-baseline-v6 xray-bridge-offline-tcp-recovered-v6; do
+        grep -Fq "tcp-v6-received b'$marker" "$tcp_echo_v6_log_file"
+    done
+    if grep -Fq "tcp-received b'xray-bridge-offline-tcp-no-worker-v4'" "$tcp_echo_log_file" \
+        || grep -Fq "tcp-v6-received b'xray-bridge-offline-tcp-no-worker-v6'" "$tcp_echo_v6_log_file"; then
+        printf 'A delayed offline-only TCP marker reached the Edge LAN after Bridge recovery.\n' >&2
         exit 1
     fi
-    offline_udp_client_pid=
-    grep -Fq "udp-marker-received b'xray-bridge-offline-baseline'" "$udp_echo_log_file"
-    grep -Fq "udp-marker-received b'xray-bridge-offline-recovered-" "$udp_echo_log_file"
-    if grep -Fq "udp-marker-received b'xray-bridge-offline-no-worker'" "$udp_echo_log_file"; then
-        printf 'The Edge LAN received the offline-only UDP marker after recovery.\n' >&2
+    grep -Fq "udp-marker-received b'xray-bridge-offline-baseline-v4'" "$udp_echo_log_file"
+    grep -Fq "udp-marker-received b'xray-bridge-offline-recovered-v4-" "$udp_echo_log_file"
+    grep -Fq "udp-v6-marker-received b'xray-bridge-offline-baseline-v6'" "$udp_echo_v6_log_file"
+    grep -Fq "udp-v6-marker-received b'xray-bridge-offline-recovered-v6-" "$udp_echo_v6_log_file"
+    if grep -Fq "udp-marker-received b'xray-bridge-offline-udp-no-worker-v4'" "$udp_echo_log_file" \
+        || grep -Fq "udp-v6-marker-received b'xray-bridge-offline-udp-no-worker-v6'" "$udp_echo_v6_log_file"; then
+        printf 'A delayed offline-only UDP marker reached the Edge LAN after Bridge recovery.\n' >&2
         exit 1
     fi
     kill -0 "$hub_pid"
     kill -0 "$server_pid"
     kill -0 "$xray_pid"
     stop_tun_gateway
-    printf 'Fixed Xray TLS Bridge UDP failed closed with no worker and recovered on the same live-TUN source/target tuple after reattachment.\n'
+    printf 'Fixed Xray TLS Bridge TCP/UDP (IPv4/IPv6) failed closed with no worker and recovered after reattachment; each UDP socket/source-port/target tuple remained unchanged.\n'
     exit 0
 fi
 
