@@ -15,7 +15,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 #[cfg(feature = "vless")]
-use crate::outbound::connect_vless_udp_via_outbound;
+use crate::outbound::{VlessUdpSendOutcome, connect_vless_udp_via_outbound};
 #[cfg(target_os = "linux")]
 use crate::util::socket::recv_udp_with_original_destination;
 use crate::{
@@ -832,8 +832,11 @@ async fn run_vless_udp_session(
             maybe_payload = receiver.recv() => {
                 let Some(payload) = maybe_payload else { break; };
                 match proxy.send_to(&target, &payload).await {
-                    Ok(()) => {
+                    Ok(VlessUdpSendOutcome::Written) => {
                         record_transfer_ref(Some(&traffic_context), payload.len() as u64, 0);
+                        idle.as_mut().reset(Instant::now() + session_idle_timeout);
+                    }
+                    Ok(VlessUdpSendOutcome::Skipped) => {
                         idle.as_mut().reset(Instant::now() + session_idle_timeout);
                     }
                     Err(error) => {
@@ -1580,6 +1583,8 @@ fn target_domain(target_location: &NetLocation) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vless")]
+    use super::run_vless_udp_session;
     use super::{
         DokodemoUdpDatagram, TrafficContext, UdpActiveRoute, UdpActiveRouteSender,
         UdpFlowKey, UdpOutboundAction, UdpRelayState, UdpReplySink, UdpSessionKey,
@@ -1601,6 +1606,7 @@ mod tests {
     };
     use tokio::sync::{Mutex, mpsc};
     use tokio::{
+        io::AsyncReadExt as _,
         net::UdpSocket,
         time::{advance, timeout},
     };
@@ -1636,6 +1642,70 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         drop(permit);
         assert!(relay.acquire_session_slot().is_ok());
+    }
+
+    #[cfg(feature = "vless")]
+    #[tokio::test(start_paused = true)]
+    async fn vless_udp_oversized_packet_does_not_end_the_worker() {
+        const OVERSIZED_PAYLOAD_LENGTH: usize = 8 * 1024 - 1;
+
+        let target =
+            NetLocation::from_str("192.0.2.8:53", None).expect("parse UDP target");
+        let target_addr = SocketAddr::from(([192, 0, 2, 8], 53));
+        let relay = Arc::new(UdpRelayState::with_idle_timeout(
+            Arc::new(TestUdpReplySink),
+            None,
+            Duration::from_secs(1),
+        ));
+        let key = UdpSessionKey {
+            client_addr: SocketAddr::from(([192, 0, 2, 1], 45_555)),
+            target_addr,
+            outbound_tag: Some("vless-out".into()),
+        };
+        let (sender, receiver) = mpsc::channel(2);
+        let (proxy_stream, mut peer_stream) = tokio::io::duplex(16 * 1024);
+        let proxy = crate::outbound::VlessUdpOutboundStream::new(
+            Box::new(proxy_stream),
+            target.clone(),
+        );
+        let task = tokio::spawn(run_vless_udp_session(
+            Arc::clone(&relay),
+            key,
+            target,
+            "vless-out".into(),
+            TrafficContext::new("dokodemo-door"),
+            proxy,
+            UdpSessionReceiver::new(receiver, None, sender.clone()),
+        ));
+
+        sender
+            .send(vec![0; OVERSIZED_PAYLOAD_LENGTH])
+            .await
+            .expect("queue oversized UDP packet");
+        sender
+            .send(b"after oversized".to_vec())
+            .await
+            .expect("queue valid UDP packet after oversized packet");
+
+        timeout(Duration::from_secs(1), async {
+            let length = peer_stream
+                .read_u16()
+                .await
+                .expect("read valid packet length");
+            assert_eq!(length as usize, b"after oversized".len());
+            let mut payload = vec![0; length as usize];
+            peer_stream
+                .read_exact(&mut payload)
+                .await
+                .expect("read valid packet after oversized packet");
+            assert_eq!(payload, b"after oversized");
+        })
+        .await
+        .expect("worker did not forward the valid packet after the oversized one");
+
+        drop(sender);
+        advance(Duration::from_secs(2)).await;
+        task.await.expect("VLESS UDP worker task panicked");
     }
 
     #[tokio::test(start_paused = true)]

@@ -68,7 +68,7 @@ use routing::{TcpRoutePlan, plan_tcp_route};
 #[cfg(all(test, feature = "grpc_transport"))]
 use static_config::{StaticOutboundGrpcSettings, encode_static_grpc_config};
 pub(crate) use static_config::{compile_static_outbound, parse_xray_uuid};
-pub(crate) use vless_udp::VlessUdpOutboundStream;
+pub(crate) use vless_udp::{VlessUdpOutboundStream, VlessUdpSendOutcome};
 
 #[cfg(feature = "api")]
 pub(crate) fn validate_freedom_outbound_settings(

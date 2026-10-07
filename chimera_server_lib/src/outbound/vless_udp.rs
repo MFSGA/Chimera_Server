@@ -6,6 +6,12 @@ use crate::{address::NetLocation, async_stream::AsyncStream};
 // whose payload plus the two-byte frame header exceeds common/buf.Size (8192).
 const XRAY_VLESS_UDP_MAX_WRITE_LENGTH: usize = 8 * 1024 - 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VlessUdpSendOutcome {
+    Written,
+    Skipped,
+}
+
 pub(crate) struct VlessUdpOutboundStream {
     stream: Box<dyn AsyncStream>,
     target: NetLocation,
@@ -20,28 +26,21 @@ impl VlessUdpOutboundStream {
         &mut self,
         target: &NetLocation,
         payload: &[u8],
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<VlessUdpSendOutcome> {
         if target != &self.target {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "VLESS UDP session cannot change its target",
             ));
         }
-        if payload.is_empty() {
-            return Ok(());
-        }
-        if payload.len() > XRAY_VLESS_UDP_MAX_WRITE_LENGTH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "VLESS UDP payload exceeds Xray packet writer limit {XRAY_VLESS_UDP_MAX_WRITE_LENGTH}"
-                ),
-            ));
+        if payload.is_empty() || payload.len() > XRAY_VLESS_UDP_MAX_WRITE_LENGTH {
+            return Ok(VlessUdpSendOutcome::Skipped);
         }
 
         self.stream.write_u16(payload.len() as u16).await?;
         self.stream.write_all(payload).await?;
-        self.stream.flush().await
+        self.stream.flush().await?;
+        Ok(VlessUdpSendOutcome::Written)
     }
 
     pub(crate) async fn recv_from(
@@ -112,7 +111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vless_udp_outbound_drops_empty_packets_and_rejects_oversized_packets() {
+    async fn vless_udp_skips_empty_and_oversized_packets_without_closing_stream() {
         let target =
             NetLocation::from_str("192.0.2.8:53", None).expect("parse UDP target");
         let (client, mut server) = duplex(16 * 1024);
@@ -120,10 +119,13 @@ mod tests {
             VlessUdpOutboundStream::new(Box::new(client), target.clone());
 
         let max_payload = vec![0x5a; XRAY_VLESS_UDP_MAX_WRITE_LENGTH];
-        stream
-            .send_to(&target, &max_payload)
-            .await
-            .expect("write maximum Xray VLESS UDP packet");
+        assert_eq!(
+            stream
+                .send_to(&target, &max_payload)
+                .await
+                .expect("write maximum Xray VLESS UDP packet"),
+            VlessUdpSendOutcome::Written
+        );
         assert_eq!(
             server.read_u16().await.expect("read maximum packet length") as usize,
             XRAY_VLESS_UDP_MAX_WRITE_LENGTH
@@ -135,23 +137,47 @@ mod tests {
             .expect("read maximum packet payload");
         assert_eq!(received, max_payload);
 
-        stream
-            .send_to(&target, &[])
-            .await
-            .expect("drop empty VLESS UDP packet");
-        stream
-            .send_to(&target, b"x")
-            .await
-            .expect("write packet after empty packet");
+        assert_eq!(
+            stream
+                .send_to(&target, &[])
+                .await
+                .expect("skip empty VLESS UDP packet"),
+            VlessUdpSendOutcome::Skipped
+        );
+        assert_eq!(
+            stream
+                .send_to(&target, b"x")
+                .await
+                .expect("write packet after empty packet"),
+            VlessUdpSendOutcome::Written
+        );
         assert_eq!(server.read_u16().await.expect("read packet length"), 1);
         assert_eq!(server.read_u8().await.expect("read packet payload"), b'x');
 
         let oversized = vec![0u8; XRAY_VLESS_UDP_MAX_WRITE_LENGTH + 1];
-        let error = stream
-            .send_to(&target, &oversized)
+        assert_eq!(
+            stream
+                .send_to(&target, &oversized)
+                .await
+                .expect("skip packet above Xray's writer limit"),
+            VlessUdpSendOutcome::Skipped
+        );
+        assert_eq!(
+            stream
+                .send_to(&target, b"after oversized")
+                .await
+                .expect("write packet after oversized packet"),
+            VlessUdpSendOutcome::Written
+        );
+        let packet_length =
+            server.read_u16().await.expect("read later packet length");
+        assert_eq!(packet_length as usize, b"after oversized".len());
+        let mut packet = vec![0; packet_length as usize];
+        server
+            .read_exact(&mut packet)
             .await
-            .expect_err("reject packet above Xray's writer limit");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            .expect("read packet after oversized packet");
+        assert_eq!(packet, b"after oversized");
     }
 
     #[tokio::test]

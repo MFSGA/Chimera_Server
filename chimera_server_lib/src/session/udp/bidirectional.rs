@@ -5,7 +5,9 @@ use bytes::Bytes;
 
 #[cfg(feature = "trojan")]
 use crate::handler::trojan_udp::TrojanUdpStream;
-use crate::outbound::{VlessUdpOutboundStream, connect_vless_udp_via_outbound};
+use crate::outbound::{
+    VlessUdpOutboundStream, VlessUdpSendOutcome, connect_vless_udp_via_outbound,
+};
 
 pub(crate) async fn run_bidirectional_udp(
     mut server_stream: Box<dyn AsyncMessageStream>,
@@ -190,8 +192,11 @@ async fn copy_bidirectional_vless_udp_messages(
                 if len == 0 {
                     return Ok(());
                 }
-                proxy.send_to(target, &client_buffer[..len]).await?;
-                record_transfer(traffic_context.clone(), len as u64, 0);
+                if proxy.send_to(target, &client_buffer[..len]).await?
+                    == VlessUdpSendOutcome::Written
+                {
+                    record_transfer(traffic_context.clone(), len as u64, 0);
+                }
             }
             result = proxy.recv_from(&mut target_buffer) => {
                 let (_source, len) = result?;
