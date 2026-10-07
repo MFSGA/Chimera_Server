@@ -127,7 +127,7 @@ lru = "0.18"
 log = "0.4"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 subtle = "2"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 md-5 = "0.10"
 blake2 = "0.10"
 blake3 = "1.8"
