@@ -309,6 +309,10 @@ async fn remember_active_route(
 pub(crate) trait UdpReplySink: Send + Sync {
     fn local_addr(&self) -> Option<SocketAddr>;
 
+    fn local_addr_for(&self, _client_addr: SocketAddr) -> Option<SocketAddr> {
+        self.local_addr()
+    }
+
     async fn send_response(
         &self,
         payload: &[u8],
@@ -530,7 +534,7 @@ async fn relay_dokodemo_udp_datagram(
                 &runtime,
                 &inbound_tag,
                 client_addr,
-                relay_state.reply_sink.local_addr(),
+                relay_state.reply_sink.local_addr_for(client_addr),
                 target_addr,
                 &target_location,
             )

@@ -842,6 +842,8 @@ async fn run_server_with_routing<D: PacketDevice + 'static>(
         Arc::new(NetstackUdpReplySink::new(
             udp_reply,
             Some(SocketAddr::new(plan.address.into(), 0)),
+            plan.ipv6_address
+                .map(|(address, _)| SocketAddr::new(address.into(), 0)),
         )),
         plan.max_udp_sessions,
     );
@@ -1061,20 +1063,37 @@ type NetstackUdpReply = Arc<
 >;
 
 struct NetstackUdpReplySink {
-    local_addr: Option<SocketAddr>,
+    local_ipv4_addr: Option<SocketAddr>,
+    local_ipv6_addr: Option<SocketAddr>,
     reply: NetstackUdpReply,
 }
 
 impl NetstackUdpReplySink {
-    fn new(reply: NetstackUdpReply, local_addr: Option<SocketAddr>) -> Self {
-        Self { local_addr, reply }
+    fn new(
+        reply: NetstackUdpReply,
+        local_ipv4_addr: Option<SocketAddr>,
+        local_ipv6_addr: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            local_ipv4_addr,
+            local_ipv6_addr,
+            reply,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl crate::session::udp::dokodemo::UdpReplySink for NetstackUdpReplySink {
     fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr
+        self.local_ipv4_addr.or(self.local_ipv6_addr)
+    }
+
+    fn local_addr_for(&self, client_addr: SocketAddr) -> Option<SocketAddr> {
+        if client_addr.is_ipv4() {
+            self.local_ipv4_addr
+        } else {
+            self.local_ipv6_addr
+        }
     }
 
     async fn send_response(
@@ -1217,7 +1236,10 @@ mod tests {
     use crate::runtime::{OutboundSummary, RuntimeState};
     #[cfg(feature = "vless-reverse")]
     use crate::{
-        config::rule::{NetworkListConfig, RoutingConfig, RuleConfig},
+        config::rule::{
+            NetworkListConfig, PortListConfig, PortRangeConfig, RoutingConfig,
+            RuleConfig,
+        },
         handler::vless_reverse::{
             bridge_worker::{BridgeDispatchContext, MuxServerWorker},
             mux_frame::{FrameMetadata, FrameOption, SessionStatus},
@@ -2326,6 +2348,147 @@ mod tests {
             .expect("TUN service did not stop after device closure")
             .expect("TUN service task panicked")
             .expect_err("device closure must be reported as a service failure");
+        runtime_state.close_inbound_connection_tasks();
+        let _ = runtime_state
+            .drain_inbound_connection_tasks(Duration::from_secs(1))
+            .await;
+    }
+
+    #[cfg(feature = "vless-reverse")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tun_ipv6_udp_local_ip_rule_uses_configured_tun_ipv6_address() {
+        let runtime_state = RuntimeState::new(
+            Vec::new(),
+            vec![
+                OutboundSummary {
+                    tag: "blocked".into(),
+                    protocol: "blackhole".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
+                },
+                OutboundSummary {
+                    tag: "reverse-out".into(),
+                    protocol: "vless-reverse".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
+                },
+            ],
+        );
+        runtime_state.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![
+                    RuleConfig {
+                        inbound_tag: vec!["office-tun".into()],
+                        network: NetworkListConfig(vec!["udp".into()]),
+                        local_ip: vec!["fd00:254::1/128".into()],
+                        port: PortListConfig(vec![PortRangeConfig {
+                            from: 5353,
+                            to: 5353,
+                        }]),
+                        outbound_tag: Some("blocked".into()),
+                        ..RuleConfig::default()
+                    },
+                    RuleConfig {
+                        inbound_tag: vec!["office-tun".into()],
+                        network: NetworkListConfig(vec!["udp".into()]),
+                        outbound_tag: Some("reverse-out".into()),
+                        ..RuleConfig::default()
+                    },
+                ],
+                ..RoutingConfig::default()
+            }))
+            .expect("compile IPv6 local-address UDP route"),
+        );
+        let runtime = runtime_state.data_plane();
+        let (portal_stream, mut bridge_peer) = tokio::io::duplex(16 * 1024);
+        let _portal_lease = runtime
+            .attach_reverse_portal(
+                "reverse-out",
+                Box::new(ReverseSessionStream::new(portal_stream)),
+            )
+            .await
+            .expect("attach Reverse Portal worker");
+        let control = read_frame_with_source_and_local(&mut bridge_peer, true)
+            .await
+            .expect("read Reverse worker control frame");
+        assert_eq!(control.metadata.status, SessionStatus::New);
+
+        let mut gateway_config = config();
+        gateway_config.ipv6_address = Some("fd00:254::1/64".into());
+        let plan = TunGatewayPlan::try_from(gateway_config)
+            .expect("valid IPv6 gateway plan");
+        let (incoming, input) = mpsc::channel(8);
+        let (output, _packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let cancellation = CancellationToken::new();
+        let service =
+            tokio::spawn(run_server(device, plan, runtime, cancellation.clone()));
+
+        let control_target = SocketAddr::new(
+            "2001:db8:44::50"
+                .parse::<Ipv6Addr>()
+                .expect("parse IPv6 target")
+                .into(),
+            5354,
+        );
+        incoming
+            .send(udp_datagram_ipv6(
+                45_557,
+                control_target,
+                b"nonmatching-route-control",
+            ))
+            .await
+            .expect("inject IPv6 UDP control datagram into memory TUN");
+        let control_packet = timeout(
+            Duration::from_secs(1),
+            read_frame_with_source_and_local(&mut bridge_peer, true),
+        )
+        .await
+        .expect("nonmatching localIP route should reach Reverse")
+        .expect("read Reverse control datagram");
+        assert_eq!(
+            control_packet.payload.as_ref(),
+            b"nonmatching-route-control"
+        );
+
+        let target = SocketAddr::new(
+            "2001:db8:44::50"
+                .parse::<Ipv6Addr>()
+                .expect("parse IPv6 target")
+                .into(),
+            5353,
+        );
+        incoming
+            .send(udp_datagram_ipv6(45_558, target, b"must-hit-ipv6-localIP"))
+            .await
+            .expect("inject IPv6 UDP datagram into memory TUN");
+        assert!(
+            timeout(
+                Duration::from_secs(1),
+                read_frame_with_source_and_local(&mut bridge_peer, true),
+            )
+            .await
+            .is_err(),
+            "IPv6 localIP rule must select blackhole instead of Reverse"
+        );
+        assert!(
+            !service.is_finished(),
+            "a blackholed IPv6 UDP datagram must not stop the TUN service"
+        );
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("TUN service did not stop after cancellation")
+            .expect("TUN service task panicked")
+            .expect("cooperative TUN shutdown should complete cleanly");
         runtime_state.close_inbound_connection_tasks();
         let _ = runtime_state
             .drain_inbound_connection_tasks(Duration::from_secs(1))
