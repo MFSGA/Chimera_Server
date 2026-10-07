@@ -608,7 +608,7 @@ impl ValidatedServerPlan {
         // advertised on a target without the Linux device backend.
         #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
         let tun_gateway_started = self.tun_gateway.is_some();
-        #[cfg(not(feature = "tun-gateway"))]
+        #[cfg(not(all(feature = "tun-gateway", target_os = "linux")))]
         let tun_gateway_started = false;
 
         if self.inbounds.is_empty()
