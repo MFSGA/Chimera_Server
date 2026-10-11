@@ -13,8 +13,8 @@ use aws_lc_rs::cipher::{
     UnboundCipherKey,
 };
 use bytes::BytesMut;
-use sha3::Shake128;
-use sha3::digest::{ExtendableOutput, Update};
+use shake::Shake128;
+use shake::digest::{ExtendableOutput, Update};
 use tokio::io::AsyncReadExt;
 
 use super::md5::{compute_md5, create_chacha_key};

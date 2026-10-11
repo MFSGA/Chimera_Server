@@ -8,7 +8,7 @@ use aws_lc_rs::aead::{
 use bytes::BytesMut;
 use futures::ready;
 use rand::Rng;
-use sha3::digest::XofReader;
+use shake::digest::XofReader;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 

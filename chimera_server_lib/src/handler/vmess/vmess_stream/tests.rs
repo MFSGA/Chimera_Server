@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use sha3::{
+use shake::{
     Shake128,
     digest::{ExtendableOutput, Update},
 };

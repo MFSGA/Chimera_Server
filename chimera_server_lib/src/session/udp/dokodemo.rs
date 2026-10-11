@@ -18,7 +18,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-#[cfg(feature = "xray-tun")]
+#[cfg(all(feature = "xray-tun", target_os = "linux"))]
 use crate::config::server_config::InboundSniffingConfig;
 #[cfg(feature = "vless")]
 use crate::outbound::{VlessUdpSendOutcome, connect_vless_udp_via_outbound};
@@ -44,7 +44,7 @@ use super::{
 };
 #[cfg(feature = "trojan")]
 use crate::session::udp::shutdown_targeted_message;
-#[cfg(feature = "xray-tun")]
+#[cfg(all(feature = "xray-tun", target_os = "linux"))]
 use crate::{
     session::quic_sniff::{CryptoStream, append_quic_initial_crypto},
     tls_client_hello::ClientHelloInspection,
