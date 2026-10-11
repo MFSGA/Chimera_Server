@@ -73,6 +73,8 @@ For release installation, the server needs:
 
 ```bash
 command -v curl || command -v wget
+command -v unzip
+command -v sha256sum || command -v openssl
 uname -m
 ```
 
@@ -111,15 +113,21 @@ sudo /tmp/chimera-install.sh install --latest --config /path/to/config.json5 --u
 
 To install a specific release:
 
+Set `VERSION` to the desired release tag (for example, `v26.10.12`):
+
 ```bash
-sudo /tmp/chimera-install.sh install --version v0.3.2 --config /path/to/config.json5 --start
+sudo /tmp/chimera-install.sh install --version VERSION --config /path/to/config.json5 --start
 ```
 
-The release asset name is expected to be:
+The Linux x86_64 release asset is:
 
 ```text
-chimera_server_app-<tag>-linux-x86_64
+Chimera-linux-64.zip
+Chimera-linux-64.zip.dgst
 ```
+
+The archive includes the server binary, README, license, and a minimal example configuration. The
+installer verifies its SHA-256 digest before extracting the binary.
 
 ### Step 2B: Build and Install from a Local Checkout
 

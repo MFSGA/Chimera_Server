@@ -37,7 +37,7 @@ Options:
   --from DIR             Directory containing ${APP_BIN} and optionally ${CLI_BIN}
                          (default: ./target/release)
   --latest               Download and install the latest GitHub Release binary
-  --version VERSION      Download and install a specific GitHub Release tag, e.g. v0.3.2
+  --version VERSION      Download and install a specific GitHub Release tag, e.g. v26.10.12
   --repo OWNER/REPO      GitHub repository used by --latest/--version
                          (default: ${GITHUB_REPO})
   --update-geo           Download latest geoip.dat and geosite.dat from v2fly/domain-list
@@ -54,7 +54,7 @@ Options:
 Examples:
   sudo $0
   sudo $0 update --latest --start
-  sudo $0 update --version v0.3.2 --update-geo --start
+  sudo $0 update --version VERSION --update-geo --start
   sudo $0 rollback --start
   sudo $0 uninstall
 EOF
@@ -217,12 +217,15 @@ normalize_arch() {
     esac
 }
 
-release_asset_name() {
-    local version arch
-    version="$1"
+release_archive_name() {
+    local arch
     arch="$(normalize_arch)"
 
-    printf '%s-%s-linux-%s\n' "${APP_BIN}" "${version}" "${arch}"
+    case "${arch}" in
+        x86_64)
+            printf '%s\n' "Chimera-linux-64.zip"
+            ;;
+    esac
 }
 
 resolve_release_version() {
@@ -233,40 +236,51 @@ resolve_release_version() {
     fi
 }
 
-verify_sha256_if_available() {
-    local file checksum_file checksum_url
+verify_release_digest() {
+    local file digest_file digest_url expected actual marker
     file="$1"
-    checksum_file="${file}.sha256"
-    checksum_url="$2"
+    digest_file="${file}.dgst"
+    digest_url="$2"
 
-    if ! command -v sha256sum >/dev/null 2>&1; then
-        warn "sha256sum not found; skipping checksum verification"
-        return
+    if ! download_file "${digest_url}" "${digest_file}"; then
+        die "release digest file not found: ${digest_url}"
     fi
 
-    if download_file "${checksum_url}" "${checksum_file}"; then
-        (
-            cd "$(dirname "${file}")"
-            sha256sum -c "$(basename "${checksum_file}")"
-        )
+    marker="SHA2-256($(basename "${file}"))= "
+    expected="$(awk -v marker="${marker}" 'index($0, marker) == 1 { print substr($0, length(marker) + 1); exit }' "${digest_file}")"
+    [[ "${expected}" =~ ^[0-9a-fA-F]{64}$ ]] || die "release SHA-256 digest is missing or malformed"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "${file}" | awk '{ print $1 }')"
+    elif command -v openssl >/dev/null 2>&1; then
+        actual="$(openssl dgst -sha256 "${file}" | awk -F'= ' '{ print $2 }')"
     else
-        warn "checksum file not found; install will continue without checksum verification"
+        die "sha256sum or openssl is required to verify release downloads"
     fi
+
+    [[ "${actual,,}" == "${expected,,}" ]] || die "release archive SHA-256 verification failed"
+    info "verified SHA-256 digest for $(basename "${file}")"
 }
 
 download_release_binary() {
-    local version asset url tmp_dir output checksum_url
+    local version archive url tmp_dir output digest_url extracted
     version="$(resolve_release_version)"
-    asset="$(release_asset_name "${version}")"
-    url="https://github.com/${GITHUB_REPO}/releases/download/${version}/${asset}"
-    checksum_url="${url}.sha256"
+    archive="$(release_archive_name)"
+    url="https://github.com/${GITHUB_REPO}/releases/download/${version}/${archive}"
+    digest_url="${url}.dgst"
     tmp_dir="$(mktemp -d)"
-    output="${tmp_dir}/${asset}"
+    output="${tmp_dir}/${archive}"
 
-    info "downloading ${GITHUB_REPO} ${version} (${asset})"
+    info "downloading ${GITHUB_REPO} ${version} (${archive})"
     download_file "${url}" "${output}"
-    verify_sha256_if_available "${output}" "${checksum_url}"
-    mv "${output}" "${tmp_dir}/${APP_BIN}"
+    verify_release_digest "${output}" "${digest_url}"
+
+    command -v unzip >/dev/null 2>&1 || die "unzip is required to install release archives"
+    extracted="${tmp_dir}/package"
+    mkdir -p "${extracted}"
+    unzip -q "${output}" -d "${extracted}"
+    [ -f "${extracted}/${APP_BIN}" ] || die "release archive does not contain ${APP_BIN}"
+    mv "${extracted}/${APP_BIN}" "${tmp_dir}/${APP_BIN}"
     chmod 0755 "${tmp_dir}/${APP_BIN}"
 
     BUILD_DIR="${tmp_dir}"

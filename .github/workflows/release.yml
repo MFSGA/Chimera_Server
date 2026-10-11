@@ -3,15 +3,6 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: "SemVer increment to publish"
-        required: true
-        default: patch
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
       release_goal:
         description: "Single primary protocol goal completed by this version"
         required: true
@@ -43,7 +34,7 @@ jobs:
       candidate_commit: ${{ steps.prepare.outputs.candidate_commit }}
       candidate_branch: ${{ steps.prepare.outputs.candidate_branch }}
       workspace_version: ${{ steps.prepare.outputs.workspace_version }}
-      base_version: ${{ steps.prepare.outputs.base_version }}
+      latest_tag_version: ${{ steps.prepare.outputs.latest_tag_version }}
       version: ${{ steps.prepare.outputs.version }}
       tag: ${{ steps.prepare.outputs.tag }}
       release_goal: ${{ steps.prepare.outputs.release_goal }}
@@ -65,7 +56,6 @@ jobs:
       - name: Compute version and create candidate
         id: prepare
         env:
-          BUMP: ${{ inputs.bump }}
           RELEASE_GOAL: ${{ inputs.release_goal }}
         run: |
           set -euo pipefail
@@ -91,7 +81,7 @@ jobs:
           }
 
           python3 .github/scripts/release_version.py \
-            --bump "$BUMP" \
+            --date "$(date -u +'%Y-%m-%d')" \
             --write \
             --github-output "$GITHUB_OUTPUT"
 
@@ -211,16 +201,37 @@ jobs:
         run: cross build --release --locked --target x86_64-unknown-linux-musl --package chimera_server_app
 
       - name: Package Linux artifacts
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp target/release/chimera_server_app "dist/chimera_server_app-${TAG}-linux-x86_64"
-          cp target/x86_64-unknown-linux-musl/release/chimera_server_app "dist/chimera_server_app-${TAG}-linux-x86_64-musl"
-          chmod +x dist/chimera_server_app-*
-          (cd dist && sha256sum "chimera_server_app-${TAG}-linux-x86_64" > "chimera_server_app-${TAG}-linux-x86_64.sha256")
-          (cd dist && sha256sum "chimera_server_app-${TAG}-linux-x86_64-musl" > "chimera_server_app-${TAG}-linux-x86_64-musl.sha256")
+          mkdir -p dist/staging/linux-64 dist/staging/linux-64-musl
+
+          cp target/release/chimera_server_app dist/staging/linux-64/chimera_server_app
+          cp target/x86_64-unknown-linux-musl/release/chimera_server_app \
+            dist/staging/linux-64-musl/chimera_server_app
+          chmod 0755 dist/staging/linux-64/chimera_server_app \
+            dist/staging/linux-64-musl/chimera_server_app
+
+          for package in linux-64 linux-64-musl; do
+            cp .github/release-package/README.md LICENSE \
+              "examples/xray-compatible/socks-tcp-noauth.json5" \
+              "dist/staging/${package}/"
+            mv "dist/staging/${package}/socks-tcp-noauth.json5" \
+              "dist/staging/${package}/config.example.json5"
+          done
+
+          for package in linux-64 linux-64-musl; do
+            archive="Chimera-${package}.zip"
+            (cd "dist/staging/${package}" && zip -9 -X -r "../../${archive}" .)
+            (
+              cd dist
+              {
+                openssl dgst -sha256 "${archive}"
+                openssl dgst -sha512 "${archive}"
+              } > "${archive}.dgst"
+            )
+          done
+
+          rm -rf dist/staging
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -247,15 +258,30 @@ jobs:
 
       - name: Package Windows artifacts
         shell: pwsh
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $binary = "dist\chimera_server_app-$env:TAG-windows-x86_64.exe"
-          Copy-Item target\release\chimera_server_app.exe $binary
-          $hash = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLower()
-          "$hash  chimera_server_app-$env:TAG-windows-x86_64.exe" |
-            Out-File -Encoding ascii "$binary.sha256"
+          $stage = "dist\staging\windows-64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\chimera_server_app.exe "$stage\chimera_server_app.exe"
+          $packageFiles = @(
+            ".github/release-package/README.md"
+            "LICENSE"
+            "examples/xray-compatible/socks-tcp-noauth.json5"
+          )
+          foreach ($packageFile in $packageFiles) {
+            Copy-Item -Path $packageFile -Destination $stage
+          }
+          Move-Item "$stage\socks-tcp-noauth.json5" "$stage\config.example.json5"
+
+          $archiveName = "Chimera-windows-64.zip"
+          $archivePath = "dist\$archiveName"
+          Compress-Archive -Path "$stage\*" -DestinationPath $archivePath
+          $sha256 = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLower()
+          $sha512 = (Get-FileHash $archivePath -Algorithm SHA512).Hash.ToLower()
+          @(
+            "SHA2-256($archiveName)= $sha256"
+            "SHA2-512($archiveName)= $sha512"
+          ) | Set-Content -Encoding ascii "$archivePath.dgst"
+          Remove-Item -Recurse -Force "dist\staging"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -295,12 +321,12 @@ jobs:
           set -euo pipefail
           cd dist
           expected=(
-            "chimera_server_app-${TAG}-linux-x86_64"
-            "chimera_server_app-${TAG}-linux-x86_64.sha256"
-            "chimera_server_app-${TAG}-linux-x86_64-musl"
-            "chimera_server_app-${TAG}-linux-x86_64-musl.sha256"
-            "chimera_server_app-${TAG}-windows-x86_64.exe"
-            "chimera_server_app-${TAG}-windows-x86_64.exe.sha256"
+            "Chimera-linux-64.zip"
+            "Chimera-linux-64.zip.dgst"
+            "Chimera-linux-64-musl.zip"
+            "Chimera-linux-64-musl.zip.dgst"
+            "Chimera-windows-64.zip"
+            "Chimera-windows-64.zip.dgst"
           )
           for file in "${expected[@]}"; do
             test -f "$file" || {
@@ -308,10 +334,38 @@ jobs:
               exit 1
             }
           done
-          sha256sum -c \
-            "chimera_server_app-${TAG}-linux-x86_64.sha256" \
-            "chimera_server_app-${TAG}-linux-x86_64-musl.sha256" \
-            "chimera_server_app-${TAG}-windows-x86_64.exe.sha256"
+          for archive in Chimera-linux-64.zip Chimera-linux-64-musl.zip Chimera-windows-64.zip; do
+            unzip -t "$archive" >/dev/null
+            for algorithm in 256 512; do
+              marker="SHA2-${algorithm}(${archive})= "
+              expected_digest=$(awk -v marker="$marker" 'index($0, marker) == 1 { print substr($0, length(marker) + 1); exit }' "${archive}.dgst")
+              if [[ "$algorithm" == "256" ]]; then
+                valid_digest="$expected_digest" && [[ "$valid_digest" =~ ^[0-9a-f]{64}$ ]]
+              else
+                valid_digest="$expected_digest" && [[ "$valid_digest" =~ ^[0-9a-f]{128}$ ]]
+              fi || {
+                echo "missing or malformed SHA2-${algorithm} digest for $archive" >&2
+                exit 1
+              }
+              actual_digest=$(openssl dgst "-sha${algorithm}" "$archive" | awk -F'= ' '{ print $2 }')
+              [[ "$actual_digest" == "$expected_digest" ]] || {
+                echo "SHA2-${algorithm} verification failed for $archive" >&2
+                exit 1
+              }
+            done
+          done
+
+          unzip -Z1 Chimera-linux-64.zip | grep -Fxq chimera_server_app
+          unzip -Z1 Chimera-linux-64-musl.zip | grep -Fxq chimera_server_app
+          unzip -Z1 Chimera-windows-64.zip | grep -Fxq chimera_server_app.exe
+          for archive in Chimera-linux-64.zip Chimera-linux-64-musl.zip Chimera-windows-64.zip; do
+            for package_file in README.md LICENSE config.example.json5; do
+              unzip -Z1 "$archive" | grep -Fxq "$package_file" || {
+                echo "$archive does not contain $package_file" >&2
+                exit 1
+              }
+            done
+          done
 
       - name: Atomically update master and tag
         env:
@@ -351,22 +405,39 @@ jobs:
         uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          name: ${{ needs.prepare.outputs.tag }} — ${{ needs.prepare.outputs.release_goal }}
-          generate_release_notes: true
+          name: Chimera Server ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: false
           body: |
-            Primary protocol goal: ${{ needs.prepare.outputs.release_goal }}
-            SemVer increment: ${{ inputs.bump }}
-            Previous release baseline: ${{ needs.prepare.outputs.base_version }}
+            ### Highlights
 
-            The workflow created ${{ needs.prepare.outputs.version }} from the validated release candidate and atomically advanced master with the release tag only after Linux/Windows preflight tests, repository release gates, and all platform artifacts passed.
-            Validate this release before starting the next primary protocol goal.
+            - ${{ needs.prepare.outputs.release_goal }}
+
+            ### Downloads
+
+            | Platform | Package |
+            | --- | --- |
+            | Linux x86_64 (GNU) | [Chimera-linux-64.zip](https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/Chimera-linux-64.zip) |
+            | Linux x86_64 (musl) | [Chimera-linux-64-musl.zip](https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/Chimera-linux-64-musl.zip) |
+            | Windows x86_64 | [Chimera-windows-64.zip](https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}/Chimera-windows-64.zip) |
+
+            Each `.zip` contains the executable, README, license, and a minimal example configuration. The matching `.dgst` file contains SHA-256 and SHA-512 digests.
+
+            ### Compatibility
+
+            Compatibility varies by protocol, transport, security, and network combination. See the [compatibility matrix](https://github.com/${{ github.repository }}/blob/master/COMPATIBILITY.md) before upgrading.
+            Validate this release in deployment before starting the next primary protocol goal.
+
+            ### Full changelog
+
+            ${{ needs.prepare.outputs.latest_tag_version != '' && format('https://github.com/{0}/compare/v{1}...{2}', github.repository, needs.prepare.outputs.latest_tag_version, needs.prepare.outputs.tag) || format('https://github.com/{0}/commits/{1}', github.repository, needs.prepare.outputs.tag) }}
           files: |
-            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64
-            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64.sha256
-            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64-musl
-            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-linux-x86_64-musl.sha256
-            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-windows-x86_64.exe
-            dist/chimera_server_app-${{ needs.prepare.outputs.tag }}-windows-x86_64.exe.sha256
+            dist/Chimera-linux-64.zip
+            dist/Chimera-linux-64.zip.dgst
+            dist/Chimera-linux-64-musl.zip
+            dist/Chimera-linux-64-musl.zip.dgst
+            dist/Chimera-windows-64.zip
+            dist/Chimera-windows-64.zip.dgst
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
 

@@ -9,7 +9,7 @@ The repository uses four entry-point workflows and two shared local actions. Kee
 | `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
-| `release.yml` | Manual only | Choose a SemVer increment, create one temporary release commit, validate/build it, then atomically advance `master` with the new tag and publish |
+| `release.yml` | Manual only | Generate a UTC calendar version, create one temporary release commit, validate/build it, then atomically advance `master` with the new tag and publish |
 
 Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag.
 
@@ -21,7 +21,7 @@ Tag pushes do not run the ordinary CI workflow. A release already runs its own e
 
 The release workflow uses `actions/rust-ci-setup/action.yml` after it creates the candidate commit. Stable releases always start from the current `master`; historical backfills are intentionally kept out of the normal release path so the main workflow has one predictable versioning model.
 
-`.github/scripts/release_version.py` owns stable SemVer calculation and the workspace-version edit. It compares the committed workspace version with the highest stable `vX.Y.Z` tag, uses the newer value as the release baseline, and then applies the selected `patch`, `minor`, or `major` increment. This prevents a stale workspace version from reusing an already-published tag.
+`.github/scripts/release_version.py` owns the Xray-style calendar version and workspace-version edit. It formats the workflow's UTC date as `YY.M.D` (for example, `26.10.12`), writes that value to the workspace manifests and lockfile, and refuses to reuse a tag for the same UTC day. Existing tags remain available as the changelog comparison point.
 
 ## CI contract
 
@@ -47,12 +47,12 @@ Build/reference rules:
 
 ## Release contract
 
-A release is an orchestration pipeline, not a second general CI system. The manual dispatch exposes only the SemVer increment and release goal; callers do not type the target version themselves.
+A release is an orchestration pipeline, not a second general CI system. The manual dispatch asks only for the release goal; the workflow generates the `YY.M.D` version from the UTC date so callers do not type a version manually.
 
 ```text
-choose patch / minor / major
+read current UTC date
             |
-   compute next stable version
+   format version as YY.M.D
             |
  update Cargo.toml + Cargo.lock
             |
@@ -86,6 +86,16 @@ The release candidate is a direct child of the `master` commit captured when the
 Before publication, the workflow verifies that remote `master` is still the original base commit. It then uses one atomic Git push for both the fast-forward of `master` and creation of the annotated stable tag. A concurrent change to `master` therefore fails closed and requires a fresh release dispatch.
 
 Repository permissions default to `contents: read`. Only the prepare, publish, and cleanup jobs receive `contents: write`, and each uses it for a narrowly defined release mutation. No stable tag or `master` version bump may become visible until both platform artifact jobs have succeeded and all expected checksums are present and verified.
+
+Release pages use the `Chimera Server vYY.M.D` title and a concise hand-authored body for the
+release goal, platform downloads, compatibility link, and full changelog comparison. Release
+archives follow the Xray-style platform ZIP layout for the targets Chimera currently builds:
+Linux x86_64 GNU, Linux x86_64 musl, and Windows x86_64. Each archive contains the executable,
+README, license, and a minimal example config; a sibling `.dgst` file contains SHA-256 and
+SHA-512. The Linux installer downloads `Chimera-linux-64.zip`, verifies SHA-256, and extracts
+the server binary. Cargo's three-part version field follows the same `YY.M.D` calendar format;
+the components identify year, month, and day rather than SemVer compatibility increments. The
+workflow permits one release per UTC day.
 
 ## Benchmark contract
 
