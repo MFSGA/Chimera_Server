@@ -386,7 +386,10 @@ jobs:
             unzip -t "$archive" >/dev/null
             for algorithm in 256 512; do
               marker="SHA2-${algorithm}(${archive})= "
-              expected_digest=$(awk -v marker="$marker" 'index($0, marker) == 1 { print substr($0, length(marker) + 1); exit }' "${archive}.dgst")
+              expected_digest=$(awk -v marker="$marker" '
+                { sub(/\r$/, "", $0) }
+                index($0, marker) == 1 { print substr($0, length(marker) + 1); exit }
+              ' "${archive}.dgst")
               if [[ "$algorithm" == "256" ]]; then
                 valid_digest="$expected_digest" && [[ "$valid_digest" =~ ^[0-9a-f]{64}$ ]]
               else
