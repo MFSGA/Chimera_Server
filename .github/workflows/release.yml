@@ -1,10 +1,10 @@
-name: Release
+name: Build and Release
 
 on:
   workflow_dispatch:
     inputs:
       release_goal:
-        description: "Single primary protocol goal completed by this version"
+        description: "Concise English release highlight, following Xray-core release title style"
         required: true
         type: string
 
@@ -148,6 +148,51 @@ jobs:
       - name: Workspace tests
         run: cargo test --workspace --all-features --locked
 
+  feature-preflight:
+    name: Feature compatibility (${{ matrix.name }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            feature: ""
+          - name: minimal-vless
+            feature: minimal-vless
+          - name: minimal-vless-tls
+            feature: minimal-vless-tls
+          - name: vless-reverse
+            feature: vless-reverse
+          - name: vless-reverse-tls
+            feature: vless-reverse-tls
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
+
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          cache-key: release-feature-${{ matrix.name }}
+
+      - name: Check feature boundary
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FEATURE" ]; then
+            cargo check \
+              --package chimera_server_app \
+              --no-default-features \
+              --features "$FEATURE" \
+              --locked
+          else
+            cargo check \
+              --package chimera_server_app \
+              --locked
+          fi
+
   gates:
     name: Release gates
     needs: prepare
@@ -166,11 +211,14 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      - name: Release version helper
+        run: python3 .github/scripts/release_version.py --self-test
+
       - name: Build all features
-        run: cargo build --all-features
+        run: cargo build --all-features --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
         run: cargo test
@@ -180,7 +228,7 @@ jobs:
 
   linux-artifacts:
     name: Linux artifacts
-    needs: [prepare, preflight, gates]
+    needs: [prepare, preflight, feature-preflight, gates]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -241,7 +289,7 @@ jobs:
 
   windows-artifacts:
     name: Windows artifacts
-    needs: [prepare, preflight, gates]
+    needs: [prepare, preflight, feature-preflight, gates]
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -444,7 +492,7 @@ jobs:
   cleanup:
     name: Cleanup candidate branch
     if: always() && needs.prepare.result == 'success'
-    needs: [prepare, preflight, gates, linux-artifacts, windows-artifacts, publish]
+    needs: [prepare, preflight, feature-preflight, gates, linux-artifacts, windows-artifacts, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

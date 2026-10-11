@@ -328,9 +328,10 @@ configuration. Do not assume launcher scripts or example configs fit the current
   goal is explicitly configuration/schema alignment.
 - Stable releases are started manually through the release workflow by providing the release goal.
   The workflow formats its UTC date as an Xray-style `YY.M.D` version and updates the workspace
-  package version and lockfile in a temporary release-candidate commit. Permit one release per UTC
-  day; the three Cargo version components mean year, month and day, not SemVer compatibility
-  increments. The explicit dispatch authorizes validation of that exact commit and, only after every
+  package version and lockfile in a temporary release-candidate commit. Additional releases on the
+  same UTC date advance the final component; the three Cargo version components mean year, month,
+  and day-or-sequence, not SemVer compatibility increments. The explicit dispatch authorizes
+  validation of that exact commit and, only after every
   release gate succeeds, an atomic fast-forward of `master` together with the new release tag. A failed
   validation must not leave the version bump on `master` or create a stable tag. Ordinary development
   tasks still do not authorize release publication.

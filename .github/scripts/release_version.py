@@ -27,11 +27,23 @@ def format_version(version: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
-def release_date_version(release_date: date) -> str:
-    """Format a release date as Xray-style YY.M.D."""
+def release_date_version(
+    release_date: date,
+    tags: list[tuple[int, int, int]] | tuple[tuple[int, int, int], ...] = (),
+) -> str:
+    """Format a release date as Xray-style YY.M.D, advancing for same-day releases."""
     if release_date.year < 2000 or release_date.year > 2099:
         raise ValueError("calendar release versions support years 2000 through 2099")
-    return f"{release_date.year % 100:02d}.{release_date.month}.{release_date.day}"
+    year = release_date.year % 100
+    month = release_date.month
+    patch = release_date.day
+    latest_month_patch = max(
+        (tag[2] for tag in tags if tag[:2] == (year, month)),
+        default=0,
+    )
+    if latest_month_patch >= patch:
+        patch = latest_month_patch + 1
+    return f"{year:02d}.{month}.{patch}"
 
 
 def parse_release_date(value: str) -> date:
@@ -172,10 +184,12 @@ def release_plan(
 ) -> dict[str, str]:
     parse_version(workspace_version)
     latest_tag = max(tags) if tags else None
-    version = release_date_version(release_date)
-    if parse_version(version) in tags:
+    version = release_date_version(release_date, tags)
+    version_tuple = parse_version(version)
+    if latest_tag is not None and version_tuple <= latest_tag:
         raise ValueError(
-            f"release tag v{version} already exists; the calendar version scheme allows one release per UTC day"
+            f"generated release tag v{version} would not be newer than the latest tag "
+            f"v{format_version(latest_tag)}"
         )
     return {
         "workspace_version": workspace_version,
@@ -195,17 +209,24 @@ def append_github_output(path: Path, values: dict[str, str]) -> None:
 def self_test() -> None:
     assert parse_version("0.8.0") == (0, 8, 0)
     assert parse_release_date("2026-10-12") == date(2026, 10, 12)
-    plan = release_plan("0.10.0", [(0, 9, 1), (0, 10, 0)], date(2026, 10, 12))
-    assert plan["latest_tag_version"] == "0.10.0"
+    plan = release_plan("0.10.0", [(0, 9, 1), (0, 10, 0), (26, 10, 10)], date(2026, 10, 12))
+    assert plan["latest_tag_version"] == "26.10.10"
     assert plan["version"] == "26.10.12"
     assert plan["tag"] == "v26.10.12"
 
+    same_day_plan = release_plan("26.10.12", [(26, 10, 12)], date(2026, 10, 12))
+    assert same_day_plan["version"] == "26.10.13"
+    repeated_day_plan = release_plan(
+        "26.10.12", [(26, 10, 12), (26, 10, 13)], date(2026, 10, 12)
+    )
+    assert repeated_day_plan["version"] == "26.10.14"
+
     try:
-        release_plan("26.10.12", [(26, 10, 12)], date(2026, 10, 12))
+        release_plan("26.10.12", [(26, 11, 1)], date(2026, 10, 12))
     except ValueError as error:
-        assert "already exists" in str(error)
+        assert "would not be newer" in str(error)
     else:
-        raise AssertionError("a second release on the same UTC day must be rejected")
+        raise AssertionError("a release date behind the latest tag must be rejected")
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
