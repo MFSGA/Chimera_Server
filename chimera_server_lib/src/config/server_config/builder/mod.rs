@@ -724,11 +724,6 @@ fn build_api_tunnel_server(
     stream_settings: Option<crate::config::StreamSettings>,
     sniffing: Option<serde_json::Value>,
 ) -> Result<ServerConfig, Error> {
-    if port.is_some() {
-        return Err(Error::InvalidConfig(format!(
-            "api tunnel inbound {tag} must not configure a TCP/UDP port"
-        )));
-    }
     if settings.is_some() || stream_settings.is_some() || sniffing.is_some() {
         return Err(Error::InvalidConfig(format!(
             "api tunnel inbound {tag} must not configure proxy or stream settings"
@@ -736,19 +731,23 @@ fn build_api_tunnel_server(
     }
     let listen = listen.ok_or_else(|| {
         Error::InvalidConfig(format!(
-            "api tunnel inbound {tag} requires an abstract Unix listen name"
+            "api tunnel inbound {tag} requires a listen address"
         ))
     })?;
-    if !listen.starts_with('@') {
-        return Err(Error::InvalidConfig(format!(
-            "api tunnel inbound {tag} listen must start with @"
-        )));
-    }
+    let bind_port = match port {
+        Some(port) => port,
+        None if listen.starts_with('@') => 0,
+        None => {
+            return Err(Error::InvalidConfig(format!(
+                "api tunnel inbound {tag} requires port unless listen is an abstract Unix name"
+            )));
+        }
+    };
     Ok(ServerConfig {
         tag,
         bind_location: BindLocation::Address(NetLocation::new(
             Address::Hostname(listen),
-            0,
+            bind_port,
         )),
         protocol: ServerProxyConfig::Tunnel,
         transport: Transport::Tcp,

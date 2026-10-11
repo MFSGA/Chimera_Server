@@ -363,6 +363,9 @@ fn resolve_api_config(
 fn api_inbound_listen(inbound: &ServerConfig) -> Result<ApiListen, Error> {
     match &inbound.protocol {
         ServerProxyConfig::Tunnel => match &inbound.bind_location {
+            crate::address::BindLocation::Address(addr) if addr.port() != 0 => {
+                Ok(ApiListen::Tcp(addr.to_socket_addr()?))
+            }
             crate::address::BindLocation::Address(addr) => {
                 ApiListen::abstract_unix(&addr.address().to_string())
             }
@@ -1451,6 +1454,21 @@ mod tests {
         }
     }
 
+    fn make_tcp_tunnel_inbound(tag: &str, listen: &str, port: u16) -> ServerConfig {
+        ServerConfig {
+            tag: tag.to_string(),
+            bind_location: BindLocation::Address(NetLocation::new(
+                Address::from(listen).expect("valid API bind address"),
+                port,
+            )),
+            protocol: ServerProxyConfig::Tunnel,
+            transport: Transport::Tcp,
+            quic_settings: None,
+            sniffing: None,
+            tcp_socket_policy: None,
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn abstract_api_listen_validates_namespace_name() {
@@ -1565,6 +1583,35 @@ mod tests {
             Some(ApiListen::AbstractUnix("chimera-api".into()))
         );
         assert_eq!(resolved.inbound_tag.as_deref(), Some("chimera-api-in"));
+    }
+
+    #[test]
+    fn resolve_api_config_uses_tcp_tunnel_for_api_tag() {
+        let api = ApiConfig {
+            tag: Some("api".into()),
+            services: vec!["HandlerService".into(), "StatsService".into()],
+            listen: None,
+        };
+        let routing = RoutingConfig {
+            rules: vec![RuleConfig {
+                inbound_tag: vec!["api".into()],
+                outbound_tag: Some("api".into()),
+                ..RuleConfig::default()
+            }],
+            ..RoutingConfig::default()
+        };
+        let inbounds = vec![make_tcp_tunnel_inbound("api", "127.0.0.1", 62789)];
+
+        let resolved = resolve_api_config(Some(&api), Some(&routing), &inbounds)
+            .expect("TCP API tunnel should resolve from routing");
+
+        assert_eq!(
+            resolved.listen,
+            Some(ApiListen::Tcp(
+                "127.0.0.1:62789".parse().expect("valid API listen")
+            ))
+        );
+        assert_eq!(resolved.inbound_tag.as_deref(), Some("api"));
     }
 
     #[test]
