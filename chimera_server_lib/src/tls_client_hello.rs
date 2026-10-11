@@ -51,17 +51,9 @@ pub(crate) fn inspect_client_hello(input: &[u8]) -> ClientHelloInspection {
         handshake.extend_from_slice(payload);
 
         if handshake.len() >= 4 {
-            if handshake[0] != CLIENT_HELLO_HANDSHAKE_TYPE {
-                return ClientHelloInspection::NotTls;
-            }
-            let body_len = ((handshake[1] as usize) << 16)
-                | ((handshake[2] as usize) << 8)
-                | handshake[3] as usize;
-            if body_len > MAX_CLIENT_HELLO_BYTES - 4 {
-                return ClientHelloInspection::Malformed;
-            }
-            if handshake.len() >= body_len + 4 {
-                return parse_client_hello_body(&handshake[4..4 + body_len]);
+            match inspect_client_hello_handshake(&handshake) {
+                ClientHelloInspection::Incomplete => {}
+                inspection => return inspection,
             }
         }
 
@@ -72,7 +64,47 @@ pub(crate) fn inspect_client_hello(input: &[u8]) -> ClientHelloInspection {
     }
 }
 
-fn parse_client_hello_body(body: &[u8]) -> ClientHelloInspection {
+pub(crate) fn inspect_client_hello_handshake(
+    handshake: &[u8],
+) -> ClientHelloInspection {
+    inspect_client_hello_handshake_with_ech_precedence(handshake, true)
+}
+
+/// Inspect a QUIC ClientHello using Xray's QUIC behavior: Xray returns an
+/// outer SNI even when the ClientHello also carries an ECH extension.
+#[cfg(any(feature = "xray-tun", test))]
+pub(crate) fn inspect_client_hello_handshake_for_xray_quic(
+    handshake: &[u8],
+) -> ClientHelloInspection {
+    inspect_client_hello_handshake_with_ech_precedence(handshake, false)
+}
+
+fn inspect_client_hello_handshake_with_ech_precedence(
+    handshake: &[u8],
+    ech_takes_precedence: bool,
+) -> ClientHelloInspection {
+    if handshake.len() < 4 {
+        return ClientHelloInspection::Incomplete;
+    }
+    if handshake[0] != CLIENT_HELLO_HANDSHAKE_TYPE {
+        return ClientHelloInspection::NotTls;
+    }
+    let body_len = ((handshake[1] as usize) << 16)
+        | ((handshake[2] as usize) << 8)
+        | handshake[3] as usize;
+    if body_len > MAX_CLIENT_HELLO_BYTES - 4 {
+        return ClientHelloInspection::Malformed;
+    }
+    let Some(body) = handshake.get(4..4 + body_len) else {
+        return ClientHelloInspection::Incomplete;
+    };
+    parse_client_hello_body(body, ech_takes_precedence)
+}
+
+fn parse_client_hello_body(
+    body: &[u8],
+    ech_takes_precedence: bool,
+) -> ClientHelloInspection {
     let mut cursor = 0usize;
     if take(body, &mut cursor, 2 + 32).is_none() {
         return ClientHelloInspection::Malformed;
@@ -147,7 +179,7 @@ fn parse_client_hello_body(body: &[u8]) -> ClientHelloInspection {
         }
     }
 
-    if ech {
+    if ech && ech_takes_precedence {
         ClientHelloInspection::EncryptedClientHello
     } else if let Some(server_name) = server_name {
         ClientHelloInspection::ServerName(server_name)
@@ -265,6 +297,15 @@ mod tests {
         assert_eq!(
             inspect_client_hello(&client_hello(Some("public.example"), true)),
             ClientHelloInspection::EncryptedClientHello
+        );
+    }
+
+    #[test]
+    fn xray_quic_sniffing_uses_outer_server_name_when_ech_is_present() {
+        let hello = client_hello(Some("public.example"), true);
+        assert_eq!(
+            inspect_client_hello_handshake_for_xray_quic(&hello[TLS_HEADER_LEN..]),
+            ClientHelloInspection::ServerName("public.example".into())
         );
     }
 

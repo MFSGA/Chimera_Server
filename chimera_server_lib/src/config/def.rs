@@ -76,6 +76,30 @@ pub struct TunGatewayConfig {
     pub max_udp_sessions: usize,
 }
 
+/// Xray's `protocol: "tun"` inbound settings. Platform-specific behavior is
+/// compiled by the TUN runtime plan rather than folded into `tunGateway`.
+#[cfg(all(feature = "xray-tun", target_os = "linux"))]
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayTunConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub desc: String,
+    #[serde(default, rename = "mtu")]
+    pub mtu: u32,
+    #[serde(default)]
+    pub gateway: Vec<String>,
+    #[serde(default)]
+    pub dns: Vec<String>,
+    #[serde(default)]
+    pub user_level: u32,
+    #[serde(default)]
+    pub auto_system_routing_table: Vec<String>,
+    #[serde(default)]
+    pub auto_outbounds_interface: Option<String>,
+}
+
 fn default_tun_gateway_tcp_limit() -> usize {
     64
 }

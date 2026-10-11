@@ -1,8 +1,8 @@
-//! Linux site-to-site TUN ingress.
+//! Linux TUN ingress services.
 //!
-//! This is a device-owned gateway service, not an Xray TUN inbound. It feeds
-//! packets through watfaq-netstack, then sends accepted TCP and UDP flows
-//! through Chimera's existing Dokodemo routing paths.
+//! The device-owned `tunGateway` extension and Xray-compatible `protocol: "tun"`
+//! inbound have separate configuration plans and route ownership. Both feed
+//! packets through watfaq-netstack and Chimera's Dokodemo routing paths.
 
 use std::{
     collections::HashSet,
@@ -14,11 +14,14 @@ use std::{
     },
 };
 
-use crate::{Error, config::def::TunGatewayConfig};
+use crate::Error;
+#[cfg(any(feature = "tun-gateway", test))]
+use crate::config::def::TunGatewayConfig;
 use crate::{
     address::NetLocation,
     async_stream::{AsyncPing, AsyncStream},
     config::server_config::DokodemoDoorConfig,
+    config::server_config::InboundSniffingConfig,
     handler::{
         dokodemo::DokodemoDoorTcpHandler,
         tcp::tcp_handler::{TcpServerConnectionContext, TcpServerHandler},
@@ -27,7 +30,11 @@ use crate::{
     session::dispatcher::process_stream_with_context,
 };
 use futures::TryStreamExt;
-use rtnetlink::{Handle as NetlinkHandle, RouteMessageBuilder};
+#[cfg(feature = "xray-tun")]
+use rand::RngExt as _;
+use rtnetlink::Handle as NetlinkHandle;
+#[cfg(any(feature = "tun-gateway", feature = "xray-tun", test))]
+use rtnetlink::RouteMessageBuilder;
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -38,19 +45,31 @@ use watfaq_netstack::{NetStack, Packet, TcpStream};
 
 #[cfg(test)]
 const NETSTACK_MTU: usize = 1500;
+#[cfg(any(feature = "tun-gateway", test))]
 const MIN_TUN_GATEWAY_MTU: usize = 1280;
+#[cfg(any(feature = "tun-gateway", test))]
 const MAX_TUN_GATEWAY_MTU: usize = 9000;
+#[cfg(any(feature = "tun-gateway", feature = "xray-tun", test))]
 const NETSTACK_MAX_TCP_STREAMS: usize = 512;
+#[cfg(feature = "xray-tun")]
+const XRAY_TUN_MAX_UDP_SESSIONS: usize = 1024;
+#[cfg(feature = "xray-tun")]
+const XRAY_TUN_MIN_MTU: usize = 1280;
+#[cfg(any(feature = "tun-gateway", test))]
 const MAX_MANAGED_TUN_PREFIXES: usize = 128;
+#[cfg(any(feature = "tun-gateway", test))]
 const DEFAULT_TUN_ROUTE_TABLE: u32 = 10_001;
+#[cfg(any(feature = "tun-gateway", test))]
 const DEFAULT_TUN_ROUTE_RULE_PRIORITY: u32 = 10_001;
 
+#[cfg(any(feature = "tun-gateway", feature = "xray-tun", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IpPrefix {
     V4(Ipv4Addr, u8),
     V6(Ipv6Addr, u8),
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 impl IpPrefix {
     fn contains(self, address: IpAddr) -> bool {
         match (self, address) {
@@ -74,6 +93,7 @@ impl IpPrefix {
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 fn parse_managed_prefix(value: &str, field: &str) -> Result<IpPrefix, String> {
     let (address, prefix) = value
         .split_once('/')
@@ -108,6 +128,7 @@ fn parse_managed_prefix(value: &str, field: &str) -> Result<IpPrefix, String> {
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 fn parse_managed_prefixes(
     values: &[String],
     field: &str,
@@ -135,6 +156,7 @@ fn parse_managed_prefixes(
 
 #[derive(Debug)]
 struct TunDeviceCreateError {
+    device_kind: &'static str,
     device_name: String,
     source: std::io::Error,
 }
@@ -143,8 +165,8 @@ impl std::fmt::Display for TunDeviceCreateError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "failed to create tunGateway device {}: {}",
-            self.device_name, self.source
+            "failed to create {} device {}: {}",
+            self.device_kind, self.device_name, self.source
         )
     }
 }
@@ -155,6 +177,7 @@ impl std::error::Error for TunDeviceCreateError {
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 #[derive(Debug, Clone)]
 pub(crate) struct TunGatewayPlan {
     name: String,
@@ -173,6 +196,300 @@ pub(crate) struct TunGatewayPlan {
     max_udp_sessions: usize,
 }
 
+#[cfg(feature = "xray-tun")]
+use crate::{
+    config::def::{InboudItem, XrayTunConfig},
+    config::server_config::collect_sniffing_config,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct TunInterfaceAddress {
+    address: IpAddr,
+    prefix_len: u8,
+}
+
+#[cfg(feature = "xray-tun")]
+#[derive(Debug, Clone)]
+pub(crate) struct XrayTunPlan {
+    name: String,
+    mtu: usize,
+    gateway: Vec<TunInterfaceAddress>,
+    system_routes: Vec<IpPrefix>,
+    inbound_tag: String,
+    user_level: u32,
+    sniffing: Option<InboundSniffingConfig>,
+    quic_route_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TunForwardingPlan {
+    mtu: usize,
+    local_ipv4: Option<Ipv4Addr>,
+    local_ipv6: Option<Ipv6Addr>,
+    inbound_tag: String,
+    user_level: u32,
+    max_tcp_connections: usize,
+    max_udp_sessions: usize,
+    sniffing: Option<InboundSniffingConfig>,
+    quic_route_only: bool,
+    // The shared stack repairs invalid IPv4 Echo Request checksums only for
+    // Xray TUN, after IP fragments have been reassembled.
+    accept_invalid_ipv4_icmp_echo_checksum: bool,
+}
+
+#[cfg(any(feature = "tun-gateway", test))]
+impl TunGatewayPlan {
+    fn forwarding_plan(&self) -> TunForwardingPlan {
+        TunForwardingPlan {
+            mtu: self.mtu,
+            local_ipv4: Some(self.address),
+            local_ipv6: self.ipv6_address.map(|(address, _)| address),
+            inbound_tag: self.inbound_tag.clone(),
+            user_level: self.user_level,
+            max_tcp_connections: self.max_tcp_connections,
+            max_udp_sessions: self.max_udp_sessions,
+            sniffing: None,
+            quic_route_only: false,
+            accept_invalid_ipv4_icmp_echo_checksum: false,
+        }
+    }
+}
+
+#[cfg(feature = "xray-tun")]
+impl XrayTunPlan {
+    pub(crate) fn tag(&self) -> &str {
+        &self.inbound_tag
+    }
+
+    pub(crate) fn try_from(item: InboudItem) -> Result<Self, String> {
+        if !matches!(item.protocol, crate::config::Protocol::Tun) {
+            return Err("expected an Xray TUN inbound".into());
+        }
+        let config = item
+            .settings
+            .as_ref()
+            .map(|settings| settings.deserialize::<XrayTunConfig>())
+            .transpose()
+            .map_err(|error| format!("invalid tun settings: {error}"))?
+            .unwrap_or_default();
+        let mtu = if config.mtu == 0 { 1500 } else { config.mtu };
+        if !(XRAY_TUN_MIN_MTU as u32..=u16::MAX as u32).contains(&mtu) {
+            return Err(format!(
+                "inbound tun settings.mtu must be from {XRAY_TUN_MIN_MTU} to {} on Linux",
+                u16::MAX
+            ));
+        }
+        let name = if config.name.is_empty() {
+            available_xray_tun_name()?
+        } else {
+            validate_xray_tun_name(&config.name)?
+        };
+        let gateway = config
+            .gateway
+            .iter()
+            .map(|address| parse_tun_interface_address(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        let system_routes =
+            parse_xray_system_routes(&config.auto_system_routing_table)?;
+        // Xray's Linux backend does not consume desc, dns, or
+        // autoOutboundsInterface; retain its platform-specific no-op behavior.
+        let _linux_unused_settings =
+            (config.desc, config.dns, config.auto_outbounds_interface);
+        let quic_override = item
+            .sniffing
+            .as_ref()
+            .is_some_and(sniffing_requests_quic_override);
+        let quic_sniffing_enabled = quic_override
+            && item
+                .sniffing
+                .as_ref()
+                .and_then(|sniffing| sniffing.get("enabled"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        let quic_route_only = quic_sniffing_enabled
+            && item
+                .sniffing
+                .as_ref()
+                .and_then(|sniffing| sniffing.get("routeOnly"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        if quic_sniffing_enabled && !quic_route_only {
+            return Err(
+                "inbound tun sniffing.destOverride=quic currently requires routeOnly=true; UDP destination override is not implemented yet".into(),
+            );
+        }
+        let sniffing = collect_sniffing_config(&item.tag, item.sniffing)
+            .map_err(|error| error.to_string())?;
+
+        Ok(Self {
+            name,
+            mtu: mtu as usize,
+            gateway,
+            system_routes,
+            inbound_tag: item.tag,
+            user_level: config.user_level,
+            sniffing,
+            quic_route_only,
+        })
+    }
+
+    fn forwarding_plan(&self) -> TunForwardingPlan {
+        TunForwardingPlan {
+            mtu: self.mtu,
+            local_ipv4: self.gateway.iter().find_map(|address| {
+                match address.address {
+                    IpAddr::V4(address) => Some(address),
+                    IpAddr::V6(_) => None,
+                }
+            }),
+            local_ipv6: self.gateway.iter().find_map(|address| {
+                match address.address {
+                    IpAddr::V6(address) => Some(address),
+                    IpAddr::V4(_) => None,
+                }
+            }),
+            inbound_tag: self.inbound_tag.clone(),
+            user_level: self.user_level,
+            max_tcp_connections: NETSTACK_MAX_TCP_STREAMS,
+            max_udp_sessions: XRAY_TUN_MAX_UDP_SESSIONS,
+            sniffing: self.sniffing.clone(),
+            quic_route_only: self.quic_route_only,
+            accept_invalid_ipv4_icmp_echo_checksum: true,
+        }
+    }
+}
+
+#[cfg(feature = "xray-tun")]
+fn parse_xray_system_routes(values: &[String]) -> Result<Vec<IpPrefix>, String> {
+    let mut parsed = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        let route = parse_xray_system_route(value)?;
+        if !seen.insert(route) {
+            return Err(format!(
+                "inbound tun settings.autoSystemRoutingTable contains duplicate route {value}"
+            ));
+        }
+        parsed.push(route);
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "xray-tun")]
+fn parse_xray_system_route(value: &str) -> Result<IpPrefix, String> {
+    let (address, prefix) = value.split_once('/').ok_or_else(|| {
+        "inbound tun settings.autoSystemRoutingTable entries must be IP CIDRs"
+            .to_string()
+    })?;
+    let address = address.parse::<IpAddr>().map_err(|_| {
+        "inbound tun settings.autoSystemRoutingTable entries must be IP CIDRs"
+            .to_string()
+    })?;
+    let prefix = prefix.parse::<u8>().map_err(|_| {
+        "inbound tun settings.autoSystemRoutingTable entries must use valid prefix lengths"
+            .to_string()
+    })?;
+    match address {
+        IpAddr::V4(address) if prefix <= 32 => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            Ok(IpPrefix::V4(
+                Ipv4Addr::from(u32::from(address) & mask),
+                prefix,
+            ))
+        }
+        IpAddr::V6(address) if prefix <= 128 => {
+            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            Ok(IpPrefix::V6(
+                Ipv6Addr::from(u128::from(address) & mask),
+                prefix,
+            ))
+        }
+        IpAddr::V4(_) => Err(
+            "inbound tun settings.autoSystemRoutingTable IPv4 prefix must not exceed 32"
+                .into(),
+        ),
+        IpAddr::V6(_) => Err(
+            "inbound tun settings.autoSystemRoutingTable IPv6 prefix must not exceed 128"
+                .into(),
+        ),
+    }
+}
+
+#[cfg(feature = "xray-tun")]
+fn sniffing_requests_quic_override(sniffing: &serde_json::Value) -> bool {
+    sniffing
+        .get("destOverride")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|protocols| {
+            protocols.iter().any(|protocol| {
+                protocol
+                    .as_str()
+                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case("quic"))
+            })
+        })
+}
+
+#[cfg(feature = "xray-tun")]
+fn validate_xray_tun_name(name: &str) -> Result<String, String> {
+    if name.is_empty()
+        || name.len() > 15
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
+        return Err(
+            "inbound tun settings.name must contain 1-15 ASCII letters, digits, '.', '_' or '-'"
+                .into(),
+        );
+    }
+    Ok(name.to_owned())
+}
+
+#[cfg(feature = "xray-tun")]
+fn available_xray_tun_name() -> Result<String, String> {
+    let interfaces = std::fs::read_dir("/sys/class/net").map_err(|error| {
+        format!("failed to list Linux network interfaces: {error}")
+    })?;
+    let used = interfaces
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<HashSet<_>>();
+    let start = rand::rng().random_range(10..=1024);
+    for offset in 0..=1014 {
+        let index = 10 + (start - 10 + offset) % 1015;
+        let name = format!("utun{index}");
+        if !used.contains(std::ffi::OsStr::new(&name)) {
+            return Ok(name);
+        }
+    }
+    Err("no available Linux TUN name in range utun10-utun1024".into())
+}
+
+#[cfg(feature = "xray-tun")]
+fn parse_tun_interface_address(value: &str) -> Result<TunInterfaceAddress, String> {
+    let (address, prefix) = value.split_once('/').ok_or_else(|| {
+        "inbound tun settings.gateway entries must be IP CIDRs".to_string()
+    })?;
+    let address = address.parse::<IpAddr>().map_err(|_| {
+        "inbound tun settings.gateway entries must be IP CIDRs".to_string()
+    })?;
+    let prefix_len = prefix.parse::<u8>().map_err(|_| {
+        "inbound tun settings.gateway entries must use valid prefix lengths"
+            .to_string()
+    })?;
+    let max_prefix = if address.is_ipv4() { 32 } else { 128 };
+    if prefix_len > max_prefix {
+        return Err(format!(
+            "inbound tun settings.gateway prefix length must not exceed {max_prefix}"
+        ));
+    }
+    Ok(TunInterfaceAddress {
+        address,
+        prefix_len,
+    })
+}
+
+#[cfg(any(feature = "tun-gateway", test))]
 impl TryFrom<TunGatewayConfig> for TunGatewayPlan {
     type Error = String;
 
@@ -334,6 +651,7 @@ impl TryFrom<TunGatewayConfig> for TunGatewayPlan {
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 fn parse_ipv6_interface_address(value: &str) -> Result<(Ipv6Addr, u8), String> {
     let (address, prefix_len) = value
         .split_once('/')
@@ -357,6 +675,7 @@ pub(crate) struct TunGatewayTask {
     pub(crate) cancellation: CancellationToken,
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 pub(crate) async fn start_server(
     plan: TunGatewayPlan,
     runtime: DataPlaneRuntime,
@@ -386,6 +705,7 @@ pub(crate) async fn start_server(
         Error::Io(std::io::Error::new(
             error_kind,
             TunDeviceCreateError {
+                device_kind: "tunGateway",
                 device_name: plan.name.clone(),
                 source: error,
             },
@@ -428,15 +748,97 @@ pub(crate) async fn start_server(
     let cancellation = CancellationToken::new();
     let task = tokio::spawn(run_server_with_routing(
         device,
-        plan,
+        plan.forwarding_plan(),
         runtime,
         cancellation.clone(),
         managed_routing,
+        None,
+        None,
+    ));
+    Ok(TunGatewayTask { task, cancellation })
+}
+
+#[cfg(feature = "xray-tun")]
+pub(crate) async fn start_xray_tun_server(
+    plan: XrayTunPlan,
+    runtime: DataPlaneRuntime,
+) -> Result<TunGatewayTask, Error> {
+    if plan
+        .system_routes
+        .iter()
+        .any(|route| matches!(route, IpPrefix::V4(_, 0) | IpPrefix::V6(_, 0)))
+    {
+        tracing::warn!(
+            inbound_tag = %plan.inbound_tag,
+            "Xray TUN installs a default route that may capture this server's own outbound connections; configure an escape route when needed"
+        );
+    }
+
+    let mut config = tun::Configuration::default();
+    config
+        .tun_name(&plan.name)
+        .mtu(plan.mtu as u16)
+        .layer(tun::Layer::L3)
+        .up();
+    config.platform_config(|platform| {
+        platform.ensure_root_privileges(true);
+    });
+
+    let device = tun::create_as_async(&config).map_err(|error| {
+        let error = std::io::Error::from(error);
+        let error_kind = error.kind();
+        tracing::error!(
+            tun_name = %plan.name,
+            error_kind = ?error_kind,
+            raw_os_error = ?error.raw_os_error(),
+            %error,
+            "failed to create Xray TUN inbound device"
+        );
+        Error::Io(std::io::Error::new(
+            error_kind,
+            TunDeviceCreateError {
+                device_kind: "Xray TUN",
+                device_name: plan.name.clone(),
+                source: error,
+            },
+        ))
+    })?;
+    let addresses = install_xray_tun_addresses(&plan).await?;
+    let system_routes = match install_xray_tun_system_routes(&plan).await {
+        Ok(routes) => routes,
+        Err(error) => {
+            if let Some(addresses) = addresses
+                && let Err(cleanup_error) = addresses.remove().await
+            {
+                tracing::error!(%cleanup_error, "failed to roll back Xray TUN addresses after route setup error");
+            }
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        tun_name = %plan.name,
+        mtu = plan.mtu,
+        gateway_addresses = plan.gateway.len(),
+        system_routes = plan.system_routes.len(),
+        inbound_tag = %plan.inbound_tag,
+        "starting Linux Xray TUN inbound"
+    );
+
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn(run_server_with_routing(
+        device,
+        plan.forwarding_plan(),
+        runtime,
+        cancellation.clone(),
+        None,
+        addresses,
+        system_routes,
     ));
     Ok(TunGatewayTask { task, cancellation })
 }
 
 #[derive(Debug)]
+#[cfg(any(feature = "tun-gateway", test))]
 struct TunIpv6AddressConfigureError {
     device_name: String,
     address: Ipv6Addr,
@@ -444,6 +846,7 @@ struct TunIpv6AddressConfigureError {
     source: std::io::Error,
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 impl std::fmt::Display for TunIpv6AddressConfigureError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -454,12 +857,14 @@ impl std::fmt::Display for TunIpv6AddressConfigureError {
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 impl std::error::Error for TunIpv6AddressConfigureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 async fn configure_ipv6_tun_address(
     device_name: &str,
     address: Ipv6Addr,
@@ -510,6 +915,200 @@ struct ManagedTunRouting {
     rules: Vec<rtnetlink::packet_route::rule::RuleMessage>,
 }
 
+struct ManagedTunAddresses {
+    handle: NetlinkHandle,
+    _connection: AbortOnDropNetlinkTask,
+    interface_index: u32,
+    addresses: Vec<TunInterfaceAddress>,
+}
+
+struct ManagedTunSystemRoutes {
+    handle: NetlinkHandle,
+    _connection: AbortOnDropNetlinkTask,
+    routes: Vec<rtnetlink::packet_route::route::RouteMessage>,
+}
+
+impl ManagedTunSystemRoutes {
+    async fn remove(mut self) -> std::io::Result<()> {
+        let mut first_error = None;
+        for route in self.routes.drain(..).rev() {
+            if let Err(error) = self.handle.route().del(route).execute().await {
+                tracing::warn!(%error, "failed to remove an Xray TUN system route");
+                first_error.get_or_insert_with(|| std::io::Error::other(error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl ManagedTunAddresses {
+    async fn remove(mut self) -> std::io::Result<()> {
+        let mut first_error = None;
+        for address in self.addresses.drain(..).rev() {
+            let message = tun_address_message(self.interface_index, address);
+            if let Err(error) = self.handle.address().del(message).execute().await {
+                tracing::warn!(
+                    tun_address = %format_args!("{}/{}", address.address, address.prefix_len),
+                    %error,
+                    "failed to remove an Xray TUN inbound interface address"
+                );
+                first_error.get_or_insert_with(|| std::io::Error::other(error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "xray-tun")]
+async fn install_xray_tun_addresses(
+    plan: &XrayTunPlan,
+) -> Result<Option<ManagedTunAddresses>, Error> {
+    if plan.gateway.is_empty() {
+        return Ok(None);
+    }
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(|source| {
+        Error::Io(std::io::Error::other(format!(
+            "failed to open route-netlink for Xray TUN inbound: {source}"
+        )))
+    })?;
+    let connection = AbortOnDropNetlinkTask(tokio::spawn(connection));
+    let mut links = handle.link().get().match_name(plan.name.clone()).execute();
+    let link = links
+        .try_next()
+        .await
+        .map_err(|source| {
+            Error::Io(std::io::Error::other(format!(
+                "failed to find Xray TUN interface {}: {source}",
+                plan.name
+            )))
+        })?
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Xray TUN interface {} was not found", plan.name),
+            ))
+        })?;
+    let mut managed = ManagedTunAddresses {
+        handle,
+        _connection: connection,
+        interface_index: link.header.index,
+        addresses: Vec::with_capacity(plan.gateway.len()),
+    };
+    for address in &plan.gateway {
+        if let Err(source) = managed
+            .handle
+            .address()
+            .add(managed.interface_index, address.address, address.prefix_len)
+            .execute()
+            .await
+        {
+            let error = Error::Io(std::io::Error::other(format!(
+                "failed to add Xray TUN gateway address {}/{}: {source}",
+                address.address, address.prefix_len
+            )));
+            if let Err(cleanup_error) = managed.remove().await {
+                tracing::error!(%cleanup_error, "failed to roll back partial Xray TUN address setup");
+            }
+            return Err(error);
+        }
+        managed.addresses.push(*address);
+    }
+    Ok(Some(managed))
+}
+
+fn tun_address_message(
+    interface_index: u32,
+    address: TunInterfaceAddress,
+) -> rtnetlink::packet_route::address::AddressMessage {
+    let prefix_len = address.prefix_len;
+    match address.address {
+        IpAddr::V4(ip) => rtnetlink::AddressMessageBuilder::<Ipv4Addr>::new()
+            .index(interface_index)
+            .address(ip, prefix_len)
+            .build(),
+        IpAddr::V6(ip) => rtnetlink::AddressMessageBuilder::<Ipv6Addr>::new()
+            .index(interface_index)
+            .address(ip, prefix_len)
+            .build(),
+    }
+}
+
+#[cfg(feature = "xray-tun")]
+fn build_xray_system_route(
+    prefix: IpPrefix,
+    interface_index: u32,
+) -> rtnetlink::packet_route::route::RouteMessage {
+    match prefix {
+        IpPrefix::V4(network, length) => RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(network, length)
+            .output_interface(interface_index)
+            .priority(1)
+            .build(),
+        IpPrefix::V6(network, length) => RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(network, length)
+            .output_interface(interface_index)
+            .priority(1)
+            .build(),
+    }
+}
+
+#[cfg(feature = "xray-tun")]
+async fn install_xray_tun_system_routes(
+    plan: &XrayTunPlan,
+) -> Result<Option<ManagedTunSystemRoutes>, Error> {
+    if plan.system_routes.is_empty() {
+        return Ok(None);
+    }
+
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(|source| {
+        Error::Io(std::io::Error::other(format!(
+            "failed to open route-netlink for Xray TUN system routes: {source}"
+        )))
+    })?;
+    let connection = AbortOnDropNetlinkTask(tokio::spawn(connection));
+    let mut links = handle.link().get().match_name(plan.name.clone()).execute();
+    let link = links
+        .try_next()
+        .await
+        .map_err(|source| {
+            Error::Io(std::io::Error::other(format!(
+                "failed to find Xray TUN interface {} for system routes: {source}",
+                plan.name
+            )))
+        })?
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Xray TUN interface {} was not found for system routes",
+                    plan.name
+                ),
+            ))
+        })?;
+    let mut managed = ManagedTunSystemRoutes {
+        handle,
+        _connection: connection,
+        routes: Vec::with_capacity(plan.system_routes.len()),
+    };
+
+    for prefix in &plan.system_routes {
+        let route = build_xray_system_route(*prefix, link.header.index);
+        if let Err(source) =
+            managed.handle.route().add(route.clone()).execute().await
+        {
+            let error = Error::Io(std::io::Error::other(format!(
+                "failed to install Xray TUN system route {prefix:?}: {source}"
+            )));
+            if let Err(cleanup_error) = managed.remove().await {
+                tracing::error!(%cleanup_error, "failed to roll back partial Xray TUN system routes");
+            }
+            return Err(error);
+        }
+        managed.routes.push(route);
+    }
+    Ok(Some(managed))
+}
+
 impl ManagedTunRouting {
     async fn remove(mut self) -> std::io::Result<()> {
         let mut first_error = None;
@@ -529,6 +1128,7 @@ impl ManagedTunRouting {
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 fn build_tun_route(
     prefix: IpPrefix,
     interface_index: u32,
@@ -552,6 +1152,7 @@ fn build_tun_route(
     }
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 fn build_tun_source_rule(
     prefix: IpPrefix,
     input_interface: &str,
@@ -601,6 +1202,7 @@ fn build_tun_source_rule(
     message
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 async fn install_tun_routing(
     plan: &TunGatewayPlan,
 ) -> Result<Option<ManagedTunRouting>, Error> {
@@ -733,6 +1335,7 @@ async fn install_tun_routing(
     Ok(Some(managed))
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 async fn verify_managed_route_table_is_empty(
     handle: &NetlinkHandle,
     table_id: u32,
@@ -765,6 +1368,7 @@ async fn verify_managed_route_table_is_empty(
     Ok(())
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 async fn verify_rule_priority_is_available(
     handle: &NetlinkHandle,
     priority: u32,
@@ -793,6 +1397,7 @@ async fn verify_rule_priority_is_available(
     Ok(())
 }
 
+#[cfg(any(feature = "tun-gateway", test))]
 fn prefix_netmask(prefix_len: u8) -> Ipv4Addr {
     Ipv4Addr::from(u32::MAX << (32 - prefix_len))
 }
@@ -804,20 +1409,47 @@ async fn run_server<D: PacketDevice + 'static>(
     runtime: DataPlaneRuntime,
     cancellation: CancellationToken,
 ) -> Result<(), Error> {
-    run_server_with_routing(device, plan, runtime, cancellation, None).await
+    run_server_with_routing(
+        device,
+        plan.forwarding_plan(),
+        runtime,
+        cancellation,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "xray-tun"))]
+async fn run_forwarding_server<D: PacketDevice + 'static>(
+    device: D,
+    plan: TunForwardingPlan,
+    runtime: DataPlaneRuntime,
+    cancellation: CancellationToken,
+) -> Result<(), Error> {
+    run_server_with_routing(device, plan, runtime, cancellation, None, None, None)
+        .await
 }
 
 async fn run_server_with_routing<D: PacketDevice + 'static>(
     device: D,
-    plan: TunGatewayPlan,
+    plan: TunForwardingPlan,
     runtime: DataPlaneRuntime,
     cancellation: CancellationToken,
     managed_routing: Option<ManagedTunRouting>,
+    managed_addresses: Option<ManagedTunAddresses>,
+    managed_system_routes: Option<ManagedTunSystemRoutes>,
 ) -> Result<(), Error> {
     use futures::{SinkExt, StreamExt};
 
     let (stack, mut tcp_listener, udp_socket) =
-        NetStack::new_with_mtu(plan.mtu).map_err(Error::Io)?;
+        if plan.accept_invalid_ipv4_icmp_echo_checksum {
+            NetStack::new_with_mtu_xray_tun_compat(plan.mtu)
+        } else {
+            NetStack::new_with_mtu(plan.mtu)
+        }
+        .map_err(Error::Io)?;
     let (mut packet_sink, mut packet_stream) = stack.split();
     let (mut udp_reader, udp_writer) = udp_socket.split();
     let udp_reply: NetstackUdpReply =
@@ -841,11 +1473,17 @@ async fn run_server_with_routing<D: PacketDevice + 'static>(
         runtime.clone(),
         Arc::new(NetstackUdpReplySink::new(
             udp_reply,
-            Some(SocketAddr::new(plan.address.into(), 0)),
-            plan.ipv6_address
-                .map(|(address, _)| SocketAddr::new(address.into(), 0)),
+            plan.local_ipv4
+                .map(|address| SocketAddr::new(address.into(), 0)),
+            plan.local_ipv6
+                .map(|address| SocketAddr::new(address.into(), 0)),
         )),
         plan.max_udp_sessions,
+    )
+    .with_route_only_quic_sniffing(
+        plan.quic_route_only
+            .then(|| plan.sniffing.clone())
+            .flatten(),
     );
     let tcp_slots = Arc::new(Semaphore::new(plan.max_tcp_connections));
     let udp_failures = AtomicUsize::new(0);
@@ -965,6 +1603,7 @@ async fn run_server_with_routing<D: PacketDevice + 'static>(
                     ..TcpServerConnectionContext::default()
                 };
                 let resolver = runtime.resolver();
+                let sniffing = plan.sniffing.clone();
                 if !runtime.spawn_inbound_connection(async move {
                     let _permit = permit;
                     if let Err(error) = process_stream_with_context(
@@ -977,7 +1616,7 @@ async fn run_server_with_routing<D: PacketDevice + 'static>(
                         source,
                         connection_runtime,
                         connection_context,
-                        None,
+                        sniffing,
                     )
                     .await
                     {
@@ -1014,12 +1653,28 @@ async fn run_server_with_routing<D: PacketDevice + 'static>(
         }
     };
 
+    // Stop the QUIC SNI timeout workers before draining forwarding state.
+    udp_forwarder.shutdown().await;
+
     // Join the netstack's internal packet engine before releasing the device.
     if let Err(error) = tcp_listener.shutdown().await {
         tracing::error!(
             inbound_tag = %plan.inbound_tag,
             %error,
             "TUN TCP packet engine failed to shut down cleanly"
+        );
+        if terminal_error.is_none() {
+            terminal_error = Some(Error::Io(error));
+        }
+    }
+
+    if let Some(managed_system_routes) = managed_system_routes
+        && let Err(error) = managed_system_routes.remove().await
+    {
+        tracing::error!(
+            inbound_tag = %plan.inbound_tag,
+            %error,
+            "failed to remove Xray TUN system routes during shutdown"
         );
         if terminal_error.is_none() {
             terminal_error = Some(Error::Io(error));
@@ -1033,6 +1688,19 @@ async fn run_server_with_routing<D: PacketDevice + 'static>(
             inbound_tag = %plan.inbound_tag,
             %error,
             "failed to remove managed TUN routes during shutdown"
+        );
+        if terminal_error.is_none() {
+            terminal_error = Some(Error::Io(error));
+        }
+    }
+
+    if let Some(managed_addresses) = managed_addresses
+        && let Err(error) = managed_addresses.remove().await
+    {
+        tracing::error!(
+            inbound_tag = %plan.inbound_tag,
+            %error,
+            "failed to remove Xray TUN gateway addresses during shutdown"
         );
         if terminal_error.is_none() {
             terminal_error = Some(Error::Io(error));
@@ -1229,7 +1897,7 @@ mod tests {
         net::TcpListener as HostTcpListener,
         net::UdpSocket as HostUdpSocket,
         sync::{Mutex, mpsc, oneshot},
-        time::timeout,
+        time::{sleep, timeout},
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1264,6 +1932,11 @@ mod tests {
             },
         },
     };
+    #[cfg(all(feature = "xray-tun", not(feature = "vless-reverse")))]
+    use crate::{
+        config::rule::{NetworkListConfig, RoutingConfig, RuleConfig},
+        routing_state::RoutingState,
+    };
     #[cfg(feature = "vless-reverse")]
     use bytes::Bytes;
 
@@ -1285,6 +1958,207 @@ mod tests {
             max_tcp_connections: 32,
             max_udp_sessions: 128,
         }
+    }
+
+    #[cfg(feature = "xray-tun")]
+    fn xray_tun_inbound(settings: serde_json::Value) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "protocol": "tun",
+            "tag": "xray-tun",
+            "settings": settings
+        }))
+        .expect("valid Xray TUN inbound shape")
+    }
+
+    #[cfg(feature = "xray-tun")]
+    fn xray_tun_inbound_with_sniffing(
+        settings: serde_json::Value,
+        sniffing: serde_json::Value,
+    ) -> InboudItem {
+        serde_json::from_value(serde_json::json!({
+            "protocol": "tun",
+            "tag": "xray-tun",
+            "settings": settings,
+            "sniffing": sniffing
+        }))
+        .expect("valid Xray TUN inbound with top-level sniffing")
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[test]
+    fn xray_tun_config_uses_xray_defaults_and_compiles_gateway_addresses() {
+        let plan = XrayTunPlan::try_from(xray_tun_inbound(serde_json::json!({
+            "name": "chimera-tun",
+            "mtu": 1280,
+            "gateway": ["10.10.0.1/24", "fd10::1/64"],
+            "userLevel": 3,
+            "autoSystemRoutingTable": [
+                "192.0.2.99/24",
+                "0.0.0.0/0",
+                "2001:db8::9/64"
+            ],
+            "autoOutboundsInterface": "eth0"
+        })))
+        .expect("valid Xray TUN config");
+
+        assert_eq!(plan.name, "chimera-tun");
+        assert_eq!(plan.mtu, 1280);
+        assert_eq!(plan.user_level, 3);
+        assert_eq!(plan.tag(), "xray-tun");
+        assert_eq!(
+            plan.system_routes,
+            vec![
+                IpPrefix::V4("192.0.2.0".parse().unwrap(), 24),
+                IpPrefix::V4(Ipv4Addr::UNSPECIFIED, 0),
+                IpPrefix::V6("2001:db8::".parse().unwrap(), 64),
+            ]
+        );
+        let forwarding = plan.forwarding_plan();
+        assert_eq!(forwarding.local_ipv4, Some("10.10.0.1".parse().unwrap()));
+        assert_eq!(forwarding.local_ipv6, Some("fd10::1".parse().unwrap()));
+        assert_eq!(forwarding.max_tcp_connections, NETSTACK_MAX_TCP_STREAMS);
+        assert_eq!(forwarding.max_udp_sessions, XRAY_TUN_MAX_UDP_SESSIONS);
+        assert_eq!(forwarding.inbound_tag, "xray-tun");
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[test]
+    fn xray_tun_config_defaults_name_and_mtu_like_xray() {
+        let plan = XrayTunPlan::try_from(xray_tun_inbound(serde_json::json!({})))
+            .expect("default Xray TUN config");
+
+        let index = plan
+            .name
+            .strip_prefix("utun")
+            .expect("default Xray TUN name uses utun prefix")
+            .parse::<u16>()
+            .expect("default Xray TUN name has numeric suffix");
+        assert!((10..=1024).contains(&index));
+        assert_eq!(plan.mtu, 1500);
+        assert!(plan.gateway.is_empty());
+        assert_eq!(plan.user_level, 0);
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[test]
+    fn xray_tun_auto_routes_use_main_table_and_xray_metric() {
+        use rtnetlink::packet_route::{AddressFamily, route::RouteAttribute};
+
+        let route = build_xray_system_route(
+            IpPrefix::V4("192.0.2.0".parse().unwrap(), 24),
+            42,
+        );
+        assert_eq!(route.header.address_family, AddressFamily::Inet);
+        assert_eq!(route.header.table, 254);
+        assert_eq!(route.header.destination_prefix_length, 24);
+        assert!(route.attributes.contains(&RouteAttribute::Destination(
+            rtnetlink::packet_route::route::RouteAddress::Inet(
+                "192.0.2.0".parse().unwrap()
+            )
+        )));
+        assert!(route.attributes.contains(&RouteAttribute::Oif(42)));
+        assert!(route.attributes.contains(&RouteAttribute::Priority(1)));
+
+        let default_route =
+            build_xray_system_route(IpPrefix::V6(Ipv6Addr::UNSPECIFIED, 0), 43);
+        assert_eq!(default_route.header.address_family, AddressFamily::Inet6);
+        assert_eq!(default_route.header.destination_prefix_length, 0);
+        assert!(default_route.attributes.contains(&RouteAttribute::Oif(43)));
+        assert!(
+            default_route
+                .attributes
+                .contains(&RouteAttribute::Priority(1))
+        );
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[test]
+    fn xray_tun_config_rejects_invalid_device_routes_and_udp_quic_override() {
+        for (settings, expected_error) in [
+            (
+                serde_json::json!({"name": "interface-name-too-long"}),
+                "settings.name",
+            ),
+            (serde_json::json!({"mtu": 1279}), "settings.mtu"),
+            (serde_json::json!({"mtu": 65536}), "settings.mtu"),
+            (
+                serde_json::json!({"gateway": ["10.0.0.1/33"]}),
+                "prefix length",
+            ),
+            (
+                serde_json::json!({"gateway": ["not-an-address"]}),
+                "IP CIDRs",
+            ),
+            (
+                serde_json::json!({"autoSystemRoutingTable": ["not-a-route"]}),
+                "autoSystemRoutingTable entries must be IP CIDRs",
+            ),
+            (
+                serde_json::json!({"autoSystemRoutingTable": ["2001:db8::1/129"]}),
+                "prefix must not exceed 128",
+            ),
+            (
+                serde_json::json!({
+                    "autoSystemRoutingTable": ["192.0.2.1/24", "192.0.2.0/24"]
+                }),
+                "contains duplicate route",
+            ),
+        ] {
+            let error = XrayTunPlan::try_from(xray_tun_inbound(settings))
+                .expect_err("invalid Xray TUN device value must be rejected");
+            assert!(error.contains(expected_error), "{error}");
+        }
+
+        let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+            "protocol": "tun",
+            "tag": "xray-tun",
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["quic"]
+            }
+        }))
+        .expect("valid Xray TUN sniffing shape");
+        let error = XrayTunPlan::try_from(inbound)
+            .expect_err("UDP QUIC destination rewrite must fail explicitly");
+        assert!(error.contains("routeOnly=true"), "{error}");
+
+        let route_only = XrayTunPlan::try_from(xray_tun_inbound_with_sniffing(
+            serde_json::json!({}),
+            serde_json::json!({
+                "enabled": true,
+                "destOverride": ["quic"],
+                "routeOnly": true
+            }),
+        ))
+        .expect("route-only QUIC SNI sniffing is supported for TUN UDP");
+        assert!(route_only.quic_route_only);
+        assert!(route_only.forwarding_plan().quic_route_only);
+
+        let disabled = XrayTunPlan::try_from(xray_tun_inbound_with_sniffing(
+            serde_json::json!({}),
+            serde_json::json!({"destOverride": ["quic"]}),
+        ))
+        .expect("disabled Xray sniffing remains a no-op");
+        assert!(!disabled.quic_route_only);
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[test]
+    fn xray_tun_config_compiles_sniffing_for_the_shared_dispatcher() {
+        let plan = XrayTunPlan::try_from(
+            serde_json::from_value(serde_json::json!({
+                "protocol": "tun",
+                "tag": "sniffing-tun",
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["http", "tls"]
+                }
+            }))
+            .expect("valid Xray TUN inbound shape"),
+        )
+        .expect("valid TUN sniffing settings");
+
+        assert!(plan.sniffing.is_some());
     }
 
     #[cfg(feature = "vless-reverse")]
@@ -2025,6 +2899,61 @@ mod tests {
         .expect("TUN UDP response timed out")
     }
 
+    #[cfg(feature = "xray-tun")]
+    async fn next_icmp_echo_reply(
+        packets: &mut mpsc::Receiver<Vec<u8>>,
+        ipv6: bool,
+        expected_payload: &[u8],
+    ) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = packets.recv().await.expect("memory TUN output closed");
+                let Ok(packet) = SlicedPacket::from_ip(&packet) else {
+                    continue;
+                };
+                let echo_reply = match packet.transport {
+                    Some(TransportSlice::Icmpv4(icmp)) if !ipv6 => {
+                        matches!(
+                            icmp.icmp_type(),
+                            etherparse::Icmpv4Type::EchoReply(_)
+                        ) && icmp.payload() == expected_payload
+                    }
+                    Some(TransportSlice::Icmpv6(icmp)) if ipv6 => {
+                        matches!(
+                            icmp.icmp_type(),
+                            etherparse::Icmpv6Type::EchoReply(_)
+                        ) && icmp.payload() == expected_payload
+                    }
+                    _ => false,
+                };
+                if echo_reply {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("TUN ICMP echo reply timed out");
+    }
+
+    #[cfg(feature = "xray-tun")]
+    async fn assert_xray_tun_drops_without_response(
+        incoming: &mpsc::Sender<Vec<u8>>,
+        packets: &mut mpsc::Receiver<Vec<u8>>,
+        packet: Vec<u8>,
+        label: &str,
+    ) {
+        incoming
+            .send(packet)
+            .await
+            .unwrap_or_else(|_| panic!("could not inject {label} into Xray TUN"));
+        assert!(
+            timeout(Duration::from_millis(100), packets.recv())
+                .await
+                .is_err(),
+            "{label} should be consumed without a TUN response"
+        );
+    }
+
     async fn next_ipv6_udp_payload(
         packets: &mut mpsc::Receiver<Vec<u8>>,
         expected: &[u8],
@@ -2150,6 +3079,650 @@ mod tests {
         let _ = runtime_state
             .drain_inbound_connection_tasks(Duration::from_secs(1))
             .await;
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xray_tun_packet_enters_existing_dokodemo_dispatcher() {
+        let echo_listener = HostTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local TCP echo listener");
+        let echo_address = echo_listener.local_addr().expect("echo address");
+        let echo_task = tokio::spawn(async move {
+            let (mut stream, _) = echo_listener
+                .accept()
+                .await
+                .expect("accept proxied Xray TUN flow");
+            let mut payload = [0; 4];
+            stream
+                .read_exact(&mut payload)
+                .await
+                .expect("read Xray TUN payload");
+            stream
+                .write_all(&payload)
+                .await
+                .expect("write Xray TUN echo");
+        });
+
+        let runtime_state = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
+            }],
+        );
+        let plan = XrayTunPlan::try_from(xray_tun_inbound(serde_json::json!({
+            "name": "test-xray-tun",
+            "gateway": ["10.254.0.1/24"]
+        })))
+        .expect("valid Xray TUN plan");
+        let (incoming, input) = mpsc::channel(8);
+        let (output, mut packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let service = tokio::spawn(run_forwarding_server(
+            device,
+            plan.forwarding_plan(),
+            runtime_state.data_plane(),
+            CancellationToken::new(),
+        ));
+
+        const CLIENT_PORT: u16 = 45_556;
+        incoming
+            .send(tcp_syn(CLIENT_PORT, echo_address))
+            .await
+            .expect("inject TCP SYN into Xray TUN packet path");
+        let (_, server_sequence) = next_tcp_syn_ack(&mut packets).await;
+        incoming
+            .send(tcp_ack(
+                CLIENT_PORT,
+                echo_address,
+                101,
+                server_sequence.wrapping_add(1),
+                b"xray",
+            ))
+            .await
+            .expect("inject TCP payload into Xray TUN packet path");
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = packets.recv().await.expect("memory TUN output closed");
+                if contains_tcp_payload(&packet, b"xray") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Xray TUN TCP echo did not return through the packet path");
+        echo_task.await.expect("echo task failed");
+
+        drop(incoming);
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("Xray TUN service did not stop after device closure")
+            .expect("Xray TUN service task panicked")
+            .expect_err("device closure must be reported as a service failure");
+        runtime_state.close_inbound_connection_tasks();
+        let _ = runtime_state
+            .drain_inbound_connection_tasks(Duration::from_secs(1))
+            .await;
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xray_tun_udp_packet_uses_existing_dokodemo_session() {
+        let echo_socket = HostUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local UDP echo socket");
+        let echo_address = echo_socket.local_addr().expect("echo address");
+        let echo_task = tokio::spawn(async move {
+            let mut payload = [0; 4];
+            let (len, peer) = echo_socket
+                .recv_from(&mut payload)
+                .await
+                .expect("receive Xray TUN datagram");
+            assert_eq!(&payload[..len], b"ping");
+            echo_socket
+                .send_to(&payload[..len], peer)
+                .await
+                .expect("send Xray TUN UDP echo");
+        });
+
+        let runtime_state = RuntimeState::new(
+            Vec::new(),
+            vec![OutboundSummary {
+                tag: "direct".into(),
+                protocol: "freedom".into(),
+                proxy_settings_type: None,
+                proxy_settings_value: None,
+                sender_settings_type: None,
+                sender_settings_value: None,
+            }],
+        );
+        let plan = XrayTunPlan::try_from(xray_tun_inbound(serde_json::json!({
+            "name": "test-xray-udp",
+            "gateway": ["10.254.0.1/24"]
+        })))
+        .expect("valid Xray TUN plan");
+        let (incoming, input) = mpsc::channel(8);
+        let (output, mut packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let cancellation = CancellationToken::new();
+        let service = tokio::spawn(run_forwarding_server(
+            device,
+            plan.forwarding_plan(),
+            runtime_state.data_plane(),
+            cancellation.clone(),
+        ));
+
+        const CLIENT_PORT: u16 = 45_558;
+        incoming
+            .send(udp_datagram(CLIENT_PORT, echo_address, b"ping"))
+            .await
+            .expect("inject UDP datagram into Xray TUN");
+        assert_eq!(
+            next_udp_payload(&mut packets, b"ping").await,
+            (
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::new(10, 44, 0, 2),
+                echo_address.port(),
+                CLIENT_PORT,
+            )
+        );
+        echo_task.await.expect("UDP echo task failed");
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("Xray TUN service did not stop after cancellation")
+            .expect("Xray TUN service task panicked")
+            .expect("cooperative Xray TUN shutdown should complete cleanly");
+        runtime_state.close_inbound_connection_tasks();
+        let _ = runtime_state
+            .drain_inbound_connection_tasks(Duration::from_secs(1))
+            .await;
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xray_tun_quic_route_only_uses_sni_rule_and_pins_udp_flow() {
+        let echo_socket = HostUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local UDP echo socket");
+        let echo_address = echo_socket.local_addr().expect("echo address");
+        let runtime_state = RuntimeState::new(
+            Vec::new(),
+            vec![
+                OutboundSummary {
+                    tag: "blocked".into(),
+                    protocol: "blackhole".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
+                },
+                OutboundSummary {
+                    tag: "direct".into(),
+                    protocol: "freedom".into(),
+                    proxy_settings_type: None,
+                    proxy_settings_value: None,
+                    sender_settings_type: None,
+                    sender_settings_value: None,
+                },
+            ],
+        );
+        runtime_state.replace_routing(
+            RoutingState::from_config(Some(&RoutingConfig {
+                rules: vec![
+                    RuleConfig {
+                        domain: vec!["full:www.google.com".into()],
+                        network: NetworkListConfig(vec!["udp".into()]),
+                        outbound_tag: Some("blocked".into()),
+                        ..RuleConfig::default()
+                    },
+                    RuleConfig {
+                        network: NetworkListConfig(vec!["udp".into()]),
+                        outbound_tag: Some("direct".into()),
+                        ..RuleConfig::default()
+                    },
+                ],
+                ..RoutingConfig::default()
+            }))
+            .expect("compile QUIC SNI and UDP fallback routes"),
+        );
+
+        let plan = XrayTunPlan::try_from(
+            serde_json::from_value(serde_json::json!({
+                "protocol": "tun",
+                "tag": "xray-tun",
+                "settings": {
+                    "name": "xray-quic-test",
+                    "gateway": ["10.254.0.1/24"]
+                },
+                "sniffing": {
+                    "enabled": true,
+                    "destOverride": ["quic"],
+                    "routeOnly": true
+                }
+            }))
+            .expect("valid Xray TUN inbound with top-level sniffing"),
+        )
+        .expect("valid route-only QUIC sniffing plan");
+        assert!(plan.quic_route_only);
+        assert!(
+            plan.sniffing
+                .as_ref()
+                .is_some_and(|sniffing| sniffing.enabled && sniffing.route_only)
+        );
+        let (incoming, input) = mpsc::channel(8);
+        let (output, mut packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let runtime = runtime_state.data_plane();
+        let mut routing_events = runtime_state.subscribe_routing_events();
+        let cancellation = CancellationToken::new();
+        let service = tokio::spawn(run_forwarding_server(
+            device,
+            plan.forwarding_plan(),
+            runtime,
+            cancellation.clone(),
+        ));
+
+        const CLIENT_PORT: u16 = 45_560;
+        let mut captured_initials =
+            include_str!("session/testdata/quic_v1_xray_26_9_9_initials.hex")
+                .lines();
+        let first_initial = decode_hex_fixture(
+            captured_initials.next().expect("first Xray Initial"),
+        );
+        let second_initial = decode_hex_fixture(
+            captured_initials.next().expect("second Xray Initial"),
+        );
+        assert!(captured_initials.next().is_none());
+        assert_eq!(
+            crate::session::quic_sniff::inspect_quic_initial_server_name(
+                &first_initial
+            )
+            .as_deref(),
+            None,
+            "the first Xray Initial has an incomplete ClientHello"
+        );
+        incoming
+            .send(udp_datagram(CLIENT_PORT, echo_address, &first_initial))
+            .await
+            .expect("inject first fragmented Xray QUIC Initial into Xray TUN");
+        let premature_echo = timeout(Duration::from_millis(75), async {
+            let mut buffer = [0; 2048];
+            echo_socket.recv_from(&mut buffer).await
+        })
+        .await;
+        assert!(
+            premature_echo.is_err(),
+            "an incomplete QUIC SNI probe must hold its first datagram"
+        );
+        incoming
+            .send(udp_datagram(CLIENT_PORT, echo_address, &second_initial))
+            .await
+            .expect("inject second fragmented Xray QUIC Initial into Xray TUN");
+        // A later datagram on the same flow is not independently sniffable.
+        // It must retain the route selected from the first Initial's SNI.
+        incoming
+            .send(udp_datagram(CLIENT_PORT, echo_address, b"subsequent-quic"))
+            .await
+            .expect("inject subsequent datagram into the same QUIC flow");
+
+        let first_route = timeout(Duration::from_secs(1), routing_events.recv())
+            .await
+            .expect("QUIC route selection did not publish a routing event")
+            .expect("routing event channel closed");
+        assert_eq!(first_route.input.target_domain, "www.google.com");
+        assert_eq!(first_route.route.outbound_tag, "blocked");
+
+        let direct_probe = timeout(Duration::from_millis(300), async {
+            let mut buffer = [0; 2048];
+            echo_socket.recv_from(&mut buffer).await
+        })
+        .await;
+        assert!(
+            direct_probe.is_err(),
+            "QUIC SNI route should select blackhole instead of the direct UDP fallback"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), packets.recv())
+                .await
+                .is_err(),
+            "blackholed QUIC datagrams must not produce a TUN response"
+        );
+        while routing_events.try_recv().is_ok() {}
+
+        const FALLBACK_CLIENT_PORT: u16 = 45_561;
+        incoming
+            .send(udp_datagram(
+                FALLBACK_CLIENT_PORT,
+                echo_address,
+                &first_initial,
+            ))
+            .await
+            .expect("inject an incomplete QUIC probe that will time out");
+        let fallback_route = timeout(Duration::from_secs(2), routing_events.recv())
+            .await
+            .expect("timed-out QUIC probe did not resume original-IP routing")
+            .expect("routing event channel closed");
+        assert!(
+            fallback_route.input.target_domain.is_empty(),
+            "timed-out QUIC route unexpectedly retained domain metadata: {:?}",
+            fallback_route.input
+        );
+        assert_eq!(
+            fallback_route.input.source_port,
+            u32::from(FALLBACK_CLIENT_PORT)
+        );
+        assert_eq!(fallback_route.route.outbound_tag, "direct");
+        let (fallback_length, _) = timeout(Duration::from_secs(1), async {
+            let mut buffer = [0; 2048];
+            echo_socket.recv_from(&mut buffer).await
+        })
+        .await
+        .expect("timed-out QUIC probe was not forwarded to its original IP")
+        .expect("UDP echo target closed");
+        assert_eq!(fallback_length, first_initial.len());
+
+        const CANCELLED_CLIENT_PORT: u16 = 45_562;
+        incoming
+            .send(udp_datagram(
+                CANCELLED_CLIENT_PORT,
+                echo_address,
+                &first_initial,
+            ))
+            .await
+            .expect("inject a pending QUIC probe before service shutdown");
+        sleep(Duration::from_millis(50)).await;
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("Xray TUN QUIC service did not stop after cancellation")
+            .expect("Xray TUN service task panicked")
+            .expect("cooperative Xray TUN shutdown should complete cleanly");
+        assert!(
+            timeout(Duration::from_millis(600), async {
+                let mut buffer = [0; 2048];
+                echo_socket.recv_from(&mut buffer).await
+            })
+            .await
+            .is_err(),
+            "service shutdown must cancel pending QUIC fallback workers"
+        );
+        runtime_state.close_inbound_connection_tasks();
+        let _ = runtime_state
+            .drain_inbound_connection_tasks(Duration::from_secs(1))
+            .await;
+    }
+
+    #[cfg(feature = "xray-tun")]
+    fn decode_hex_fixture(value: &str) -> Vec<u8> {
+        let (pairs, remainder) = value.trim().as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "hex fixture has an incomplete byte");
+        pairs
+            .iter()
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    b'A'..=b'F' => byte - b'A' + 10,
+                    _ => panic!("invalid hexadecimal fixture"),
+                };
+                digit(pair[0]) * 16 + digit(pair[1])
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "xray-tun")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xray_tun_stack_matches_echo_and_unknown_protocol_icmp_behavior() {
+        let runtime_state = RuntimeState::new(Vec::new(), Vec::new());
+        let plan = XrayTunPlan::try_from(xray_tun_inbound(serde_json::json!({
+            "name": "test-xray-icmp",
+            "gateway": ["10.254.0.1/24", "fd10::1/64"]
+        })))
+        .expect("valid Xray TUN plan");
+        let (incoming, input) = mpsc::channel(8);
+        let (output, mut packets) = mpsc::channel(32);
+        let device = MemoryTun {
+            inbound: Mutex::new(input),
+            outbound: output,
+        };
+        let cancellation = CancellationToken::new();
+        let service = tokio::spawn(run_forwarding_server(
+            device,
+            plan.forwarding_plan(),
+            runtime_state.data_plane(),
+            cancellation.clone(),
+        ));
+
+        let mut ipv4_request = Vec::new();
+        PacketBuilder::ipv4([10, 44, 0, 2], [203, 0, 113, 9], 64)
+            .icmpv4_echo_request(7, 9)
+            .write(&mut ipv4_request, b"chimera-v4-ping")
+            .expect("build IPv4 echo request");
+        incoming
+            .send(ipv4_request)
+            .await
+            .expect("inject IPv4 ICMP echo into Xray TUN");
+        next_icmp_echo_reply(&mut packets, false, b"chimera-v4-ping").await;
+
+        let source: Ipv6Addr = "fd10:44::2".parse().expect("valid IPv6 source");
+        let target: Ipv6Addr = "2001:db8::9".parse().expect("valid IPv6 target");
+        let mut ipv6_request = Vec::new();
+        PacketBuilder::ipv6(source.octets(), target.octets(), 64)
+            .icmpv6_echo_request(7, 9)
+            .write(&mut ipv6_request, b"chimera-v6-ping")
+            .expect("build IPv6 echo request");
+        incoming
+            .send(ipv6_request)
+            .await
+            .expect("inject IPv6 ICMP echo into Xray TUN");
+        next_icmp_echo_reply(&mut packets, true, b"chimera-v6-ping").await;
+
+        let source_v4 = [10, 254, 0, 2];
+        let target_v4 = [203, 0, 113, 9];
+        let mut quoted_ipv4_udp = Vec::new();
+        PacketBuilder::ipv4(source_v4, target_v4, 64)
+            .udp(45_200, 443)
+            .write(&mut quoted_ipv4_udp, b"quoted UDP packet")
+            .expect("build quoted IPv4 UDP packet");
+        let build_ipv4_error = |icmp_type, code, details| {
+            let mut packet = Vec::new();
+            PacketBuilder::ipv4(target_v4, source_v4, 64)
+                .icmpv4_raw(icmp_type, code, details)
+                .write(&mut packet, &quoted_ipv4_udp)
+                .expect("build IPv4 ICMP error packet");
+            packet
+        };
+        for (icmp_type, code, details, label) in [
+            (3, 3, [0; 4], "IPv4 Destination Unreachable"),
+            (11, 0, [0; 4], "IPv4 Time Exceeded"),
+            (12, 0, [20, 0, 0, 0], "IPv4 Parameter Problem"),
+        ] {
+            assert_xray_tun_drops_without_response(
+                &incoming,
+                &mut packets,
+                build_ipv4_error(icmp_type, code, details),
+                label,
+            )
+            .await;
+        }
+
+        let source_v6: Ipv6Addr = "fd10::2".parse().expect("valid IPv6 source");
+        let target_v6: Ipv6Addr = "2001:db8::9".parse().expect("valid IPv6 target");
+        let mut quoted_ipv6_udp = Vec::new();
+        PacketBuilder::ipv6(source_v6.octets(), target_v6.octets(), 64)
+            .udp(45_201, 443)
+            .write(&mut quoted_ipv6_udp, b"quoted UDP packet")
+            .expect("build quoted IPv6 UDP packet");
+        let build_ipv6_error = |icmp_type, code, details| {
+            let mut packet = Vec::new();
+            PacketBuilder::ipv6(target_v6.octets(), source_v6.octets(), 64)
+                .icmpv6_raw(icmp_type, code, details)
+                .write(&mut packet, &quoted_ipv6_udp)
+                .expect("build IPv6 ICMP error packet");
+            packet
+        };
+        for (icmp_type, code, details, label) in [
+            (1, 4, [0; 4], "IPv6 Destination Unreachable"),
+            (3, 0, [0; 4], "IPv6 Time Exceeded"),
+            (4, 0, [0, 0, 0, 40], "IPv6 Parameter Problem"),
+        ] {
+            assert_xray_tun_drops_without_response(
+                &incoming,
+                &mut packets,
+                build_ipv6_error(icmp_type, code, details),
+                label,
+            )
+            .await;
+        }
+
+        let mut truncated_ipv4_header = etherparse::Ipv4Header::new(
+            4,
+            64,
+            etherparse::ip_number::ICMP,
+            [10, 44, 0, 2],
+            [203, 0, 113, 9],
+        )
+        .expect("valid IPv4 header for truncated ICMP");
+        truncated_ipv4_header.header_checksum =
+            truncated_ipv4_header.calc_header_checksum();
+        let mut truncated_ipv4_icmp = truncated_ipv4_header.to_bytes().to_vec();
+        truncated_ipv4_icmp.extend_from_slice(&[8, 0, 0, 0]);
+        assert_xray_tun_drops_without_response(
+            &incoming,
+            &mut packets,
+            truncated_ipv4_icmp,
+            "truncated IPv4 Echo Request",
+        )
+        .await;
+
+        let truncated_ipv6_header = etherparse::Ipv6Header {
+            payload_length: 4,
+            next_header: etherparse::ip_number::IPV6_ICMP,
+            hop_limit: 64,
+            source: "fd10:44::2"
+                .parse::<Ipv6Addr>()
+                .expect("valid IPv6 source")
+                .octets(),
+            destination: "2001:db8::9"
+                .parse::<Ipv6Addr>()
+                .expect("valid IPv6 destination")
+                .octets(),
+            ..Default::default()
+        };
+        let mut truncated_ipv6_icmp = truncated_ipv6_header.to_bytes().to_vec();
+        truncated_ipv6_icmp.extend_from_slice(&[128, 0, 0, 0]);
+        assert_xray_tun_drops_without_response(
+            &incoming,
+            &mut packets,
+            truncated_ipv6_icmp,
+            "truncated IPv6 Echo Request",
+        )
+        .await;
+
+        let mut bad_checksum_ipv4 = Vec::new();
+        PacketBuilder::ipv4([10, 44, 0, 2], [203, 0, 113, 9], 64)
+            .icmpv4_echo_request(7, 10)
+            .write(&mut bad_checksum_ipv4, b"bad-v4-checksum!")
+            .expect("build IPv4 Echo Request for checksum test");
+        bad_checksum_ipv4[22] ^= 0x01;
+        incoming
+            .send(bad_checksum_ipv4)
+            .await
+            .expect("inject IPv4 Echo Request with invalid ICMP checksum");
+        next_icmp_echo_reply(&mut packets, false, b"bad-v4-checksum!").await;
+
+        let mut bad_checksum_ipv6 = Vec::new();
+        PacketBuilder::ipv6(source.octets(), target.octets(), 64)
+            .icmpv6_echo_request(7, 10)
+            .write(&mut bad_checksum_ipv6, b"bad-v6-checksum")
+            .expect("build IPv6 Echo Request for checksum test");
+        bad_checksum_ipv6[42] ^= 0x01;
+        assert_xray_tun_drops_without_response(
+            &incoming,
+            &mut packets,
+            bad_checksum_ipv6,
+            "IPv6 Echo Request with invalid ICMP checksum",
+        )
+        .await;
+
+        let source_v4 = [10, 44, 0, 2];
+        let destination_v4 = [203, 0, 113, 9];
+        let mut ipv4_header = etherparse::Ipv4Header::new(
+            8,
+            64,
+            etherparse::IpNumber(252),
+            source_v4,
+            destination_v4,
+        )
+        .expect("valid IPv4 header");
+        ipv4_header.header_checksum = ipv4_header.calc_header_checksum();
+        let mut unknown_ipv4 = ipv4_header.to_bytes().to_vec();
+        unknown_ipv4.extend_from_slice(&[0; 8]);
+        incoming
+            .send(unknown_ipv4)
+            .await
+            .expect("inject unknown IPv4 protocol into Xray TUN");
+        let ipv4_error = timeout(Duration::from_secs(3), packets.recv())
+            .await
+            .expect("IPv4 protocol-unreachable response timed out")
+            .expect("memory TUN output closed");
+        let ipv4_header_len = ((ipv4_error[0] & 0x0f) as usize) * 4;
+        assert_eq!(ipv4_error[9], etherparse::ip_number::ICMP.0);
+        assert_eq!(ipv4_error[ipv4_header_len], 3);
+        assert_eq!(ipv4_error[ipv4_header_len + 1], 2);
+        assert_eq!(&ipv4_error[12..16], &destination_v4);
+        assert_eq!(&ipv4_error[16..20], &source_v4);
+
+        let source_v6 = [0x20; 16];
+        let destination_v6 = [0x21; 16];
+        let ipv6_header = etherparse::Ipv6Header {
+            payload_length: 8,
+            next_header: etherparse::IpNumber(252),
+            hop_limit: 64,
+            source: source_v6,
+            destination: destination_v6,
+            ..Default::default()
+        };
+        let mut unknown_ipv6 = ipv6_header.to_bytes().to_vec();
+        unknown_ipv6.extend_from_slice(&[0; 8]);
+        incoming
+            .send(unknown_ipv6)
+            .await
+            .expect("inject unknown IPv6 next header into Xray TUN");
+        let ipv6_error = timeout(Duration::from_secs(3), packets.recv())
+            .await
+            .expect("IPv6 unrecognized-next-header response timed out")
+            .expect("memory TUN output closed");
+        assert_eq!(ipv6_error[6], etherparse::ip_number::IPV6_ICMP.0);
+        assert_eq!(ipv6_error[40], 4);
+        assert_eq!(ipv6_error[41], 1);
+        assert_eq!(&ipv6_error[8..24], &destination_v6);
+        assert_eq!(&ipv6_error[24..40], &source_v6);
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(2), service)
+            .await
+            .expect("Xray TUN service did not stop after cancellation")
+            .expect("Xray TUN service task panicked")
+            .expect("cooperative Xray TUN shutdown should complete cleanly");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

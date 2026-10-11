@@ -77,7 +77,10 @@ mod wireguard;
 // Provisional platform boundary: this module uses Linux L3 system-TUN APIs and
 // has only been packet-tested on Linux. Add a device backend plus lifecycle and
 // packet tests for another OS before widening this gate.
-#[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+#[cfg(all(
+    any(feature = "tun-gateway", feature = "xray-tun"),
+    target_os = "linux"
+))]
 mod tun_gateway;
 
 mod user_domain;
@@ -170,6 +173,12 @@ pub fn prepare_server_runtime(
             "prepare_server_runtime does not start tunGateway; use start() to own its device lifecycle".into(),
         ));
     }
+    #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+    if !plan.xray_tuns.is_empty() {
+        return Err(Error::InvalidConfig(
+            "prepare_server_runtime does not start Xray TUN inbounds; use start() to own their device lifecycle".into(),
+        ));
+    }
     let runtime_state = RuntimeState::new_with_resolver(
         plan.inbounds.clone(),
         plan.outbounds.clone(),
@@ -199,6 +208,15 @@ pub fn prepare_server_inbounds(
     if config.tun_gateway.is_some() {
         return Err(Error::InvalidConfig(
             "prepare_server_inbounds does not start tunGateway; use start() to own its device lifecycle".into(),
+        ));
+    }
+    if config
+        .inbounds
+        .iter()
+        .any(|inbound| matches!(&inbound.protocol, config::Protocol::Tun))
+    {
+        return Err(Error::InvalidConfig(
+            "prepare_server_inbounds does not start Xray TUN inbounds; use start() to own their device lifecycle".into(),
         ));
     }
     compile_inbounds(config.inbounds)
@@ -431,6 +449,8 @@ struct ValidatedServerPlan {
     // configured tunGateway before they reach startup.
     #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
     tun_gateway: Option<tun_gateway::TunGatewayPlan>,
+    #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+    xray_tuns: Vec<tun_gateway::XrayTunPlan>,
 }
 
 impl ValidatedServerPlan {
@@ -504,7 +524,57 @@ impl ValidatedServerPlan {
             ));
         }
 
-        let inbounds = compile_inbounds(inbounds)?;
+        let mut listener_inbounds = Vec::with_capacity(inbounds.len());
+        let mut xray_tun_items = Vec::new();
+        for inbound in inbounds {
+            if matches!(&inbound.protocol, config::Protocol::Tun) {
+                xray_tun_items.push(inbound);
+            } else {
+                listener_inbounds.push(inbound);
+            }
+        }
+
+        #[cfg(not(feature = "xray-tun"))]
+        if !xray_tun_items.is_empty() {
+            return Err(Error::InvalidConfig(
+                "protocol tun is configured but the \"xray-tun\" feature is disabled"
+                    .into(),
+            ));
+        }
+
+        #[cfg(all(feature = "xray-tun", not(target_os = "linux")))]
+        if !xray_tun_items.is_empty() {
+            return Err(Error::InvalidConfig(
+                "protocol tun currently requires a Linux server build".into(),
+            ));
+        }
+
+        #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+        let xray_tuns = xray_tun_items
+            .into_iter()
+            .map(tun_gateway::XrayTunPlan::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Error::InvalidConfig)?;
+
+        let inbounds = compile_inbounds(listener_inbounds)?;
+
+        #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+        {
+            let mut tags = std::collections::HashSet::new();
+            for inbound in &inbounds {
+                if !inbound.tag.is_empty() {
+                    tags.insert(inbound.tag.as_str());
+                }
+            }
+            for inbound in &xray_tuns {
+                let tag = inbound.tag();
+                if !tag.is_empty() && !tags.insert(tag) {
+                    return Err(Error::InvalidConfig(format!(
+                        "Xray TUN inbound tag {tag} duplicates another inbound tag"
+                    )));
+                }
+            }
+        }
         #[cfg(feature = "vless-reverse")]
         let mut outbounds = compile_configured_outbounds(&outbounds)?;
         #[cfg(not(feature = "vless-reverse"))]
@@ -588,6 +658,8 @@ impl ValidatedServerPlan {
             // Keep the compiled runtime plan paired with its Linux-only owner.
             #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
             tun_gateway,
+            #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+            xray_tuns,
         })
     }
 
@@ -610,12 +682,17 @@ impl ValidatedServerPlan {
         let tun_gateway_started = self.tun_gateway.is_some();
         #[cfg(not(all(feature = "tun-gateway", target_os = "linux")))]
         let tun_gateway_started = false;
+        #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+        let xray_tun_started = !self.xray_tuns.is_empty();
+        #[cfg(not(all(feature = "xray-tun", target_os = "linux")))]
+        let xray_tun_started = false;
 
         if self.inbounds.is_empty()
             && !api_started
             && self.mcp.is_none()
             && !reverse_bridge_started
             && !tun_gateway_started
+            && !xray_tun_started
         {
             return Err(Error::InvalidConfig(
                 "no servers started; check inbounds/api configuration".into(),
@@ -831,10 +908,11 @@ async fn start_async(
     let resolved_api = plan.resolved_api;
     let api_listen = resolved_api.listen.clone();
     let skip_inbound_tag = resolved_api.inbound_tag.clone();
-    // Non-Linux builds reject tunGateway during plan compilation and have no
-    // device-service plan to transfer into startup.
+    // Linux-only TUN plans are transferred only to startup, which owns devices.
     #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
     let tun_gateway = plan.tun_gateway;
+    #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+    let xray_tuns = plan.xray_tuns;
 
     let runtime_state = RuntimeState::new_with_resolver(
         plan.inbounds,
@@ -877,6 +955,8 @@ async fn start_async(
             // Keep the startup resource field limited to the implemented Linux owner.
             #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
             tun_gateway,
+            #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+            xray_tuns,
         },
         connection_drain_timeout,
     )
@@ -1022,6 +1102,52 @@ mod tests {
             #[cfg(all(feature = "tun-gateway", not(target_os = "linux")))]
             assert!(error.to_string().contains("requires a Linux"));
         }
+    }
+
+    #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+    #[test]
+    fn xray_tun_inbound_compiles_as_a_device_plan_without_socket_listener() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [{
+                    "protocol": "tun",
+                    "tag": "xray-tun",
+                    "settings": {
+                        "name": "config-test-tun",
+                        "gateway": ["10.20.0.1/24"]
+                    }
+                }],
+                "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+            }))
+            .expect("parse Xray TUN inbound config");
+
+        let plan = ValidatedServerPlan::compile(config)
+            .expect("Xray TUN should compile to its device-backed plan");
+        assert!(plan.inbounds.is_empty());
+        assert_eq!(plan.xray_tuns.len(), 1);
+        assert_eq!(plan.xray_tuns[0].tag(), "xray-tun");
+    }
+
+    #[cfg(not(feature = "xray-tun"))]
+    #[test]
+    fn xray_tun_inbound_is_rejected_when_feature_is_disabled() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [{
+                    "protocol": "tun",
+                    "tag": "xray-tun",
+                    "settings": {}
+                }],
+                "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+            }))
+            .expect("parse Xray TUN inbound config");
+
+        let error = match ValidatedServerPlan::compile(config) {
+            Ok(_) => panic!("disabled Xray TUN must fail instead of being ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("xray-tun"), "{error}");
+        assert!(error.to_string().contains("disabled"), "{error}");
     }
 
     #[test]

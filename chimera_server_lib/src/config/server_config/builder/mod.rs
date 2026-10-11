@@ -650,7 +650,7 @@ struct RawSniffingConfig {
     route_only: bool,
 }
 
-fn collect_sniffing_config(
+pub(crate) fn collect_sniffing_config(
     tag: &str,
     value: Option<serde_json::Value>,
 ) -> Result<Option<InboundSniffingConfig>, Error> {
@@ -1085,6 +1085,9 @@ impl TryFrom<InboudItem> for ServerConfig {
 
         match protocol {
             Protocol::DokodemoDoor => build_dokodemo_server(context, settings),
+            Protocol::Tun => Err(Error::InvalidConfig(
+                "protocol tun must be compiled as a device inbound".into(),
+            )),
             Protocol::Tunnel => unreachable!("tunnel returned before proxy build"),
             #[cfg(feature = "hysteria")]
             Protocol::Hysteria2 => build_hysteria2_server(context, settings),

@@ -11,6 +11,8 @@ use crate::handler::vless_reverse::bridge_runtime::ReverseBridgePlan;
 // implementation and packet/lifecycle validation before this gate is widened.
 #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
 use crate::tun_gateway::TunGatewayPlan;
+#[cfg(all(feature = "xray-tun", target_os = "linux"))]
+use crate::tun_gateway::XrayTunPlan;
 use crate::{
     Error,
     config::def::{ApiConfig, BurstObservatoryConfig, ObservatoryConfig},
@@ -57,7 +59,7 @@ impl ServerServiceTask {
         }
     }
 
-    #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+    #[cfg(all(feature = "tun-runtime", target_os = "linux"))]
     fn cooperative(
         task: JoinHandle<Result<(), Error>>,
         cancellation: CancellationToken,
@@ -97,9 +99,11 @@ pub(crate) struct ServerStartupConfig {
     pub(crate) api_listen: Option<ApiListen>,
     #[cfg(feature = "vless-reverse")]
     pub(crate) reverse_bridge_plans: Vec<ReverseBridgePlan>,
-    // Only the implemented Linux device owner can be passed to startup.
+    // These are separate Linux device plans; each keeps its own config contract.
     #[cfg(all(feature = "tun-gateway", target_os = "linux"))]
     pub(crate) tun_gateway: Option<TunGatewayPlan>,
+    #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+    pub(crate) xray_tuns: Vec<XrayTunPlan>,
 }
 
 pub(crate) async fn start_server_resources(
@@ -140,6 +144,20 @@ pub(crate) async fn start_server_resources(
         if let Some(tun_gateway) = config.tun_gateway {
             let task = crate::tun_gateway::start_server(
                 tun_gateway,
+                runtime_state.data_plane(),
+            )
+            .await?;
+            join_handles.push(ServerServiceTask::cooperative(
+                task.task,
+                task.cancellation,
+            ));
+            has_started_server = true;
+        }
+
+        #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+        for xray_tun in config.xray_tuns {
+            let task = crate::tun_gateway::start_xray_tun_server(
+                xray_tun,
                 runtime_state.data_plane(),
             )
             .await?;
@@ -532,6 +550,8 @@ mod tests {
                 #[cfg(feature = "vless-reverse")]
                 reverse_bridge_plans: Vec::new(),
                 tun_gateway: Some(tun_gateway),
+                #[cfg(all(feature = "xray-tun", target_os = "linux"))]
+                xray_tuns: Vec::new(),
             },
             Duration::from_secs(1),
         )

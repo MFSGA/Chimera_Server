@@ -1,3 +1,5 @@
+#[cfg(all(feature = "tun-runtime", target_os = "linux", feature = "xray-tun"))]
+use std::collections::VecDeque;
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -7,6 +9,8 @@ use std::{
 
 #[cfg(feature = "vless-reverse")]
 use tokio::sync::oneshot;
+#[cfg(all(feature = "tun-runtime", target_os = "linux", feature = "xray-tun"))]
+use tokio::task::JoinHandle;
 use tokio::{
     net::UdpSocket,
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
@@ -14,6 +18,8 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
+#[cfg(feature = "xray-tun")]
+use crate::config::server_config::InboundSniffingConfig;
 #[cfg(feature = "vless")]
 use crate::outbound::{VlessUdpSendOutcome, connect_vless_udp_via_outbound};
 #[cfg(target_os = "linux")]
@@ -38,6 +44,18 @@ use super::{
 };
 #[cfg(feature = "trojan")]
 use crate::session::udp::shutdown_targeted_message;
+#[cfg(feature = "xray-tun")]
+use crate::{
+    session::quic_sniff::{CryptoStream, append_quic_initial_crypto},
+    tls_client_hello::ClientHelloInspection,
+};
+
+#[cfg(all(feature = "tun-runtime", target_os = "linux", feature = "xray-tun"))]
+const TUN_QUIC_SNI_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(all(feature = "tun-runtime", target_os = "linux", feature = "xray-tun"))]
+const TUN_QUIC_MAX_PENDING_PACKETS: usize = 8;
+#[cfg(all(feature = "tun-runtime", target_os = "linux", feature = "xray-tun"))]
+const TUN_QUIC_MAX_PENDING_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UdpOutboundAction {
@@ -315,7 +333,7 @@ pub(crate) trait UdpReplySink: Send + Sync {
 
     async fn send_response(
         &self,
-        payload: &[u8],
+        _payload: &[u8],
         client_addr: SocketAddr,
         source_addr: SocketAddr,
     ) -> std::io::Result<usize>;
@@ -339,15 +357,41 @@ impl UdpReplySink for SocketUdpReplySink {
     }
 }
 
-#[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+#[cfg(all(feature = "tun-runtime", target_os = "linux"))]
+#[cfg(feature = "xray-tun")]
+struct TunQuicRouteCacheEntry {
+    domain: Option<String>,
+    #[cfg(feature = "xray-tun")]
+    crypto: CryptoStream,
+    #[cfg(feature = "xray-tun")]
+    complete: bool,
+    #[cfg(feature = "xray-tun")]
+    pending_packets: VecDeque<Vec<u8>>,
+    #[cfg(feature = "xray-tun")]
+    pending_bytes: usize,
+    #[cfg(feature = "xray-tun")]
+    timeout_task: Option<JoinHandle<()>>,
+    expires_at: Instant,
+}
+
+#[cfg(all(feature = "tun-runtime", target_os = "linux"))]
 pub(crate) struct TunUdpForwarder {
     relay_state: Arc<UdpRelayState>,
     inbound_tag: String,
     user_level: u32,
     runtime: DataPlaneRuntime,
+    #[cfg(feature = "xray-tun")]
+    route_only_quic_sniffing: Option<InboundSniffingConfig>,
+    #[cfg(feature = "xray-tun")]
+    quic_route_cache:
+        Arc<Mutex<HashMap<(SocketAddr, SocketAddr), TunQuicRouteCacheEntry>>>,
+    #[cfg(feature = "xray-tun")]
+    max_quic_route_entries: usize,
+    #[cfg(feature = "xray-tun")]
+    session_idle_timeout: Duration,
 }
 
-#[cfg(all(feature = "tun-gateway", target_os = "linux"))]
+#[cfg(all(feature = "tun-runtime", target_os = "linux"))]
 impl TunUdpForwarder {
     pub(crate) fn new(
         inbound_tag: String,
@@ -402,6 +446,224 @@ impl TunUdpForwarder {
             inbound_tag,
             user_level,
             runtime,
+            #[cfg(feature = "xray-tun")]
+            route_only_quic_sniffing: None,
+            #[cfg(feature = "xray-tun")]
+            quic_route_cache: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "xray-tun")]
+            max_quic_route_entries: max_sessions,
+            #[cfg(feature = "xray-tun")]
+            session_idle_timeout,
+        }
+    }
+
+    pub(crate) fn with_route_only_quic_sniffing(
+        self,
+        sniffing: Option<InboundSniffingConfig>,
+    ) -> Self {
+        #[cfg(feature = "xray-tun")]
+        {
+            let mut forwarder = self;
+            forwarder.route_only_quic_sniffing =
+                sniffing.filter(|sniffing| sniffing.enabled && sniffing.route_only);
+            forwarder
+        }
+        #[cfg(not(feature = "xray-tun"))]
+        {
+            let _ = sniffing;
+            self
+        }
+    }
+
+    #[cfg(feature = "xray-tun")]
+    async fn route_only_quic_datagrams(
+        &self,
+        client_addr: SocketAddr,
+        target_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Option<Vec<(Vec<u8>, Option<String>)>> {
+        let Some(sniffing) = self.route_only_quic_sniffing.as_ref() else {
+            return Some(vec![(payload.to_vec(), None)]);
+        };
+        if sniffing.excludes_ip(target_addr.ip()) {
+            return Some(vec![(payload.to_vec(), None)]);
+        }
+
+        let now = Instant::now();
+        let key = (client_addr, target_addr);
+        let mut cache = self.quic_route_cache.lock().await;
+        cache.retain(|_, entry| {
+            if entry.expires_at <= now {
+                if let Some(task) = entry.timeout_task.take() {
+                    task.abort();
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if !cache.contains_key(&key) {
+            if cache.len() >= self.max_quic_route_entries {
+                return Some(vec![(payload.to_vec(), None)]);
+            }
+            cache.insert(
+                key,
+                TunQuicRouteCacheEntry {
+                    domain: None,
+                    crypto: CryptoStream::default(),
+                    complete: false,
+                    pending_packets: VecDeque::new(),
+                    pending_bytes: 0,
+                    timeout_task: None,
+                    expires_at: now + self.session_idle_timeout,
+                },
+            );
+        }
+
+        let entry = cache.get_mut(&key)?;
+        entry.expires_at = now + self.session_idle_timeout;
+        if entry.complete {
+            return Some(vec![(payload.to_vec(), entry.domain.clone())]);
+        }
+
+        if !append_quic_initial_crypto(payload, &mut entry.crypto) {
+            entry.complete = true;
+            entry.domain = None;
+            if let Some(task) = entry.timeout_task.take() {
+                task.abort();
+            }
+            let mut packets = std::mem::take(&mut entry.pending_packets);
+            packets.push_back(payload.to_vec());
+            entry.pending_bytes = 0;
+            return Some(packets.into_iter().map(|packet| (packet, None)).collect());
+        }
+
+        let domain = match entry.crypto.xray_quic_client_hello_inspection() {
+            ClientHelloInspection::Incomplete => {
+                let exceeds_limits = entry.pending_packets.len()
+                    >= TUN_QUIC_MAX_PENDING_PACKETS
+                    || entry
+                        .pending_bytes
+                        .checked_add(payload.len())
+                        .is_none_or(|bytes| bytes > TUN_QUIC_MAX_PENDING_BYTES);
+                if exceeds_limits {
+                    entry.complete = true;
+                    entry.domain = None;
+                    if let Some(task) = entry.timeout_task.take() {
+                        task.abort();
+                    }
+                    let mut packets = std::mem::take(&mut entry.pending_packets);
+                    packets.push_back(payload.to_vec());
+                    entry.pending_bytes = 0;
+                    return Some(
+                        packets.into_iter().map(|packet| (packet, None)).collect(),
+                    );
+                }
+
+                entry.pending_bytes += payload.len();
+                entry.pending_packets.push_back(payload.to_vec());
+                if entry.timeout_task.is_none() {
+                    entry.timeout_task = Some(self.spawn_quic_sni_timeout(key));
+                }
+                return None;
+            }
+            ClientHelloInspection::ServerName(domain) => (!sniffing
+                .excludes_domain(&domain))
+            .then(|| domain.to_ascii_lowercase()),
+            ClientHelloInspection::NotTls
+            | ClientHelloInspection::Malformed
+            | ClientHelloInspection::NoServerName
+            | ClientHelloInspection::EncryptedClientHello => None,
+        };
+
+        entry.complete = true;
+        entry.domain = domain.clone();
+        if let Some(task) = entry.timeout_task.take() {
+            task.abort();
+        }
+        let mut packets = std::mem::take(&mut entry.pending_packets);
+        packets.push_back(payload.to_vec());
+        entry.pending_bytes = 0;
+        Some(
+            packets
+                .into_iter()
+                .map(|packet| (packet, domain.clone()))
+                .collect(),
+        )
+    }
+
+    #[cfg(feature = "xray-tun")]
+    fn spawn_quic_sni_timeout(
+        &self,
+        key: (SocketAddr, SocketAddr),
+    ) -> JoinHandle<()> {
+        let route_cache = Arc::clone(&self.quic_route_cache);
+        let relay_state = Arc::clone(&self.relay_state);
+        let inbound_tag = self.inbound_tag.clone();
+        let user_level = self.user_level;
+        let runtime = self.runtime.clone();
+        tokio::spawn(async move {
+            sleep(TUN_QUIC_SNI_TIMEOUT).await;
+            let pending = {
+                let mut cache = route_cache.lock().await;
+                let Some(entry) = cache.get_mut(&key) else {
+                    return;
+                };
+                if entry.complete {
+                    return;
+                }
+                entry.complete = true;
+                entry.domain = None;
+                entry.pending_bytes = 0;
+                std::mem::take(&mut entry.pending_packets)
+            };
+
+            for payload in pending {
+                let datagram = DokodemoUdpDatagram {
+                    client_addr: key.0,
+                    target_addr: key.1,
+                    target_location: NetLocation::from_ip_addr(
+                        key.1.ip(),
+                        key.1.port(),
+                    ),
+                    payload,
+                };
+                if let Err(error) = relay_dokodemo_udp_datagram(
+                    Arc::clone(&relay_state),
+                    inbound_tag.clone(),
+                    user_level,
+                    runtime.clone(),
+                    datagram,
+                )
+                .await
+                {
+                    debug!(
+                        client = %key.0,
+                        target = %key.1,
+                        %error,
+                        "timed-out TUN QUIC SNI probe could not forward its buffered UDP datagram"
+                    );
+                }
+            }
+        })
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        #[cfg(feature = "xray-tun")]
+        {
+            let tasks = {
+                let mut cache = self.quic_route_cache.lock().await;
+                cache
+                    .values_mut()
+                    .filter_map(|entry| entry.timeout_task.take())
+                    .collect::<Vec<_>>()
+            };
+            for task in &tasks {
+                task.abort();
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
         }
     }
 
@@ -417,22 +679,38 @@ impl TunUdpForwarder {
                 "tunGateway UDP packet has mismatched address families",
             ));
         }
-        relay_dokodemo_udp_datagram(
-            Arc::clone(&self.relay_state),
-            self.inbound_tag.clone(),
-            self.user_level,
-            self.runtime.clone(),
-            DokodemoUdpDatagram {
-                client_addr,
-                target_addr,
-                target_location: NetLocation::from_ip_addr(
-                    target_addr.ip(),
-                    target_addr.port(),
-                ),
-                payload: packet.data().to_vec(),
-            },
-        )
-        .await
+        #[cfg(feature = "xray-tun")]
+        let datagrams = self
+            .route_only_quic_datagrams(client_addr, target_addr, packet.data())
+            .await;
+        #[cfg(not(feature = "xray-tun"))]
+        let datagrams = Some(vec![(packet.data().to_vec(), None)]);
+        let Some(datagrams) = datagrams else {
+            return Ok(());
+        };
+
+        for (payload, sniffed_domain) in datagrams {
+            let target_location = sniffed_domain.map_or_else(
+                || NetLocation::from_ip_addr(target_addr.ip(), target_addr.port()),
+                |domain| {
+                    NetLocation::new(Address::Hostname(domain), target_addr.port())
+                },
+            );
+            relay_dokodemo_udp_datagram(
+                Arc::clone(&self.relay_state),
+                self.inbound_tag.clone(),
+                self.user_level,
+                self.runtime.clone(),
+                DokodemoUdpDatagram {
+                    client_addr,
+                    target_addr,
+                    target_location,
+                    payload,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 

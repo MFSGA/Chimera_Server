@@ -10,6 +10,8 @@ pub(crate) use builder::decode_wireguard_key;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+#[cfg(all(feature = "xray-tun", target_os = "linux"))]
+pub(crate) use builder::collect_sniffing_config;
 pub(crate) use plan::InboundPlan;
 pub use types::DokodemoDoorConfig;
 pub use types::HttpUser;
