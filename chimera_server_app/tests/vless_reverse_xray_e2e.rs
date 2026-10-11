@@ -53,6 +53,7 @@ enum ReverseSecurity {
     Tls,
     #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
     Reality,
+    #[cfg(any(feature = "full", feature = "ws"))]
     Websocket,
     XhttpTls,
     XhttpTlsAuto,
@@ -70,6 +71,7 @@ impl ReverseSecurity {
             Self::Tls => "tls",
             #[cfg(any(feature = "full", feature = "vless-reverse-reality"))]
             Self::Reality => "reality",
+            #[cfg(any(feature = "full", feature = "ws"))]
             Self::Websocket => "websocket",
             Self::XhttpTls => "xhttp-tls",
             Self::XhttpTlsAuto => "xhttp-tls-auto",
@@ -129,6 +131,12 @@ fn xray_bridge_round_trips_public_dokodemo_tcp_over_tls_vless_reverse() {
     run_reverse_interop(ReverseSecurity::Tls);
 }
 
+#[cfg(any(feature = "full", feature = "ws"))]
+#[test]
+fn xray_bridge_round_trips_public_chimera_portal_over_websocket_vless_reverse() {
+    run_reverse_interop(ReverseSecurity::Websocket);
+}
+
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_raw_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Raw, None);
@@ -175,6 +183,7 @@ fn chimera_bridge_round_trips_xray_portal_over_reality_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Reality, None);
 }
 
+#[cfg(any(feature = "full", feature = "ws"))]
 #[test]
 fn chimera_bridge_round_trips_public_xray_portal_over_websocket_vless_reverse() {
     run_chimera_bridge_interop(ReverseSecurity::Websocket, None);
@@ -4842,6 +4851,7 @@ fn run_chimera_bridge_interop(
                 }
             }),
         ),
+        #[cfg(any(feature = "full", feature = "ws"))]
         ReverseSecurity::Websocket => (
             json!({
                 "network": "ws",
@@ -5581,9 +5591,19 @@ fn run_reverse_interop(security: ReverseSecurity) {
                 }
             }),
         ),
-        ReverseSecurity::Websocket => {
-            unreachable!("Portal-side WebSocket is not exercised here")
-        }
+        #[cfg(any(feature = "full", feature = "ws"))]
+        ReverseSecurity::Websocket => (
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": "/reverse"}
+            }),
+            json!({
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": "/reverse"}
+            }),
+        ),
         ReverseSecurity::XhttpTls
         | ReverseSecurity::XhttpTlsAuto
         | ReverseSecurity::XhttpTlsPacketUp
