@@ -123,6 +123,9 @@ pub(crate) struct ReassembledTransport {
     pub(crate) template: IpHeaderTemplate,
     pub(crate) protocol: etherparse::IpNumber,
     pub(crate) payload: Vec<u8>,
+    /// Pointer into the reassembled IPv6 packet for an unknown option error.
+    /// Present only when Xray TUN compatibility was explicitly enabled.
+    pub(crate) unknown_option_pointer: Option<u32>,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -202,6 +205,8 @@ pub(crate) struct FragmentReassembler {
     expected_protocol: Option<etherparse::IpNumber>,
     label: &'static str,
     active: HashMap<FragmentKey, FragmentState>,
+    xray_unknown_destination_options: bool,
+    xray_udp_first_fragment_guard: bool,
 }
 
 impl FragmentReassembler {
@@ -213,6 +218,8 @@ impl FragmentReassembler {
             expected_protocol: Some(expected_protocol),
             label,
             active: HashMap::new(),
+            xray_unknown_destination_options: false,
+            xray_udp_first_fragment_guard: false,
         }
     }
 
@@ -221,7 +228,21 @@ impl FragmentReassembler {
             expected_protocol: None,
             label,
             active: HashMap::new(),
+            xray_unknown_destination_options: false,
+            xray_udp_first_fragment_guard: false,
         }
+    }
+
+    pub(crate) fn with_xray_unknown_destination_options(mut self) -> Self {
+        self.xray_unknown_destination_options = true;
+        self
+    }
+
+    /// Require the complete IPv6 Destination Options -> UDP header chain
+    /// in fragment zero without changing the UDP unknown-option policy.
+    pub(crate) fn with_xray_udp_first_fragment_guard(mut self) -> Self {
+        self.xray_udp_first_fragment_guard = true;
+        self
     }
 
     fn prune_expired(&mut self, now: Instant) {
@@ -267,6 +288,26 @@ impl FragmentReassembler {
             Some(piece) => piece,
             None => return Ok(None),
         };
+
+        // Xray/gVisor requires fragment zero to hold the complete header
+        // chain. Follow consecutive Destination Options headers and require
+        // at least eight transport-header bytes in fragment zero. For TCP
+        // this is the pinned reference's observed minimum, not necessarily
+        // the complete header. UDP's opt-in guard remains independent of
+        // semantic unknown-option actions.
+        if (self.xray_unknown_destination_options
+            || self.xray_udp_first_fragment_guard)
+            && matches!(piece.key, FragmentKey::Ipv6 { .. })
+            && piece.offset.value() == 0
+            && piece.next_header == etherparse::ip_number::IPV6_DEST_OPTIONS
+            && !ipv6_first_fragment_contains_transport_header(piece.payload)
+        {
+            self.active.remove(&piece.key);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fragment zero does not contain the complete upper-layer header chain",
+            ));
+        }
 
         if !self.active.contains_key(&piece.key) {
             self.evict_oldest_if_full();
@@ -343,18 +384,31 @@ impl FragmentReassembler {
             template.set_ecn(etherparse::IpEcn::CongestionExperienced);
         }
         let (payload, _) = state.buffer.take_bufs();
-        let transport = transport_payload(state.next_header, &payload)?;
-        if self
-            .expected_protocol
-            .is_some_and(|expected| transport.0 != expected)
-        {
+        let (protocol, data, unknown_option_pointer) = match transport_payload(
+            state.next_header,
+            &payload,
+            self.xray_unknown_destination_options,
+            template.destination_ip(),
+        )? {
+            TransportDecode::Deliver(protocol, data) => (protocol, data, None),
+            TransportDecode::Discard => return Ok(None),
+            TransportDecode::ParameterProblem(pointer) => {
+                // Keep the unmodified fragmentable payload for the quoted
+                // packet. The Fragment header is omitted after reassembly.
+                (state.next_header, payload.as_slice(), Some(pointer))
+            }
+        };
+        if self.expected_protocol.is_some_and(|expected| {
+            unknown_option_pointer.is_some() || protocol != expected
+        }) {
             return Ok(None);
         }
 
         Ok(Some(ReassembledTransport {
             template,
-            protocol: transport.0,
-            payload: transport.1.to_vec(),
+            protocol,
+            payload: data.to_vec(),
+            unknown_option_pointer,
         }))
     }
 }
@@ -480,17 +534,67 @@ fn ipv6_fragment_piece(packet: &[u8]) -> std::io::Result<Option<FragmentPiece<'_
     }
 }
 
+enum TransportDecode<'a> {
+    Deliver(etherparse::IpNumber, &'a [u8]),
+    Discard,
+    ParameterProblem(u32),
+}
+
+/// Check the pinned Xray TUN Destination Options -> transport header chain.
+/// The reference accepts TCP fragments with only the first eight TCP bytes in
+/// fragment zero, but not those with zero TCP bytes; this is intentionally
+/// *not* a general RFC 7112 complete-TCP-header enforcement.
+/// Each extension consumes at least eight bytes, bounding the scan by the
+/// first fragment itself. Other upper-layer protocols are unchanged.
+fn ipv6_first_fragment_contains_transport_header(mut data: &[u8]) -> bool {
+    let mut next = etherparse::ip_number::IPV6_DEST_OPTIONS;
+    while next == etherparse::ip_number::IPV6_DEST_OPTIONS {
+        let Ok(extension) = etherparse::Ipv6RawExtHeaderSlice::from_slice(data)
+        else {
+            return false;
+        };
+        next = extension.next_header();
+        data = &data[extension.slice().len()..];
+    }
+    !matches!(
+        next,
+        etherparse::ip_number::IPV6_ICMP
+            | etherparse::ip_number::UDP
+            | etherparse::ip_number::TCP
+    ) || data.len() >= 8
+}
+
 fn transport_payload(
     mut next_header: etherparse::IpNumber,
     mut payload: &[u8],
-) -> std::io::Result<(etherparse::IpNumber, &[u8])> {
+    xray_unknown_destination_options: bool,
+    destination_ip: IpAddr,
+) -> std::io::Result<TransportDecode<'_>> {
+    let mut stripped = 0usize;
     loop {
         match next_header {
             etherparse::ip_number::IPV6_DEST_OPTIONS => {
                 let extension =
                     etherparse::Ipv6RawExtHeaderSlice::from_slice(payload)
                         .map_err(std::io::Error::other)?;
-                validate_padding_only_ipv6_options(extension.payload())?;
+                if xray_unknown_destination_options {
+                    match unknown_destination_option_action(
+                        extension.payload(),
+                        stripped + 40 + 2,
+                        destination_ip.is_multicast(),
+                    )? {
+                        UnknownOptionAction::Continue => {}
+                        UnknownOptionAction::Discard => {
+                            return Ok(TransportDecode::Discard);
+                        }
+                        UnknownOptionAction::ParameterProblem(pointer) => {
+                            return Ok(TransportDecode::ParameterProblem(pointer));
+                        }
+                    }
+                } else {
+                    validate_padding_only_ipv6_options(extension.payload())?;
+                }
+                stripped += extension.slice().len();
                 next_header = extension.next_header();
                 payload = &payload[extension.slice().len()..];
             }
@@ -502,9 +606,68 @@ fn transport_payload(
                     "unsupported semantic IPv6 extension after Fragment header",
                 ));
             }
-            _ => return Ok((next_header, payload)),
+            _ => return Ok(TransportDecode::Deliver(next_header, payload)),
         }
     }
+}
+
+enum UnknownOptionAction {
+    Continue,
+    Discard,
+    ParameterProblem(u32),
+}
+
+/// RFC 8200 action bits on unknown Destination Options. Deliberately scoped
+/// to opt-in Xray TUN fragmented traffic; this is not a complete implementation
+/// of the semantics of recognized IPv6 options.
+fn unknown_destination_option_action(
+    options: &[u8],
+    pointer_base: usize,
+    destination_multicast: bool,
+) -> std::io::Result<UnknownOptionAction> {
+    let mut offset = 0usize;
+    while offset < options.len() {
+        let option = options[offset];
+        if option == 0 {
+            offset += 1;
+            continue;
+        }
+        let Some(&length) = options.get(offset + 1) else {
+            return Err(std::io::Error::other("truncated IPv6 option length"));
+        };
+        let end = offset
+            .checked_add(2 + usize::from(length))
+            .ok_or_else(|| std::io::Error::other("IPv6 option length overflow"))?;
+        let Some(data) = options.get(offset + 2..end) else {
+            return Err(std::io::Error::other("truncated IPv6 option data"));
+        };
+        if option == 1 {
+            if data.iter().any(|value| *value != 0) {
+                return Err(std::io::Error::other("nonzero PadN option data"));
+            }
+        } else {
+            match option >> 6 {
+                0 => {}
+                1 => return Ok(UnknownOptionAction::Discard),
+                2 => {
+                    let pointer = u32::try_from(pointer_base + offset)
+                        .map_err(std::io::Error::other)?;
+                    return Ok(UnknownOptionAction::ParameterProblem(pointer));
+                }
+                3 if destination_multicast => {
+                    return Ok(UnknownOptionAction::Discard);
+                }
+                3 => {
+                    let pointer = u32::try_from(pointer_base + offset)
+                        .map_err(std::io::Error::other)?;
+                    return Ok(UnknownOptionAction::ParameterProblem(pointer));
+                }
+                _ => unreachable!(),
+            }
+        }
+        offset = end;
+    }
+    Ok(UnknownOptionAction::Continue)
 }
 
 fn validate_padding_only_ipv6_options(options: &[u8]) -> std::io::Result<()> {

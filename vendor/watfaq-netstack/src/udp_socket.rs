@@ -58,6 +58,7 @@ pub struct UdpSocket {
     inbound: mpsc::Receiver<Packet>,
     outbound: mpsc::Sender<Packet>,
     mtu: usize,
+    xray_first_fragment_header_guard: bool,
 }
 
 impl UdpSocket {
@@ -69,6 +70,7 @@ impl UdpSocket {
             inbound,
             outbound,
             mtu: DEFAULT_UDP_PACKET_MTU,
+            xray_first_fragment_header_guard: false,
         }
     }
 
@@ -91,13 +93,24 @@ impl UdpSocket {
             inbound,
             outbound,
             mtu,
+            xray_first_fragment_header_guard: false,
         }
     }
 
+    pub(crate) fn with_xray_first_fragment_header_guard(mut self) -> Self {
+        self.xray_first_fragment_header_guard = true;
+        self
+    }
+
     pub fn split(self) -> (SplitRead, SplitWrite) {
+        let mut fragments =
+            FragmentReassembler::new(etherparse::ip_number::UDP, "UDP");
+        if self.xray_first_fragment_header_guard {
+            fragments = fragments.with_xray_udp_first_fragment_guard();
+        }
         let read = SplitRead {
             recv: self.inbound,
-            fragments: FragmentReassembler::new(etherparse::ip_number::UDP, "UDP"),
+            fragments,
             next_fragment_expiry: Instant::now() + FRAGMENT_EXPIRY_SCAN_INTERVAL,
         };
         let write = SplitWrite {

@@ -110,7 +110,7 @@ impl NetStack {
         crate::tcp_listener::TcpListener,
         crate::udp_socket::UdpSocket,
     ) {
-        Self::build(1500)
+        Self::build(1500, false, false)
     }
 
     /// Builds the packet stack with one MTU shared by smoltcp and UDP output
@@ -127,11 +127,47 @@ impl NetStack {
         std::io::Error,
     > {
         validate_mtu(mtu)?;
-        Ok(Self::build(mtu))
+        Ok(Self::build(mtu, false, false))
+    }
+
+    /// Builds a stack that matches Xray's IPv4 Echo Request checksum handling.
+    /// Invalid ICMPv4 Echo Request checksums are repaired before smoltcp sees
+    /// the packet, including when the request was fragmented and reassembled.
+    /// Other packet types and the default constructors retain strict handling.
+    pub fn new_with_mtu_accepting_invalid_ipv4_icmp_echo_checksum(
+        mtu: usize,
+    ) -> Result<
+        (
+            Self,
+            crate::tcp_listener::TcpListener,
+            crate::udp_socket::UdpSocket,
+        ),
+        std::io::Error,
+    > {
+        validate_mtu(mtu)?;
+        Ok(Self::build(mtu, true, false))
+    }
+
+    /// Opt-in Xray TUN behavior: checksum normalization and RFC 8200 unknown
+    /// Destination Options actions after IPv6 Fragment reassembly.
+    pub fn new_with_mtu_xray_tun_compat(
+        mtu: usize,
+    ) -> Result<
+        (
+            Self,
+            crate::tcp_listener::TcpListener,
+            crate::udp_socket::UdpSocket,
+        ),
+        std::io::Error,
+    > {
+        validate_mtu(mtu)?;
+        Ok(Self::build(mtu, true, true))
     }
 
     fn build(
         mtu: usize,
+        accept_invalid_ipv4_icmp_echo_checksum: bool,
+        xray_unknown_destination_options: bool,
     ) -> (
         Self,
         crate::tcp_listener::TcpListener,
@@ -150,12 +186,20 @@ impl NetStack {
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
-        let udp_socket =
+        let mut udp_socket =
             UdpSocket::with_mtu(udp_outbound_stack, udp_packet_sender, mtu);
+        if xray_unknown_destination_options {
+            udp_socket = udp_socket.with_xray_first_fragment_header_guard();
+        }
         let (tcp_inbound_app, tcp_outbound_stack) =
             mpsc::channel::<Packet>(PACKET_QUEUE_SIZE);
-        let tcp_listener =
-            TcpListener::with_mtu(tcp_outbound_stack, tcp_packet_sender, mtu);
+        let tcp_listener = TcpListener::with_mtu(
+            tcp_outbound_stack,
+            tcp_packet_sender,
+            mtu,
+            accept_invalid_ipv4_icmp_echo_checksum,
+            xray_unknown_destination_options,
+        );
 
         let stack = NetStack {
             udp_inbound: udp_inbound_app,
@@ -254,12 +298,7 @@ impl futures::Sink<Packet> for StackSplitSink {
                         mirror_to_tcp = true;
                         IpProtocol::Udp
                     }
-                    _ => {
-                        debug!(
-                            "tun fragmented IPv6 packet ignored (next header: {next_header:?})"
-                        );
-                        return Ok(());
-                    }
+                    protocol => IpProtocol::from(protocol.0),
                 }
             } else {
                 let packet = match etherparse::IpSlice::from_slice(item.data()) {
@@ -275,13 +314,7 @@ impl futures::Sink<Packet> for StackSplitSink {
                         etherparse::ip_number::UDP => IpProtocol::Udp,
                         etherparse::ip_number::TCP => IpProtocol::Tcp,
                         etherparse::ip_number::ICMP => IpProtocol::Icmp,
-                        _ => {
-                            debug!(
-                                "tun fragmented IP packet ignored (protocol: {:?})",
-                                payload.ip_number
-                            );
-                            return Ok(());
-                        }
+                        protocol => IpProtocol::from(protocol.0),
                     }
                 } else {
                     match payload.ip_number {
@@ -289,10 +322,26 @@ impl futures::Sink<Packet> for StackSplitSink {
                         etherparse::ip_number::UDP => IpProtocol::Udp,
                         etherparse::ip_number::ICMP => IpProtocol::Icmp,
                         etherparse::ip_number::IPV6_ICMP => IpProtocol::Icmpv6,
-                        protocol => {
-                            debug!("tun IP packet ignored (protocol: {protocol:?})");
+                        protocol
+                            if item
+                                .data()
+                                .first()
+                                .is_some_and(|byte| byte >> 4 == 6)
+                                && matches!(
+                                    protocol,
+                                    etherparse::ip_number::IPV6_HOP_BY_HOP
+                                        | etherparse::ip_number::IPV6_DEST_OPTIONS
+                                        | etherparse::ip_number::IPV6_ROUTE
+                                        | etherparse::ip_number::IPV6_FRAG
+                                        | etherparse::ip_number::AUTH
+                                ) =>
+                        {
+                            debug!(
+                                "tun IPv6 extension header is unsupported: {protocol:?}"
+                            );
                             return Ok(());
                         }
+                        protocol => IpProtocol::from(protocol.0),
                     }
                 }
             }
@@ -320,15 +369,12 @@ impl futures::Sink<Packet> for StackSplitSink {
             let proto = *proto;
 
             if self.pending_permit.is_none() {
-                let sender = match proto {
-                    IpProtocol::Udp => self.udp_inbound.clone(),
-                    IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                        self.tcp_inbound.clone()
-                    }
-                    _ => {
-                        self.packet_container.pop_front();
-                        continue;
-                    }
+                // Keep unknown IP protocols on the IP stack path so it can
+                // return the same protocol-unreachable errors as Xray's TUN.
+                let sender = if proto == IpProtocol::Udp {
+                    self.udp_inbound.clone()
+                } else {
+                    self.tcp_inbound.clone()
                 };
                 self.pending_permit = Some(Box::pin(sender.reserve_owned()));
             }
