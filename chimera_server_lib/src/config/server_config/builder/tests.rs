@@ -1444,6 +1444,7 @@ fn xray_tcp_api_tunnel_accepts_listen_and_port() {
         "listen": "127.0.0.1",
         "port": 62789,
         "protocol": "tunnel",
+        "settings": {"rewriteAddress": "127.0.0.1"},
         "tag": "api"
     }))
     .expect("valid Xray TCP API tunnel inbound");
@@ -1457,6 +1458,22 @@ fn xray_tcp_api_tunnel_accepts_listen_and_port() {
             assert_eq!(location.port(), 62789);
         }
     }
+}
+
+#[test]
+fn xray_tcp_api_tunnel_rejects_unknown_settings() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 62789,
+        "protocol": "tunnel",
+        "settings": {"rewriteAddress": "127.0.0.1", "unexpected": true},
+        "tag": "api"
+    }))
+    .expect("literal Xray API tunnel should deserialize");
+
+    let error = ServerConfig::try_from(inbound)
+        .expect_err("unrecognized tunnel settings must not be ignored");
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
