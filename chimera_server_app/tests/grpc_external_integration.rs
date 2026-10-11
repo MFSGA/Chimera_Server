@@ -227,6 +227,37 @@ fn free_localhost_port() -> io::Result<u16> {
     Ok(port)
 }
 
+fn get_debug_vars(address: SocketAddr) -> io::Result<serde_json::Value> {
+    use io::{Read, Write};
+
+    let mut stream = TcpStream::connect_timeout(&address, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    write!(
+        stream,
+        "GET /debug/vars HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("HTTP response has no header terminator"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if !headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "))
+    {
+        return Err(io::Error::other(format!(
+            "metrics endpoint returned {}",
+            headers.lines().next().unwrap_or("no status line")
+        )));
+    }
+    serde_json::from_slice(&response[header_end + 4..])
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
 #[cfg(target_os = "linux")]
 fn build_abstract_tunnel_config(socket_name: &str, socks_port: u16) -> String {
     format!(
@@ -906,15 +937,46 @@ fn three_x_ui_default_api_config_and_grpc_calls_end_to_end() {
         .lock()
         .expect("failed to acquire test lock");
     let grpc_port = free_localhost_port().expect("failed to allocate API port");
+    let metrics_port = loop {
+        let port = free_localhost_port().expect("failed to allocate metrics port");
+        if port != grpc_port {
+            break port;
+        }
+    };
     let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
+    let metrics_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, metrics_port);
     let config =
         include_str!("../../examples/xray-compatible/3x-ui-default-api.json5")
-            .replace("62789", &grpc_port.to_string());
+            .replace("62789", &grpc_port.to_string())
+            .replace("127.0.0.1:11111", &metrics_addr.to_string());
     let mut server = ServerProcess::spawn_with_geoip_fixture(&config)
         .expect("failed to spawn Chimera with 3x-ui API fixture");
     server
         .wait_until_ready(SocketAddr::V4(grpc_addr))
         .unwrap_or_else(|err| panic!("3x-ui API listener did not start: {err}"));
+    server
+        .wait_until_ready(SocketAddr::V4(metrics_addr))
+        .unwrap_or_else(|err| panic!("3x-ui metrics listener did not start: {err}"));
+
+    let metrics =
+        get_debug_vars(SocketAddr::V4(metrics_addr)).unwrap_or_else(|err| {
+            panic!("GET /debug/vars failed: {err}; logs:\n{}", server.logs())
+        });
+    assert!(metrics["memstats"]["HeapAlloc"].is_u64());
+    assert!(metrics["memstats"]["Sys"].is_u64());
+    assert_eq!(metrics["memstats"]["NumGC"], 0);
+    assert!(metrics["stats"]["inbound"].is_object());
+    assert!(metrics["observatory"].is_object());
+    assert!(
+        !metrics["chimera"]["memory_values_are_xray_go_runtime_equivalents"]
+            .as_bool()
+            .expect("memory equivalence marker should be boolean")
+    );
+    assert!(
+        metrics["chimera"]["traffic_stats_enabled"]
+            .as_bool()
+            .expect("traffic feature marker should be boolean")
+    );
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

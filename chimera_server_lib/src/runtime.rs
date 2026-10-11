@@ -947,6 +947,12 @@ impl RuntimeState {
         self.routing().observations()
     }
 
+    pub(crate) fn active_outbound_observations(
+        &self,
+    ) -> HashMap<String, OutboundObservation> {
+        self.routing().active_observations()
+    }
+
     pub fn with_routing_mut<R, F>(&self, mutator: F) -> R
     where
         F: FnOnce(&mut RoutingState) -> R,

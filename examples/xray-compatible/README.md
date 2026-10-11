@@ -2,8 +2,8 @@
 
 This directory is the authoritative materialized config matrix for Chimera Server examples that intentionally use xray-core-shaped JSON/JSON5 fields such as `inbounds`, `outbounds`, `settings`, and `streamSettings`.
 
-Current implementation reference: local `ref/xray-core` at Xray-core `v26.9.9`
-(`52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`, pre-release).
+Current implementation reference: local `ref/xray-core` at Xray-core `v26.10.10`
+(`701af60772cda123492f86e383e1fdba066614a9`).
 
 The release-prep real-client checks recorded below were run on 2026-09-10 with two Xray client builds:
 
@@ -231,10 +231,11 @@ xray_client_rejects_invalid_hysteria2_auth_without_tunnel           PASS
 
 Hysteria2 is therefore **not currently release-blocked by the previously observed 4 KiB timeout**. The repository-local Xray 26.2.6 limitation remains documented so future failures at that exact boundary are not misattributed to the server.
 
-## Runtime coverage not re-certified in this release-prep round
+## Runtime and control-plane coverage notes
 
 | Area | Current status |
 | --- | --- |
+| 3x-ui metrics `/debug/vars` | Runtime-covered by the `3x-ui-default-api.json5` process e2e. The endpoint returns Xray-shaped traffic and outbound-observation data. Linux memory history uses process RSS/virtual-size approximations; Go heap/GC equivalence and the `metrics.tag` outbound path are not implemented. |
 | VLESS + TCP + REALITY + Vision | Runtime and ignored real-client matrices exist; not re-run as release evidence in this round. |
 | VLESS + XHTTP + none/TLS/REALITY | Ordinary XHTTP protocol/security matrices pass; the routing goal has real Xray 26.2.6/Linux allow/reject certification for XHTTP over TCP with `none` and TLS, plus Xray 26.9.9/Linux allow/reject and direct-IP audit certification for XHTTP/3 over TLS (`stream-one`, `packet-up`, and `stream-up`) and XHTTP + REALITY over TCP. |
 | VLESS + gRPC | Inbound and real Xray-client tests exist; not re-run as release evidence in this round. |

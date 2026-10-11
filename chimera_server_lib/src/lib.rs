@@ -8,7 +8,10 @@ pub use config::{
     server_config::{ServerConfig, ServerProxyConfig},
 };
 use config::{
-    def::{ApiConfig, DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS, PolicyConfig},
+    def::{
+        ApiConfig, DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS, MetricsConfig,
+        PolicyConfig,
+    },
     rule::RoutingConfig,
     server_config::InboundPlan,
 };
@@ -37,6 +40,7 @@ mod geodata;
 mod grpc;
 
 mod mcp;
+mod metrics;
 
 mod outbound;
 
@@ -444,6 +448,7 @@ struct ValidatedServerPlan {
     api: Option<ApiConfig>,
     mcp: Option<mcp::McpServerConfig>,
     mcp_configured_without_listen: bool,
+    metrics: Option<MetricsConfig>,
     observatory: Option<config::def::ObservatoryConfig>,
     burst_observatory: Option<config::def::BurstObservatoryConfig>,
     resolved_api: ResolvedApiConfig,
@@ -469,6 +474,7 @@ impl ValidatedServerPlan {
             observatory,
             burst_observatory,
             shutdown,
+            metrics,
             tun_gateway,
             legacy_reverse_configured,
             mcp,
@@ -615,6 +621,26 @@ impl ValidatedServerPlan {
 
         let mcp_configured_without_listen =
             mcp.as_ref().is_some_and(|config| config.listen.is_none());
+
+        let metrics = metrics
+            .map(|config| {
+                let Some(listen) = config.listen.as_deref() else {
+                    return Err(Error::InvalidConfig(
+                        "metrics.listen is required; tagged metrics outbound routing is not supported".into(),
+                    ));
+                };
+                let listen_addr = listen.parse::<SocketAddr>().map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid metrics.listen {}: {}",
+                        listen, error
+                    ))
+                })?;
+                Ok(MetricsConfig {
+                    listen: Some(listen_addr.to_string()),
+                    tag: config.tag,
+                })
+            })
+            .transpose()?;
         let mcp = match mcp {
             Some(config) => match config.listen {
                 Some(listen) => {
@@ -654,6 +680,7 @@ impl ValidatedServerPlan {
             api,
             mcp,
             mcp_configured_without_listen,
+            metrics,
             observatory,
             burst_observatory,
             resolved_api,
@@ -693,6 +720,7 @@ impl ValidatedServerPlan {
         if self.inbounds.is_empty()
             && !api_started
             && self.mcp.is_none()
+            && self.metrics.is_none()
             && !reverse_bridge_started
             && !tun_gateway_started
             && !xray_tun_started
@@ -906,6 +934,7 @@ async fn start_async(
     let api_config = plan.api;
     let mcp_configured_without_listen = plan.mcp_configured_without_listen;
     let mcp_config = plan.mcp;
+    let metrics_config = plan.metrics;
     let observatory_config = plan.observatory;
     let burst_observatory_config = plan.burst_observatory;
     let resolved_api = plan.resolved_api;
@@ -947,6 +976,7 @@ async fn start_async(
         ServerStartupConfig {
             mcp: mcp_config,
             mcp_configured_without_listen,
+            metrics: metrics_config,
             skip_inbound_tag,
             observatory: observatory_config,
             burst_observatory: burst_observatory_config,
@@ -1071,6 +1101,45 @@ mod tests {
 
         ValidatedServerPlan::compile(config)
             .expect("Xray treats a null root reverse pointer as unconfigured");
+    }
+
+    #[test]
+    fn metrics_listener_config_is_validated_and_counts_as_a_service() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "metrics": {
+                    "listen": "127.0.0.1:11111",
+                    "tag": "metrics_out"
+                }
+            }))
+            .expect("parse metrics listener config");
+
+        let plan = ValidatedServerPlan::compile(config)
+            .expect("metrics listener should compile");
+        plan.ensure_server_component()
+            .expect("metrics listener is a server component");
+        let metrics = plan.metrics.expect("metrics plan should be retained");
+        assert_eq!(metrics.listen.as_deref(), Some("127.0.0.1:11111"));
+        assert_eq!(metrics.tag.as_deref(), Some("metrics_out"));
+    }
+
+    #[test]
+    fn metrics_without_listen_is_rejected_until_tagged_routing_exists() {
+        let config: crate::config::def::LiteralConfig =
+            serde_json::from_value(serde_json::json!({
+                "inbounds": [],
+                "outbounds": [],
+                "metrics": { "tag": "metrics_out" }
+            }))
+            .expect("parse tagged-only metrics config");
+
+        let error = match ValidatedServerPlan::compile(config) {
+            Ok(_) => panic!("tag-only metrics config must not be silently ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("metrics.listen is required"));
     }
 
     #[test]

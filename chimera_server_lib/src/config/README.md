@@ -358,6 +358,27 @@ not use it as a proxy destination because the inbound is reserved for the API
 control route and gRPC binds directly. Other tunnel settings, stream settings,
 and sniffing remain rejected.
 
+## Xray metrics HTTP endpoint
+
+The top-level `metrics.listen` setting starts an HTTP listener that serves
+`GET /debug/vars` with the Xray-shaped `memstats`, `stats`, and `observatory`
+objects. Traffic counters use Chimera's current inbound/outbound/user totals;
+observatory entries expose the existing outbound observation state. This is
+the endpoint 3x-ui polls for its Xray metrics history.
+
+Rust has no Go runtime heap or garbage collector. On Linux, `memstats.HeapAlloc`
+and `memstats.Sys` therefore report process resident and virtual memory from
+`/proc/self/status` as useful memory-history approximations; they are not
+equivalent to Go allocator counters. `HeapObjects`, `NumGC`, and `PauseNs` are
+zero, and a `chimera` object identifies this distinction. Other operating
+systems currently report zero for process memory until a native source is
+implemented and verified.
+
+When `metrics.tag` is also set, Chimera logs that the Xray tagged outbound
+access path is unavailable while still serving the configured HTTP listener.
+A tag-only metrics config is rejected because it cannot start the 3x-ui HTTP
+endpoint and the outbound routing mode is not implemented.
+
 ## Xray DNS hosts subset
 
 The top-level `dns.hosts` object accepts Xray custom domain-rule keys (`full:`, `domain:`, `keyword:`, `regexp:`, and `dotless:`; an unprefixed key means `full:`) mapped to one IP string, an array of IP strings, a proxied domain string, or a response-code string such as `"#3"`. A response-code mapping returns the corresponding DNS error immediately (`"#0"` is an empty response), without falling through to an upstream nameserver. A proxied domain is recursively resolved through the same hosts table with a bounded depth; if the final alias is not statically mapped, the shared resolver continues with that final alias. Literal domain patterns are normalized case-insensitively, with a trailing dot removed and IDN converted to ASCII, before the mapping is used by the shared runtime resolver. Matching IP entries are combined, and an unmatched hostname falls through to the system resolver.

@@ -15,7 +15,9 @@ use crate::tun_gateway::TunGatewayPlan;
 use crate::tun_gateway::XrayTunPlan;
 use crate::{
     Error,
-    config::def::{ApiConfig, BurstObservatoryConfig, ObservatoryConfig},
+    config::def::{
+        ApiConfig, BurstObservatoryConfig, MetricsConfig, ObservatoryConfig,
+    },
     inbound::InboundFailure,
     mcp::{self, McpServerConfig},
     routing_observer,
@@ -91,6 +93,7 @@ impl ServerServiceTask {
 pub(crate) struct ServerStartupConfig {
     pub(crate) mcp: Option<McpServerConfig>,
     pub(crate) mcp_configured_without_listen: bool,
+    pub(crate) metrics: Option<MetricsConfig>,
     pub(crate) skip_inbound_tag: Option<String>,
     pub(crate) observatory: Option<ObservatoryConfig>,
     pub(crate) burst_observatory: Option<BurstObservatoryConfig>,
@@ -120,6 +123,32 @@ pub(crate) async fn start_server_resources(
             has_started_server = true;
         } else if config.mcp_configured_without_listen {
             tracing::warn!("mcp is configured but no listen address was resolved");
+        }
+
+        if let Some(metrics) = config.metrics {
+            #[cfg(not(feature = "traffic"))]
+            tracing::warn!(
+                "metrics stats counters are unavailable because the \"traffic\" feature is disabled"
+            );
+            if metrics.tag.as_deref().is_some_and(|tag| !tag.is_empty()) {
+                tracing::warn!(
+                    tag = %metrics.tag.as_deref().unwrap_or_default(),
+                    "metrics.tag outbound routing is not implemented; metrics.listen remains available"
+                );
+            }
+            let listen = metrics.listen.ok_or_else(|| {
+                Error::InvalidConfig("metrics.listen is required".into())
+            })?;
+            let listen = listen.parse().map_err(|error| {
+                Error::InvalidConfig(format!("invalid metrics.listen: {error}"))
+            })?;
+            let task = crate::metrics::start_metrics_server(
+                listen,
+                runtime_state.clone(),
+            )
+            .await?;
+            join_handles.push(ServerServiceTask::abort_on_shutdown(task));
+            has_started_server = true;
         }
 
         // Bind every configured data-plane listener before advertising the
@@ -541,6 +570,7 @@ mod tests {
             ServerStartupConfig {
                 mcp: None,
                 mcp_configured_without_listen: false,
+                metrics: None,
                 skip_inbound_tag: None,
                 observatory: None,
                 burst_observatory: None,

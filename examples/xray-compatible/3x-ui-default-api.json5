@@ -5,6 +5,10 @@
     "services": ["StatsService", "RoutingService"],
     "tag": "api"
   },
+  "metrics": {
+    "listen": "127.0.0.1:11111",
+    "tag": "metrics_out"
+  },
   "inbounds": [
     {
       "listen": "127.0.0.1",
