@@ -83,6 +83,8 @@ struct StaticVlessReverseConfig {
     sniffing: Option<serde_json::Value>,
     #[serde(default, rename = "siteToSite")]
     site_to_site: Option<serde_json::Value>,
+    #[serde(default, rename = "maxActiveSessions")]
+    max_active_sessions: Option<usize>,
 }
 
 #[cfg(feature = "vless-reverse")]

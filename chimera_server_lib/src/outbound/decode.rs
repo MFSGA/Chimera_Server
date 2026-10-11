@@ -281,7 +281,12 @@ pub(super) fn decode_vless_outbound(
     if let Some(reverse) = account.reverse.as_ref() {
         #[cfg(not(feature = "vless-reverse"))]
         {
-            let _ = (&reverse.tag, &reverse.sniffing, &reverse.site_to_site_json);
+            let _ = (
+                &reverse.tag,
+                &reverse.sniffing,
+                &reverse.site_to_site_json,
+                &reverse.max_active_sessions,
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "VLESS outbound reverse requires the vless-reverse feature",
@@ -290,7 +295,12 @@ pub(super) fn decode_vless_outbound(
 
         #[cfg(feature = "vless-reverse")]
         {
-            let _ = (&reverse.tag, &reverse.sniffing, &reverse.site_to_site_json);
+            let _ = (
+                &reverse.tag,
+                &reverse.sniffing,
+                &reverse.site_to_site_json,
+                &reverse.max_active_sessions,
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "VLESS Reverse Bridge account cannot be used as a normal forward outbound",
@@ -326,6 +336,8 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
     }
     let sniffing = decode_reverse_sniffing(reverse.sniffing.as_ref())?;
     let site_to_site = decode_reverse_site_to_site(&reverse.site_to_site_json)?;
+    let max_active_sessions =
+        decode_reverse_max_active_sessions(reverse.max_active_sessions)?;
     if site_to_site.is_some()
         && sniffing.as_ref().is_some_and(|sniffing| {
             !sniffing.route_only
@@ -351,7 +363,36 @@ pub(crate) fn maybe_decode_vless_reverse_bridge(
         user_level,
         sniffing,
         site_to_site,
+        max_active_sessions,
     }))
+}
+
+#[cfg(feature = "vless-reverse")]
+fn decode_reverse_max_active_sessions(
+    limit: Option<u64>,
+) -> std::io::Result<Option<usize>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    if limit == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VLESS Reverse maxActiveSessions must be greater than zero",
+        ));
+    }
+    let limit = usize::try_from(limit).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VLESS Reverse maxActiveSessions is out of range",
+        )
+    })?;
+    if limit > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VLESS Reverse maxActiveSessions exceeds the runtime permit limit",
+        ));
+    }
+    Ok(Some(limit))
 }
 
 #[cfg(feature = "vless-reverse")]

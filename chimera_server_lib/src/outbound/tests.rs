@@ -1773,6 +1773,7 @@ fn encoded_vless_reverse_account_cannot_downgrade_to_forward_outbound() {
             tag: "reverse-in".into(),
             sniffing: None,
             site_to_site_json: String::new(),
+            max_active_sessions: None,
         }),
     };
     let config = VlessClientConfigPayload {
@@ -1857,7 +1858,7 @@ fn static_vless_reverse_preserves_bridge_startup_plan() {
             "email": "bridge@example.test",
             "level": 7,
             "encryption": "none",
-            "reverse": {"tag": "reverse-in"}
+            "reverse": {"tag": "reverse-in", "maxActiveSessions": 4}
         }
     }))
     .expect("parse reverse VLESS outbound");
@@ -1874,6 +1875,33 @@ fn static_vless_reverse_preserves_bridge_startup_plan() {
         "3ac9b383-75a1-431c-8184-106c80eb2273"
     );
     assert_eq!(bridge.user_level, 7);
+    assert_eq!(bridge.max_active_sessions, Some(4));
+}
+
+#[cfg(feature = "vless-reverse")]
+#[test]
+fn static_vless_reverse_rejects_invalid_active_session_limits() {
+    for limit in [0, tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1)] {
+        let item: OutboundItem = serde_json::from_value(serde_json::json!({
+            "protocol": "vless",
+            "tag": "reverse-tunnel",
+            "settings": {
+                "address": "127.0.0.1",
+                "port": 1234,
+                "id": "3ac9b383-75a1-431c-8184-106c80eb2273",
+                "encryption": "none",
+                "reverse": {
+                    "tag": "reverse-in",
+                    "maxActiveSessions": limit
+                }
+            }
+        }))
+        .expect("parse Reverse Bridge outbound");
+
+        let error = compile_static_outbound(&item)
+            .expect_err("invalid active-session limit must fail config compilation");
+        assert!(error.contains("maxActiveSessions"), "{error}");
+    }
 }
 
 #[cfg(all(feature = "vless-reverse", feature = "tls"))]

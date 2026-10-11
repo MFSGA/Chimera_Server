@@ -62,6 +62,10 @@ pub(crate) fn start_reverse_bridge_monitors(
 async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) {
     let resolver = runtime.resolver();
     let dispatcher: Arc<dyn BridgeTcpDispatcher> = Arc::new(runtime);
+    let session_slots = plan
+        .endpoint
+        .max_active_sessions
+        .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
     let mut workers = Vec::<MuxServerWorker>::new();
     let mut previous_state = None;
     let mut successful_dials = 0u64;
@@ -117,18 +121,24 @@ async fn run_bridge_monitor(runtime: DataPlaneRuntime, plan: ReverseBridgePlan) 
                     successful_dials = successful_dials.saturating_add(1);
                     let recovered_after_failures = consecutive_failures;
                     consecutive_failures = 0;
-                    workers.push(MuxServerWorker::new_with_context(
-                        physical,
-                        plan.endpoint.reverse_tag.clone(),
-                        dispatcher.clone(),
-                        BridgeDispatchContext {
-                            sniffing: plan.endpoint.sniffing.clone(),
-                            routing_user: plan.endpoint.routing_user.clone(),
-                            policy_identity: plan.endpoint.policy_identity.clone(),
-                            user_level: plan.endpoint.user_level,
-                            site_to_site: plan.endpoint.site_to_site.clone(),
-                        },
-                    ));
+                    workers.push(
+                        MuxServerWorker::new_with_context_and_session_slots(
+                            physical,
+                            plan.endpoint.reverse_tag.clone(),
+                            dispatcher.clone(),
+                            BridgeDispatchContext {
+                                sniffing: plan.endpoint.sniffing.clone(),
+                                routing_user: plan.endpoint.routing_user.clone(),
+                                policy_identity: plan
+                                    .endpoint
+                                    .policy_identity
+                                    .clone(),
+                                user_level: plan.endpoint.user_level,
+                                site_to_site: plan.endpoint.site_to_site.clone(),
+                            },
+                            session_slots.clone(),
+                        ),
+                    );
                     tracing::info!(
                         event = "vless_reverse_bridge_worker_connected",
                         outbound_tag = %plan.outbound_tag,
@@ -229,6 +239,7 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].outbound_tag, "reverse");
         assert_eq!(plans[0].endpoint.reverse_tag, "bridge-in");
+        assert_eq!(plans[0].endpoint.max_active_sessions, None);
         assert_eq!(
             plans[0].endpoint.server.address(),
             &Address::Ipv4(std::net::Ipv4Addr::LOCALHOST)

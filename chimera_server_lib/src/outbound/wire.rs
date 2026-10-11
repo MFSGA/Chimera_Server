@@ -239,6 +239,10 @@ pub(super) struct VlessReversePayload {
     // never written to the VLESS wire protocol.
     #[prost(string, tag = "100")]
     pub(super) site_to_site_json: String,
+    // Chimera's optional Bridge admission cap is local runtime configuration;
+    // it is carried only in the compiled outbound snapshot, never on the wire.
+    #[prost(uint64, optional, tag = "101")]
+    pub(super) max_active_sessions: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]

@@ -515,6 +515,7 @@ mod tests {
             user_level: 0,
             sniffing: None,
             site_to_site: None,
+            max_active_sessions: None,
         };
         let expected_user = endpoint.user_id;
         let (mut client, mut server) = duplex(128);

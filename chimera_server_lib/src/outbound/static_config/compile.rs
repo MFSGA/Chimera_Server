@@ -1088,10 +1088,32 @@ fn encode_static_vless_config(
             })
             .transpose()?
             .unwrap_or_default();
+        if reverse.max_active_sessions == Some(0) {
+            return Err(
+                "VLESS Reverse maxActiveSessions must be greater than zero".into()
+            );
+        }
+        if reverse
+            .max_active_sessions
+            .is_some_and(|limit| limit > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            return Err(format!(
+                "VLESS Reverse maxActiveSessions cannot exceed {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            ));
+        }
         Some(VlessReversePayload {
             tag: reverse.tag,
             sniffing,
             site_to_site_json,
+            max_active_sessions: reverse
+                .max_active_sessions
+                .map(|limit| {
+                    u64::try_from(limit).map_err(|_| {
+                        "VLESS Reverse maxActiveSessions is out of range".to_string()
+                    })
+                })
+                .transpose()?,
         })
     } else {
         None
@@ -1099,7 +1121,12 @@ fn encode_static_vless_config(
 
     #[cfg(not(feature = "vless-reverse"))]
     if let Some(reverse) = config.reverse.as_ref() {
-        let _ = (&reverse.tag, &reverse.sniffing, &reverse.site_to_site);
+        let _ = (
+            &reverse.tag,
+            &reverse.sniffing,
+            &reverse.site_to_site,
+            &reverse.max_active_sessions,
+        );
         return Err(
             "VLESS outbound reverse requires the vless-reverse feature".into()
         );

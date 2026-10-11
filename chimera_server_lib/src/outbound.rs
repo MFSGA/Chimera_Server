@@ -159,6 +159,7 @@ pub(crate) struct VlessReverseBridgeEndpoint {
     pub(crate) sniffing: Option<crate::config::server_config::InboundSniffingConfig>,
     pub(crate) site_to_site:
         Option<crate::handler::vless_reverse::site_policy::SiteToSitePolicy>,
+    pub(crate) max_active_sessions: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

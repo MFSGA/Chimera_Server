@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split},
-    sync::mpsc,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -117,11 +117,28 @@ impl MuxServerWorker {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_context(
         physical: Box<dyn AsyncStream>,
         reverse_tag: String,
         dispatcher: Arc<dyn BridgeTcpDispatcher>,
         context: BridgeDispatchContext,
+    ) -> Self {
+        Self::new_with_context_and_session_slots(
+            physical,
+            reverse_tag,
+            dispatcher,
+            context,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_context_and_session_slots(
+        physical: Box<dyn AsyncStream>,
+        reverse_tag: String,
+        dispatcher: Arc<dyn BridgeTcpDispatcher>,
+        context: BridgeDispatchContext,
+        session_slots: Option<Arc<Semaphore>>,
     ) -> Self {
         let control = Arc::new(BridgeControlState::new());
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -142,6 +159,7 @@ impl MuxServerWorker {
             tasks.clone(),
             session_count.clone(),
             context,
+            session_slots,
         ));
         let writer_task = tokio::spawn(run_physical_writer(
             writer,
@@ -219,6 +237,7 @@ async fn run_physical_reader<R>(
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
     context: BridgeDispatchContext,
+    session_slots: Option<Arc<Semaphore>>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -269,6 +288,7 @@ async fn run_physical_reader<R>(
                     tasks.clone(),
                     session_count.clone(),
                     context.clone(),
+                    session_slots.clone(),
                 )
                 .await
             }
@@ -316,6 +336,7 @@ async fn handle_new_tcp(
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
     context: BridgeDispatchContext,
+    session_slots: Option<Arc<Semaphore>>,
 ) -> std::io::Result<()> {
     let target = frame.metadata.target.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -340,6 +361,7 @@ async fn handle_new_tcp(
             tasks,
             session_count,
             context,
+            session_slots,
         )
         .await;
     }
@@ -356,6 +378,20 @@ async fn handle_new_tcp(
             ),
         ));
     }
+    let session_permit = match try_acquire_session_slot(&session_slots) {
+        Ok(permit) => permit,
+        Err(_) => {
+            debug!(
+                event = "vless_reverse_bridge_session_limit_reached",
+                reverse_tag = %reverse_tag,
+                session_id = frame.metadata.session_id,
+                network = "tcp",
+                "rejecting VLESS Reverse session at configured active-session limit"
+            );
+            send_end_frame(frame.metadata.session_id, true, &outbound).await?;
+            return Ok(());
+        }
+    };
 
     let source = frame
         .metadata
@@ -403,6 +439,7 @@ async fn handle_new_tcp(
         outbound,
         sessions,
         cancellation,
+        session_permit,
     ));
     track_task(&tasks, task);
     Ok(())
@@ -419,6 +456,7 @@ async fn handle_new_udp(
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     session_count: Arc<AtomicU64>,
     context: BridgeDispatchContext,
+    session_slots: Option<Arc<Semaphore>>,
 ) -> std::io::Result<()> {
     let target = frame.metadata.target.as_ref().ok_or_else(|| {
         std::io::Error::new(
@@ -446,6 +484,20 @@ async fn handle_new_udp(
             ),
         ));
     }
+    let session_permit = match try_acquire_session_slot(&session_slots) {
+        Ok(permit) => permit,
+        Err(_) => {
+            debug!(
+                event = "vless_reverse_bridge_session_limit_reached",
+                reverse_tag = %reverse_tag,
+                session_id = frame.metadata.session_id,
+                network = "udp",
+                "rejecting VLESS Reverse session at configured active-session limit"
+            );
+            send_end_frame(frame.metadata.session_id, true, &outbound).await?;
+            return Ok(());
+        }
+    };
 
     let source = frame
         .metadata
@@ -476,9 +528,19 @@ async fn handle_new_udp(
         sessions,
         cancellation,
         site_to_site,
+        session_permit,
     ));
     track_task(&tasks, task);
     Ok(())
+}
+
+fn try_acquire_session_slot(
+    session_slots: &Option<Arc<Semaphore>>,
+) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
+    match session_slots {
+        Some(session_slots) => session_slots.clone().try_acquire_owned().map(Some),
+        None => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -492,6 +554,7 @@ async fn run_udp_session(
     sessions: SessionRoutes,
     cancellation: CancellationToken,
     site_to_site: Option<super::site_policy::SiteToSitePolicy>,
+    _session_permit: Option<OwnedSemaphorePermit>,
 ) {
     if !initial_payload.is_empty() {
         let request_target = match site_to_site.as_ref() {
@@ -711,6 +774,7 @@ async fn half_close_session(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tcp_session(
     session_id: u16,
     stream: Box<dyn AsyncStream>,
@@ -719,6 +783,7 @@ async fn run_tcp_session(
     outbound: mpsc::Sender<Bytes>,
     sessions: SessionRoutes,
     cancellation: CancellationToken,
+    _session_permit: Option<OwnedSemaphorePermit>,
 ) {
     let initial_payload_bytes = initial_payload.len();
     let (mut remote_read, mut remote_write) = split(stream);

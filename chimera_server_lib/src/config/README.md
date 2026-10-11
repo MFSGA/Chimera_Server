@@ -105,6 +105,14 @@ destination, so the Hub can route on the original Overlay address while the Edge
 dials the mapped LAN address. If omitted, the existing VLESS Reverse behavior is
 unchanged. If present, unmatched targets are denied.
 
+The same object accepts optional `maxActiveSessions`, a positive integer that
+caps concurrent logical TCP and UDP sessions across all physical Bridge workers
+owned by that outbound. When the cap is full, the Bridge sends an error END for
+the new logical session without dispatching it to a target; existing sessions
+and the physical worker remain available. The option is a Chimera resource
+policy, not an Xray setting. Omitting it leaves the Bridge unlimited, preserving
+the Xray-compatible default.
+
 ```json
 {
   "protocol": "vless",
@@ -116,6 +124,7 @@ unchanged. If present, unmatched targets are denied.
     "encryption": "none",
     "reverse": {
       "tag": "home-edge",
+      "maxActiveSessions": 512,
       "siteToSite": {
         "prefixMaps": [
           { "from": "10.200.1.0/24", "to": "192.168.50.0/24" }

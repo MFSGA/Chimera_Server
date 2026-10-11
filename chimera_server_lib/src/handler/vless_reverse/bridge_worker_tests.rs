@@ -1,6 +1,9 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -8,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     time::timeout,
 };
 
@@ -50,6 +53,7 @@ struct DispatchCall {
 struct FakeDispatcher {
     stream: Mutex<Option<DuplexStream>>,
     calls: Mutex<Vec<DispatchCall>>,
+    udp_calls: AtomicUsize,
 }
 
 impl FakeDispatcher {
@@ -57,6 +61,7 @@ impl FakeDispatcher {
         Self {
             stream: Mutex::new(Some(stream)),
             calls: Mutex::new(Vec::new()),
+            udp_calls: AtomicUsize::new(0),
         }
     }
 
@@ -106,6 +111,7 @@ impl BridgeTcpDispatcher for FakeDispatcher {
         _local: Option<SocketAddr>,
         _context: BridgeDispatchContext,
     ) -> std::io::Result<BridgeUdpSession> {
+        self.udp_calls.fetch_add(1, Ordering::Relaxed);
         let (requests, mut request_rx) =
             tokio::sync::mpsc::channel::<super::BridgeUdpRequest>(16);
         let (response_tx, responses) = tokio::sync::mpsc::channel(16);
@@ -139,6 +145,205 @@ fn tcp_destination(address: Ipv4Addr, port: u16) -> Destination {
         network: TargetNetwork::Tcp,
         location: NetLocation::new(Address::Ipv4(address), port),
     }
+}
+
+fn udp_destination(address: Ipv4Addr, port: u16) -> Destination {
+    Destination {
+        network: TargetNetwork::Udp,
+        location: NetLocation::new(Address::Ipv4(address), port),
+    }
+}
+
+#[tokio::test]
+async fn bridge_session_limit_is_shared_across_workers_and_tcp_udp() {
+    let slots = Arc::new(Semaphore::new(1));
+
+    let (physical_a, mut portal_a) = duplex(16 * 1024);
+    let (local_a, _local_peer_a) = duplex(16 * 1024);
+    let dispatcher_a = Arc::new(FakeDispatcher::new(local_a));
+    let worker_a = MuxServerWorker::new_with_context_and_session_slots(
+        Box::new(ReverseSessionStream::new(physical_a)),
+        "bridge-in".to_string(),
+        dispatcher_a.clone(),
+        BridgeDispatchContext::default(),
+        Some(slots.clone()),
+    );
+
+    portal_a
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 11,
+                    status: SessionStatus::New,
+                    option: FrameOption::default(),
+                    target: Some(tcp_destination(Ipv4Addr::LOCALHOST, 8080)),
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::new(),
+            })
+            .expect("encode first worker TCP NEW"),
+        )
+        .await
+        .expect("write first worker TCP NEW");
+    timeout(Duration::from_secs(1), async {
+        while worker_a.active_connections() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first worker consumes the shared session slot");
+
+    let (physical_b, mut portal_b) = duplex(16 * 1024);
+    let (local_b, _local_peer_b) = duplex(16 * 1024);
+    let dispatcher_b = Arc::new(FakeDispatcher::new(local_b));
+    let worker_b = MuxServerWorker::new_with_context_and_session_slots(
+        Box::new(ReverseSessionStream::new(physical_b)),
+        "bridge-in".to_string(),
+        dispatcher_b.clone(),
+        BridgeDispatchContext::default(),
+        Some(slots.clone()),
+    );
+
+    portal_b
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 22,
+                    status: SessionStatus::New,
+                    option: FrameOption::default().with_data(),
+                    target: Some(udp_destination(Ipv4Addr::LOCALHOST, 53)),
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::from_static(b"dns"),
+            })
+            .expect("encode second worker UDP NEW"),
+        )
+        .await
+        .expect("write second worker UDP NEW");
+    let denied = timeout(Duration::from_secs(1), read_frame(&mut portal_b))
+        .await
+        .expect("over-limit UDP session is rejected promptly")
+        .expect("read over-limit UDP END");
+    assert_eq!(denied.metadata.session_id, 22);
+    assert_eq!(denied.metadata.status, SessionStatus::End);
+    assert_eq!(denied.metadata.option, FrameOption::default().with_error());
+    assert_eq!(dispatcher_b.udp_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(worker_b.active_connections(), 0);
+
+    portal_b
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 24,
+                    status: SessionStatus::New,
+                    option: FrameOption::default(),
+                    target: Some(tcp_destination(Ipv4Addr::LOCALHOST, 80)),
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::new(),
+            })
+            .expect("encode second worker over-limit TCP NEW"),
+        )
+        .await
+        .expect("write second worker over-limit TCP NEW");
+    let denied = timeout(Duration::from_secs(1), read_frame(&mut portal_b))
+        .await
+        .expect("over-limit TCP session is rejected promptly")
+        .expect("read over-limit TCP END");
+    assert_eq!(denied.metadata.session_id, 24);
+    assert_eq!(denied.metadata.status, SessionStatus::End);
+    assert_eq!(denied.metadata.option, FrameOption::default().with_error());
+    assert!(dispatcher_b.calls().is_empty());
+    assert_eq!(worker_a.active_connections(), 1);
+    assert!(
+        worker_b.is_active(),
+        "overload keeps the physical worker alive"
+    );
+
+    portal_a
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 11,
+                    status: SessionStatus::End,
+                    option: FrameOption::default(),
+                    target: None,
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::new(),
+            })
+            .expect("encode first worker END"),
+        )
+        .await
+        .expect("write first worker END");
+    timeout(Duration::from_secs(1), async {
+        while slots.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closing the first session releases its shared slot");
+
+    portal_b
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 23,
+                    status: SessionStatus::New,
+                    option: FrameOption::default(),
+                    target: Some(tcp_destination(Ipv4Addr::LOCALHOST, 8081)),
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::new(),
+            })
+            .expect("encode second worker TCP NEW after release"),
+        )
+        .await
+        .expect("write second worker TCP NEW after release");
+    timeout(Duration::from_secs(1), async {
+        while worker_b.active_connections() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second worker can admit TCP after the shared slot is released");
+    assert_eq!(dispatcher_b.calls().len(), 1);
+
+    portal_b
+        .write_all(
+            &encode_frame(&MuxFrame {
+                metadata: FrameMetadata {
+                    session_id: 23,
+                    status: SessionStatus::End,
+                    option: FrameOption::default(),
+                    target: None,
+                    source: None,
+                    local: None,
+                    global_id: None,
+                },
+                payload: Bytes::new(),
+            })
+            .expect("encode second worker END"),
+        )
+        .await
+        .expect("write second worker END");
+    timeout(Duration::from_secs(1), async {
+        while slots.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closing the admitted session releases the slot");
 }
 
 fn site_to_site_policy() -> SiteToSitePolicy {
