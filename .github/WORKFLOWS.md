@@ -13,6 +13,30 @@ The repository uses four entry-point workflows and two shared local actions. Kee
 
 Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag.
 
+## AI-assisted development governance
+
+The authoritative Codex workflow and risk-based approval policy are in
+[`docs/ai-development-governance.md`](../docs/ai-development-governance.md),
+with independent review checks in
+[`docs/ai-review-checklist.md`](../docs/ai-review-checklist.md).
+Pull requests use `.github/pull_request_template.md`; confirmed failures
+are recorded in `LESSONS.md`. These are **procedural rules**, not proof that
+an autonomous coding or AI review GitHub Action has already been installed.
+
+- The existing Rust CI jobs remain the authoritative mechanical quality gates.
+  AI feedback is additive and cannot replace format, Clippy, Windows/Linux tests,
+  feature-matrix checks or release candidate validation.
+- Low-risk L0/L1 auto-merge may be added only through a separately reviewed
+  change with protected branch rules, independent checks and constrained tokens;
+  L2/L3 remain human-approved. AI-generated PR labels or checkboxes alone cannot
+  grant merge authorization.
+- AI review workflows must not run untrusted PR code with writable credentials
+  or invoke privileged tooling on untrusted Issue/PR content.
+- Stable releases remain **manual** via `release.yml`. Do not attach release
+  publication to PR auto-merge, push events or an AI verdict.
+- Any future nightly retrospective may suggest Lessons or PRs but cannot bypass
+  review or weaken required checks.
+
 ## Shared actions
 
 `actions/rust-ci-setup/action.yml` is for workflows that always run from the current repository revision. It owns stable Rust setup, Rust caching, and the pinned `cross` revision.

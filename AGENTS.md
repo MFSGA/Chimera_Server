@@ -32,6 +32,39 @@ report any necessary deviation from the project conventions.
   with the rationale, implementation status and verification evidence so later agents inherit
   the decision. Keep support claims synchronized with the compatibility matrix.
 
+## AI Development Governance (Codex)
+
+- Follow [AI development governance](docs/ai-development-governance.md) for the
+  Planner → Coder → independent Reviewer → CI/PR → Retrospective workflow.
+  Read relevant [Engineering Lessons](LESSONS.md) before code changes; use the
+  [independent review checklist](docs/ai-review-checklist.md) when reviewing a PR.
+  These documents add procedural requirements and cannot weaken the architecture,
+  Xray compatibility contract, release discipline, or current user instructions.
+- Before implementation, state the task goal, non-goals, affected boundary/owner,
+  expected verification, and risk classification L0–L3. Keep trivial changes short;
+  write a reviewable plan for protocol, cross-module, or high-risk changes.
+- Do not treat the coding Agent's self-review as independent review. A reviewer
+  must inspect the actual diff and evidence in a separate context. No Agent may
+  mark its own claims, skipped checks, or ignored tests as independently verified.
+- For parallel Codex tasks, use separate branches and Git worktrees. Never share
+  an editable index/worktree between concurrent coding agents; isolate Cargo
+  build output when concurrency could interfere.
+- Completion reports and pull requests must identify exact commands actually run,
+  their outcomes, unverified scope, compatibility deviations, remaining risks, and
+  whether human approval is required. Use the PR template for submitted changes.
+- Treat governance, workflow, release, secrets, `ref/`, and `vendor/` changes
+  as protected high-risk work (L3). Protocol, cryptography, policy, runtime,
+  platform and feature changes are at least L2. Neither class is eligible for
+  AI-only auto-merge; policy changes require maintainer review.
+- Automation is not permission. Codex must not auto-merge, push, release, deploy,
+  edit branch protections, or change CI gates without explicit authorization and
+  the applicable repository safeguards. The existing manually dispatched
+  `.github/workflows/release.yml` remains the sole stable release path.
+- Record confirmed engineering failures in `LESSONS.md`, with evidence, cause,
+  prevention, and reproducible verification. Repeated failure patterns may
+  propose stricter rules through reviewed changes, not self-approve or silently
+  relax existing rules.
+
 ## Project Goal, Scope and References
 
 - The ultimate goal is full xray-core compatibility **as a server**, with inbound compatibility
@@ -166,6 +199,10 @@ Paths below are relative to the repository root.
    not be run; distinguish pre-existing failures from regressions introduced by the change.
 6. Summarize the result, compatibility differences and remaining limitations. Update this
    document only when durable workflow, architecture or setup guidance changes.
+7. Before a PR or handoff, complete the evidence fields in `.github/pull_request_template.md`:
+   risk L0–L3, actual validation results (including omitted tests), independent review
+   status, compatibility baseline when relevant, and human approval requirements.
+   If the change caused a confirmed regression, record a properly evidenced lesson.
 
 ## Rust and Runtime Conventions
 
