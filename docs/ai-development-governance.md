@@ -90,11 +90,11 @@
 
 1. **现在可用**：Codex 按 `AGENTS.md`、本文件、`LESSONS.md` 工作，提交 PR 模板，使用已有 CI 和手工发布流程。
 2. **第二步（需仓库设置）**：独立 Codex 审查用只读/隔离身份运行，记录阻断级发现；为 CI/Review 设置 required checks，禁止 Agent 修改自身验证规则。
-3. **第三步（需单独授权和实际验证）**：仅对 L0/L1 的可信任务开自动 PR/合并；凭据、写权限与不可信代码运行隔离；设置并发/超时/成本上限及失败停止规则。仓库内 `auto-merge.yml` 仅允许根 README 的 L0/L1 文档 PR，在维护者风险标签、完整 CI、严格分支保护和必需 Review 均满足时请求 GitHub 原生 Auto-merge；相关事件按 PR 串行处理，并在 PR 更新、基分支修改或风险标签变更时撤销旧请求、重新核验 live 状态。标签撤销不能与 GitHub 的原生合并操作原子化，撤销是 best-effort；required CI 和 Review 规则仍由 GitHub 强制执行。它不会创建 PR，也不会自动合并 L2/L3 变更。
+3. **第三步（需单独授权和实际验证）**：仅对 L0/L1 的可信任务开自动 PR/合并；凭据、写权限与不可信代码运行隔离；设置并发/超时/成本上限及失败停止规则。仓库内 `auto-merge.yml` 仅允许根 README 的 L0/L1 文档 PR，在配置的维护者风险标签、完整 CI、管理员确认的严格分支保护和必需 Review 均满足时请求 GitHub 原生 Auto-merge；若门禁已全部满足，则用 head SHA 固定的 GitHub PR 合并 API 完成。相关事件按 PR 串行处理，并在 PR 更新、基分支修改或风险标签变更时撤销旧请求、重新核验 live 状态。由于 `GITHUB_TOKEN` 不能读取分支管理设置，必须由管理员配置 `CHIMERA_AUTOMERGE_MAINTAINERS` 和 `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true`；后者仅可在确认严格 required checks、审批与 stale-review dismissal 已生效、无绕过角色/应用、无 ruleset 或 merge queue 后设置。标签撤销不能与 GitHub 的原生合并操作原子化，撤销是 best-effort；required CI 和 Review 规则仍由 GitHub 强制执行。它不会创建 PR，也不会自动合并 L2/L3 变更。
 4. **第四步（另行审批）**：可定期生成经验复盘建议，但不触发自动 release；如需自动发布，先重新审议 `AGENTS.md` 的手动发布授权与现有 candidate-SHA 质量门禁，不得绕过。
 
 ## 9. 规则是否已经生效
 
 - **通过仓库文件生效**：Codex 指令、PR 模板、现有 CI / release 工作流。
-- **需要仓库管理员在 GitHub 配置**：classic `master` 分支保护、strict required checks、审批要求、Auto-merge、GitHub App/PAT、工作流 Secrets。仓库内自动合并工作流在这些条件不足或 active Ruleset 覆盖 `master` 时 fail closed。
+- **需要仓库管理员在 GitHub 配置**：strict classic `master` branch protection（required CI、审批、stale-review dismissal、admin enforcement、无绕过项和 merge queue）、Auto-merge、`CHIMERA_AUTOMERGE_MAINTAINERS` 与 `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED` 仓库变量。工作流在变量或 Auto-merge 缺失时 fail closed；它不自行验证管理员确认的分支规则。
 - **尚未实现**：独立 Codex 审查工作流、自动 Issue 编码/PR、自动风险分类、定时复盘工作流。自动合并仅处理由人工标记并审查的 L0/L1 PR；未完成管理员设置和真实运行验证前，不得宣称已启用。

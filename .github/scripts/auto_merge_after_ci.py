@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import sys
@@ -52,7 +51,12 @@ class GitHubApi:
     def __init__(self, token: str):
         self.token = token
 
-    def request(self, url: str, payload: dict[str, Any] | None = None) -> tuple[Any, dict[str, str]]:
+    def request(
+        self,
+        url: str,
+        payload: dict[str, Any] | None = None,
+        method: str | None = None,
+    ) -> tuple[Any, dict[str, str]]:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -63,7 +67,7 @@ class GitHubApi:
                 "X-GitHub-Api-Version": "2022-11-28",
                 **({"Content-Type": "application/json"} if data is not None else {}),
             },
-            method="POST" if data is not None else "GET",
+            method=method or ("POST" if data is not None else "GET"),
         )
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
@@ -76,6 +80,10 @@ class GitHubApi:
 
     def get(self, path: str) -> Any:
         value, _ = self.request(f"https://api.github.com{path}")
+        return value
+
+    def put(self, path: str, payload: dict[str, Any]) -> Any:
+        value, _ = self.request(f"https://api.github.com{path}", payload, method="PUT")
         return value
 
     def get_all(self, path: str) -> list[Any]:
@@ -124,23 +132,16 @@ def required_jobs_passed(jobs: list[dict[str, Any]], attempt: int) -> bool:
     )
 
 
-def protected_branch_ready(protection: dict[str, Any]) -> bool:
-    checks = protection.get("required_status_checks") or {}
-    contexts = set(checks.get("contexts") or ())
-    contexts.update(
-        item.get("context")
-        for item in checks.get("checks") or ()
-        if item.get("context")
-    )
-    reviews = protection.get("required_pull_request_reviews") or {}
-    admins_enforced = (protection.get("enforce_admins") or {}).get("enabled") is True
-    return (
-        "CI / Required checks" in contexts
-        and checks.get("strict") is True
-        and reviews.get("required_approving_review_count", 0) >= 1
-        and reviews.get("dismiss_stale_reviews") is True
-        and admins_enforced
-    )
+def protection_confirmation_enabled(value: str | None) -> bool:
+    return value == "true"
+
+
+def configured_maintainers(value: str | None) -> set[str]:
+    return {
+        login.strip().casefold()
+        for login in (value or "").split(",")
+        if login.strip()
+    }
 
 
 def high_risk_file(path: str) -> bool:
@@ -179,51 +180,20 @@ def api_path(repository: str, suffix: str) -> str:
 
 def maintainer_applied_current_label(
     api: GitHubApi,
-    repository: str,
     label: str,
     author: str,
     events: list[dict[str, Any]],
+    maintainers: set[str],
 ) -> bool:
     actor = current_risk_label_actor(label, events)
-    if not actor or actor.lower() == author.lower():
+    if (
+        not actor
+        or actor.casefold() == author.casefold()
+        or actor.casefold() not in maintainers
+    ):
         return False
     user = api.get(f"/users/{urllib.parse.quote(actor, safe='')}")
-    if user.get("type") != "User":
-        return False
-    permission = api.get(
-        api_path(
-            repository,
-            f"/collaborators/{urllib.parse.quote(actor, safe='')}/permission",
-        )
-    )
-    return permission.get("permission") in {"admin", "maintain"}
-
-
-def ruleset_targets_master(ruleset: dict[str, Any]) -> bool:
-    conditions = ruleset.get("conditions") or {}
-    ref_names = conditions.get("ref_name") or {}
-    includes = ref_names.get("include") or ["~ALL"]
-    excludes = ref_names.get("exclude") or []
-    target = "refs/heads/master"
-
-    def matches(pattern: str) -> bool:
-        if pattern in {"~ALL", "~DEFAULT_BRANCH"}:
-            return True
-        return fnmatch.fnmatchcase(target, pattern)
-
-    return any(matches(pattern) for pattern in includes) and not any(
-        matches(pattern) for pattern in excludes
-    )
-
-
-def active_master_ruleset_exists(api: GitHubApi, repository: str) -> bool:
-    rulesets = api.get_all(
-        api_path(repository, "/rulesets?includes_parents=true&per_page=100")
-    )
-    return any(
-        ruleset.get("enforcement") == "active" and ruleset_targets_master(ruleset)
-        for ruleset in rulesets
-    )
+    return user.get("type") == "User"
 
 
 def enable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
@@ -240,6 +210,46 @@ def enable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
         """,
         {"pullRequestId": pull_request["node_id"]},
     )
+
+
+def merge_pull_request(
+    api: GitHubApi,
+    repository: str,
+    pull_request: dict[str, Any],
+    expected_head_sha: str,
+) -> None:
+    result = api.put(
+        api_path(repository, f"/pulls/{pull_request['number']}/merge"),
+        {"sha": expected_head_sha, "merge_method": "squash"},
+    )
+    if result.get("merged") is not True:
+        raise GitHubApiError("GitHub did not confirm the pull request merge")
+
+
+def complete_or_queue_auto_merge(
+    api: GitHubApi,
+    repository: str,
+    pull_request: dict[str, Any],
+    expected_head_sha: str,
+) -> bool:
+    if pull_request.get("mergeable_state") == "clean":
+        merge_pull_request(api, repository, pull_request, expected_head_sha)
+        return False
+
+    try:
+        enable_auto_merge(api, pull_request)
+        return True
+    except GitHubApiError:
+        # The PR can become clean after the last GET but before the GraphQL
+        # mutation. In that race, finish with GitHub's head-SHA-guarded merge API.
+        latest = api.get(api_path(repository, f"/pulls/{pull_request['number']}"))
+        if (
+            latest.get("mergeable_state") != "clean"
+            or latest.get("head", {}).get("sha") != expected_head_sha
+        ):
+            raise
+        merge_pull_request(api, repository, latest, expected_head_sha)
+        return False
 
 
 def disable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
@@ -341,6 +351,8 @@ def process_pull_request(
     repository: str,
     workflow_run: dict[str, Any],
     event_pr: dict[str, Any],
+    maintainers: set[str],
+    protection_confirmed: bool,
 ) -> None:
     number = event_pr.get("number")
     if not isinstance(number, int):
@@ -369,6 +381,11 @@ def process_pull_request(
     ):
         raise SkipAutomation(f"PR #{number} is missing a successful required CI job")
 
+    if not protection_confirmed:
+        raise SkipAutomation(
+            "set CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true after configuring master protections"
+        )
+
     labels = {label.get("name", "").lower() for label in pr.get("labels", [])}
     authorized_labels = labels & AUTO_MERGE_LABELS
     if len(authorized_labels) != 1:
@@ -377,8 +394,10 @@ def process_pull_request(
     events = api.get_all(api_path(repository, f"/issues/{number}/events?per_page=100"))
     author = pr.get("user", {}).get("login", "")
     label = next(iter(authorized_labels))
-    if not maintainer_applied_current_label(api, repository, label, author, events):
-        raise SkipAutomation(f"PR #{number} risk label was not applied by a different maintainer")
+    if not maintainer_applied_current_label(api, label, author, events, maintainers):
+        raise SkipAutomation(
+            f"PR #{number} risk label was not applied by a different configured maintainer"
+        )
 
     files = api.get_all(api_path(repository, f"/pulls/{number}/files?per_page=100"))
     if pr.get("changed_files", 0) != len(files):
@@ -391,22 +410,6 @@ def process_pull_request(
         raise SkipAutomation("repository Auto-merge is disabled")
     if settings.get("default_branch") != "master":
         raise SkipAutomation("the repository default branch is not master")
-
-    if active_master_ruleset_exists(api, repository):
-        raise SkipAutomation(
-            "an active ruleset targets master; this workflow currently requires classic branch protection"
-        )
-
-    try:
-        protection = api.get(api_path(repository, "/branches/master/protection"))
-    except GitHubApiError as error:
-        if "HTTP 404" in str(error):
-            raise SkipAutomation("master has no classic branch protection rule") from None
-        raise
-    if not protected_branch_ready(protection):
-        raise SkipAutomation(
-            "master must require CI / Required checks, one approval, stale-review dismissal, and admin enforcement"
-        )
 
     latest_pr = api.get(api_path(repository, f"/pulls/{number}"))
     latest_head = latest_pr.get("head", {})
@@ -429,7 +432,7 @@ def process_pull_request(
         api_path(repository, f"/issues/{number}/events?per_page=100")
     )
     if not maintainer_applied_current_label(
-        api, repository, label, author, latest_events
+        api, label, author, latest_events, maintainers
     ):
         raise SkipAutomation(f"PR #{number} risk label authorization changed during preflight")
     latest_files = api.get_all(
@@ -440,10 +443,14 @@ def process_pull_request(
     ):
         raise SkipAutomation(f"PR #{number} file scope changed during auto-merge preflight")
 
-    # GitHub has no atomic label-check-and-enable mutation; revocation events
-    # cancel queued Auto-merge requests on a best-effort basis.
-    enable_auto_merge(api, latest_pr)
-    print(f"Enabled GitHub Auto-merge for eligible PR #{number}.")
+    # If the PR is not ready, GitHub holds native Auto-merge until its required
+    # gates pass. A clean PR cannot be queued, so merge it with the same head SHA.
+    # Label revocation remains best-effort because there is no atomic
+    # label-check-and-merge operation.
+    if complete_or_queue_auto_merge(api, repository, latest_pr, latest_head["sha"]):
+        print(f"Enabled GitHub Auto-merge for eligible PR #{number}.")
+    else:
+        print(f"Merged eligible PR #{number} through GitHub.")
 
 
 def self_test() -> None:
@@ -467,33 +474,110 @@ def self_test() -> None:
         successful_jobs + [successful_jobs[0]],
         1,
     )
-    assert protected_branch_ready(
+    assert protection_confirmation_enabled("true")
+    assert not protection_confirmation_enabled(None)
+    assert not protection_confirmation_enabled("True")
+    assert not protection_confirmation_enabled("false")
+    assert configured_maintainers(" Alice, bob ,") == {"alice", "bob"}
+    assert configured_maintainers(None) == set()
+
+    class UserLookupStub:
+        def get(self, path: str) -> dict[str, str]:
+            assert path == "/users/maintainer"
+            return {"type": "User"}
+
+    authorized_label_event = [
         {
-            "required_status_checks": {
-                "contexts": ["CI / Required checks"],
-                "strict": True,
-            },
-            "required_pull_request_reviews": {
-                "required_approving_review_count": 1,
-                "dismiss_stale_reviews": True,
-            },
-            "enforce_admins": {"enabled": True},
+            "event": "labeled",
+            "label": {"name": "automerge:l1"},
+            "actor": {"login": "maintainer"},
+            "created_at": "2026-10-14T10:00:00Z",
         }
+    ]
+    assert maintainer_applied_current_label(
+        UserLookupStub(),
+        "automerge:l1",
+        "pr-author",
+        authorized_label_event,
+        {"maintainer"},
     )
-    assert not protected_branch_ready({})
-    assert not protected_branch_ready(
-        {
-            "required_status_checks": {
-                "contexts": ["CI / Required checks"],
-                "strict": False,
-            },
-            "required_pull_request_reviews": {
-                "required_approving_review_count": 1,
-                "dismiss_stale_reviews": True,
-            },
-            "enforce_admins": {"enabled": True},
-        }
+    assert not maintainer_applied_current_label(
+        UserLookupStub(),
+        "automerge:l1",
+        "maintainer",
+        authorized_label_event,
+        {"maintainer"},
     )
+    assert not maintainer_applied_current_label(
+        UserLookupStub(),
+        "automerge:l1",
+        "pr-author",
+        authorized_label_event,
+        set(),
+    )
+
+    class MergeFlowApiStub:
+        def __init__(self) -> None:
+            self.put_calls: list[tuple[str, dict[str, Any]]] = []
+            self.graphql_calls: list[str] = []
+
+        def put(self, path: str, payload: dict[str, Any]) -> dict[str, bool]:
+            self.put_calls.append((path, payload))
+            return {"merged": True}
+
+        def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+            self.graphql_calls.append(query)
+            return {}
+
+        def get(self, path: str) -> dict[str, Any]:
+            raise AssertionError(f"unexpected API read: {path}")
+
+    immediate_merge_api = MergeFlowApiStub()
+    assert not complete_or_queue_auto_merge(
+        immediate_merge_api,
+        "MFSGA/Chimera_Server",
+        {"number": 42, "mergeable_state": "clean"},
+        "head-sha",
+    )
+    assert immediate_merge_api.put_calls == [
+        (
+            "/repos/MFSGA/Chimera_Server/pulls/42/merge",
+            {"sha": "head-sha", "merge_method": "squash"},
+        )
+    ]
+    assert not immediate_merge_api.graphql_calls
+
+    queued_merge_api = MergeFlowApiStub()
+    assert complete_or_queue_auto_merge(
+        queued_merge_api,
+        "MFSGA/Chimera_Server",
+        {"number": 42, "mergeable_state": "blocked", "node_id": "PR_node"},
+        "head-sha",
+    )
+    assert not queued_merge_api.put_calls
+    assert len(queued_merge_api.graphql_calls) == 1
+
+    class CleanRaceApiStub(MergeFlowApiStub):
+        def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+            raise GitHubApiError("simulated clean-state auto-merge rejection")
+
+        def get(self, path: str) -> dict[str, Any]:
+            assert path == "/repos/MFSGA/Chimera_Server/pulls/42"
+            return {
+                "number": 42,
+                "mergeable_state": "clean",
+                "head": {"sha": "head-sha"},
+            }
+
+    clean_race_api = CleanRaceApiStub()
+    assert not complete_or_queue_auto_merge(
+        clean_race_api,
+        "MFSGA/Chimera_Server",
+        {"number": 42, "mergeable_state": "blocked", "node_id": "PR_node"},
+        "head-sha",
+    )
+    assert len(clean_race_api.put_calls) == 1
+
     assert high_risk_file(".github/workflows/ci.yml")
     assert high_risk_file("chimera_server_lib/src/config/def.rs")
     assert high_risk_file("chimera_cli/src/main.rs")
@@ -501,15 +585,6 @@ def self_test() -> None:
     assert high_risk_file("VLESS_REVERSE_DESIGN.md")
     assert not high_risk_file("README.md")
     assert not high_risk_file("README.en.md")
-    assert ruleset_targets_master(
-        {"conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}}
-    )
-    assert ruleset_targets_master(
-        {"conditions": {"ref_name": {"include": ["refs/heads/*"], "exclude": []}}}
-    )
-    assert not ruleset_targets_master(
-        {"conditions": {"ref_name": {"include": ["refs/heads/release/*"], "exclude": []}}}
-    )
     events = [
         {
             "event": "labeled",
@@ -593,6 +668,12 @@ def main() -> int:
         repository = os.environ.get("GITHUB_REPOSITORY", "")
         if not token or not repository:
             raise GitHubApiError("required GitHub Actions environment is missing")
+        maintainers = configured_maintainers(
+            os.environ.get("CHIMERA_AUTOMERGE_MAINTAINERS")
+        )
+        protection_confirmed = protection_confirmation_enabled(
+            os.environ.get("CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED")
+        )
         api = GitHubApi(token)
         event_name = os.environ.get("GITHUB_EVENT_NAME", "")
         if event_name == "workflow_run":
@@ -612,19 +693,22 @@ def main() -> int:
                 raise SkipAutomation("the CI run has no associated pull request")
             if len(pull_requests) != 1:
                 raise SkipAutomation("the CI run is associated with multiple PRs; refusing ambiguous serialization")
-        elif event_name == "pull_request_target":
+        elif event_name in {"pull_request_target", "pull_request_review"}:
             event_pr = event.get("pull_request") or {}
             action = event.get("action")
-            if action not in {"synchronize", "unlabeled", "labeled", "edited"}:
-                raise SkipAutomation("the pull request event does not affect merge authorization")
-            number = event_pr.get("number")
-            label_events = (
-                api.get_all(api_path(repository, f"/issues/{number}/events?per_page=100"))
-                if isinstance(number, int)
-                else []
-            )
-            if should_cancel_auto_merge(action, event, event_pr, label_events):
-                disable_auto_merge(api, event_pr)
+            if event_name == "pull_request_target":
+                if action not in {"synchronize", "unlabeled", "labeled", "edited"}:
+                    raise SkipAutomation("the pull request event does not affect merge authorization")
+                number = event_pr.get("number")
+                label_events = (
+                    api.get_all(api_path(repository, f"/issues/{number}/events?per_page=100"))
+                    if isinstance(number, int)
+                    else []
+                )
+                if should_cancel_auto_merge(action, event, event_pr, label_events):
+                    disable_auto_merge(api, event_pr)
+            elif action not in {"submitted", "edited", "dismissed"}:
+                raise SkipAutomation("the pull request review event is not actionable")
             pull_requests = [event_pr]
             workflow_run = None
         else:
@@ -635,7 +719,14 @@ def main() -> int:
                 current_run = workflow_run or latest_ci_run_for_pull_request(
                     api, repository, event_pr
                 )
-                process_pull_request(api, repository, current_run, event_pr)
+                process_pull_request(
+                    api,
+                    repository,
+                    current_run,
+                    event_pr,
+                    maintainers,
+                    protection_confirmed,
+                )
             except SkipAutomation as skip:
                 print(f"Skipping PR #{event_pr.get('number', '?')}: {skip}")
         return 0
