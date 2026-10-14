@@ -86,15 +86,15 @@
 - 每次高风险回归及重要发布失败后复盘；如配置周期性夜间 Agent 复盘，工作流应只有读权限，最多创建受审的建议或 PR，**不得自动放宽规则或合并自身修改**。
 - 除非经复验，不得将假设、单次临时修复或推测标注为“已解决”；防止 LESSONS 变成无限膨胀的提示词。
 
-## 8. 引入自动化的建议顺序（目前不表示已启用）
+## 8. 引入自动化的建议顺序
 
 1. **现在可用**：Codex 按 `AGENTS.md`、本文件、`LESSONS.md` 工作，提交 PR 模板，使用已有 CI 和手工发布流程。
 2. **第二步（需仓库设置）**：独立 Codex 审查用只读/隔离身份运行，记录阻断级发现；为 CI/Review 设置 required checks，禁止 Agent 修改自身验证规则。
-3. **第三步（需单独授权和实际验证）**：仅对 L0/L1 的可信任务开自动 PR/合并；凭据、写权限与不可信代码运行隔离；设置并发/超时/成本上限及失败停止规则。
+3. **第三步（需单独授权和实际验证）**：仅对 L0/L1 的可信任务开自动 PR/合并；凭据、写权限与不可信代码运行隔离；设置并发/超时/成本上限及失败停止规则。仓库内 `auto-merge.yml` 仅允许根 README 的 L0/L1 文档 PR，在维护者风险标签、完整 CI、严格分支保护和必需 Review 均满足时请求 GitHub 原生 Auto-merge；相关事件按 PR 串行处理，并在 PR 更新、基分支修改或风险标签变更时撤销旧请求、重新核验 live 状态。标签撤销不能与 GitHub 的原生合并操作原子化，撤销是 best-effort；required CI 和 Review 规则仍由 GitHub 强制执行。它不会创建 PR，也不会自动合并 L2/L3 变更。
 4. **第四步（另行审批）**：可定期生成经验复盘建议，但不触发自动 release；如需自动发布，先重新审议 `AGENTS.md` 的手动发布授权与现有 candidate-SHA 质量门禁，不得绕过。
 
 ## 9. 规则是否已经生效
 
 - **通过仓库文件生效**：Codex 指令、PR 模板、现有 CI / release 工作流。
-- **需要仓库管理员在 GitHub 配置**：分支保护/Rulesets、required checks、审批要求、Auto-merge、GitHub App/PAT、工作流 Secrets。
-- **尚未实现**：独立 Codex 审查工作流、自动 Issue 编码/PR、按风险自动合并、定时复盘工作流。以上仅为治理目标，不能在 PR 中声明已经有这些机制。
+- **需要仓库管理员在 GitHub 配置**：classic `master` 分支保护、strict required checks、审批要求、Auto-merge、GitHub App/PAT、工作流 Secrets。仓库内自动合并工作流在这些条件不足或 active Ruleset 覆盖 `master` 时 fail closed。
+- **尚未实现**：独立 Codex 审查工作流、自动 Issue 编码/PR、自动风险分类、定时复盘工作流。自动合并仅处理由人工标记并审查的 L0/L1 PR；未完成管理员设置和真实运行验证前，不得宣称已启用。

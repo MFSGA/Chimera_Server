@@ -1,12 +1,13 @@
 # GitHub Actions layout
 
-The repository uses four entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
+The repository uses five entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
 
 ## Workflows
 
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
 | `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
+| `auto-merge.yml` | Successful `CI` completion and PR authorization changes | Revalidates low-risk PRs, cancels stale Auto-merge requests, and requests native GitHub Auto-merge only after every gate passes |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
@@ -26,10 +27,9 @@ an autonomous coding or AI review GitHub Action has already been installed.
 - The existing Rust CI jobs remain the authoritative mechanical quality gates.
   AI feedback is additive and cannot replace format, Clippy, Windows/Linux tests,
   feature-matrix checks or release candidate validation.
-- Low-risk L0/L1 auto-merge may be added only through a separately reviewed
-  change with protected branch rules, independent checks and constrained tokens;
-  L2/L3 remain human-approved. AI-generated PR labels or checkboxes alone cannot
-  grant merge authorization.
+- Low-risk L0/L1 auto-merge requires protected branch rules, independent checks
+  and constrained tokens; L2/L3 remain human-merged. AI-generated PR labels or
+  checkboxes alone cannot grant merge authorization.
 - AI review workflows must not run untrusted PR code with writable credentials
   or invoke privileged tooling on untrusted Issue/PR content.
 - Stable releases remain **manual** via `release.yml`. Do not attach release
@@ -57,9 +57,21 @@ lint            fmt + clippy
 test            Ubuntu + Windows workspace tests
 
 build           Linux GNU + Linux musl + Windows MSVC release-target builds
+required-checks stable aggregate over every required CI job
 ```
 
 Jobs run in parallel. A formatting failure should not hide a Windows compile failure, and one target failure should not cancel the other matrix entries.
+
+`auto-merge.yml` runs after the trusted `CI` workflow completes and when a PR is synchronized, edited, labeled, or unlabeled. Events are serialized per PR. It checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. For a PR with current or historical auto-merge risk labeling, an authorization change first cancels any queued native Auto-merge request, then revalidates the live PR state. It re-reads head, labels, and changed files immediately before requesting native Auto-merge, and only proceeds when all of the following hold:
+
+- The PR comes from this repository, targets `master`, is open, and its head has not changed since the successful CI run.
+- A repository admin or maintainer other than the PR author applied exactly one of `automerge:l0` or `automerge:l1`; the label is a risk classification, not a review substitute.
+- Every changed file is one of the root README files (`README.md`, `README.en.md`, `README.fa.md`, `README.ru.md`). Code, workflow, configuration, reference, vendor, and other documentation changes remain manual-merge only.
+- Repository Auto-merge is enabled, no active ruleset targets `master`, and classic branch protection requires strict/up-to-date `CI / Required checks`, at least one approval, stale-approval dismissal, and admin enforcement.
+
+The workflow skips when a prerequisite is absent. A maintainer must configure GitHub Auto-merge and classic `master` protection, then create the two labels before this automation can activate. The current repository settings do not meet those prerequisites.
+
+Label revocation is best-effort: GitHub does not provide an atomic operation that combines the final label check with enabling native Auto-merge. If all merge gates become satisfied in the small interval before the cancellation event is handled, GitHub may merge first. Required CI, up-to-date branch and review protections remain enforced by GitHub.
 
 Build/reference rules:
 
