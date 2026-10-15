@@ -1,17 +1,41 @@
 # GitHub Actions layout
 
-The repository uses four entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
+The repository uses five entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
 
 ## Workflows
 
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
 | `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
+| `auto-merge.yml` | Successful `CI` completion, PR authorization changes, and review updates | Revalidates low-risk PRs, cancels stale Auto-merge requests, and queues or completes the merge only after every gate passes |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
 
 Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag.
+
+## AI-assisted development governance
+
+The authoritative Codex workflow and risk-based approval policy are in
+[`docs/ai-development-governance.md`](../docs/ai-development-governance.md),
+with independent review checks in
+[`docs/ai-review-checklist.md`](../docs/ai-review-checklist.md).
+Pull requests use `.github/pull_request_template.md`; confirmed failures
+are recorded in `LESSONS.md`. These are **procedural rules**, not proof that
+an autonomous coding or AI review GitHub Action has already been installed.
+
+- The existing Rust CI jobs remain the authoritative mechanical quality gates.
+  AI feedback is additive and cannot replace format, Clippy, Windows/Linux tests,
+  feature-matrix checks or release candidate validation.
+- Low-risk L0/L1 auto-merge requires protected branch rules, independent checks
+  and constrained tokens; L2/L3 remain human-merged. AI-generated PR labels or
+  checkboxes alone cannot grant merge authorization.
+- AI review workflows must not run untrusted PR code with writable credentials
+  or invoke privileged tooling on untrusted Issue/PR content.
+- Stable releases remain **manual** via `release.yml`. Do not attach release
+  publication to PR auto-merge, push events or an AI verdict.
+- Any future nightly retrospective may suggest Lessons or PRs but cannot bypass
+  review or weaken required checks.
 
 ## Shared actions
 
@@ -33,9 +57,22 @@ lint            fmt + clippy
 test            Ubuntu + Windows workspace tests
 
 build           Linux GNU + Linux musl + Windows MSVC release-target builds
+required-checks stable aggregate over every required CI job
 ```
 
 Jobs run in parallel. A formatting failure should not hide a Windows compile failure, and one target failure should not cancel the other matrix entries.
+
+`auto-merge.yml` runs after the trusted `CI` workflow completes, when a PR is synchronized, edited, labeled, or unlabeled, and when its review is submitted, edited, or dismissed. Events are serialized per PR. It checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. For a PR with current or historical auto-merge risk labeling, a head or label change first cancels any queued native Auto-merge request; each relevant PR or review event then revalidates the live PR state. It re-reads head, labels, and changed files immediately before requesting or completing the merge, and only proceeds when all of the following hold:
+
+- The PR comes from this repository, targets `master`, is open, and its head has not changed since the successful CI run.
+- A username listed in `CHIMERA_AUTOMERGE_MAINTAINERS`, other than the PR author, applied exactly one of `automerge:l0` or `automerge:l1`; the label is a risk classification, not a review substitute.
+- Every changed file is one of the root README files (`README.md`, `README.en.md`, `README.fa.md`, `README.ru.md`). Code, workflow, configuration, reference, vendor, and other documentation changes remain manual-merge only.
+- Repository Auto-merge is enabled, and the repository variables `CHIMERA_AUTOMERGE_MAINTAINERS` and `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` are configured. The maintainer variable is a comma-separated list of GitHub usernames permitted to apply the risk labels. The confirmation variable is an administrator's assertion that classic `master` branch protection enforces strict/up-to-date `CI / Required checks`, at least one approval, stale-approval dismissal, and admin enforcement; no active ruleset, merge queue, or bypass actor can skip those gates.
+- If GitHub reports that the PR is already clean and mergeable, the workflow completes it through the pull-request merge API pinned to the verified head SHA. Otherwise it requests native GitHub Auto-merge, which waits for remaining required reviews/checks. The job needs `contents: write` for the ready-to-merge API call and executes only this trusted script from the default branch.
+
+The workflow skips when a prerequisite is absent. GitHub Actions `GITHUB_TOKEN` cannot read repository administration settings, so the workflow does not inspect branch protection or rulesets itself; setting the confirmation variable without those protections would allow an unsafe immediate merge. An administrator must verify the protections, enable GitHub Auto-merge, set both variables, and create the two labels before this automation can activate. The current repository settings do not meet those prerequisites.
+
+Label revocation is best-effort: GitHub does not provide an atomic operation that combines the final label check with enabling native Auto-merge. If all merge gates become satisfied in the small interval before the cancellation event is handled, GitHub may merge first. Required CI, up-to-date branch and review protections remain enforced by GitHub.
 
 Build/reference rules:
 
