@@ -323,9 +323,15 @@ Freedom outbound settings support ordered `finalRules` matching `action`,
 decides whether the target is allowed. `network` accepts a string, a comma-
 separated string, or an array; when omitted it follows Xray's TCP default.
 `port` accepts a number or a comma-separated string of ports/ranges. `ip`
-accepts a string or array of literal IP/CIDR strings. For a hostname target, all
-resolved addresses are checked before Freedom dials; any blocked candidate
-rejects the request. These checks use the same rule matcher from the shared
+accepts a string or array of literal IP/CIDR strings and positive Xray GeoIP
+references (`geoip:CODE`, `ext:geoip.dat:CODE`, or
+`ext-ip:geoip.dat:CODE`). GeoIP references are expanded from the Xray
+`geoip.dat` asset selected by `xray.location.asset` /
+`XRAY_LOCATION_ASSET` (or the executable directory and standard Xray asset
+directories). Missing files, unknown codes, and empty code entries fail
+configuration compilation so a requested rule cannot be silently dropped.
+For a hostname target, all resolved addresses are checked before Freedom dials;
+any blocked candidate rejects the request. These checks use the same rule matcher from the shared
 TCP/UDP outbound selector and Dokodemo's dedicated UDP route, including new
 and per-packet sessions.
 
@@ -335,12 +341,43 @@ Shadowsocks inbounds. An explicit matching `allow` rule overrides that default.
 The Edge `reverse.siteToSite` map/ACL remains a separate, narrower Chimera
 extension: it maps Overlay destinations and checks the mapped LAN endpoint.
 
-This is a partial compatibility slice. GeoIP/ext IP rules, IP reverse-match,
+This is a partial compatibility slice. IP reverse-match,
 `blockDelay`, non-default `domainStrategy`/`targetStrategy`, redirect/destination
 override, nonzero `userLevel`, fragment/noise, and Freedom socket/dialer settings
 fail explicitly until implemented. A denied connection is closed or its UDP
 packet dropped immediately; Xray's configurable/default delayed blackhole is
 not reproduced yet.
+
+## API tunnel inbound
+
+The API-routed `protocol: "tunnel"` inbound accepts a TCP `listen` plus `port`
+and starts the management gRPC server on that address. A Linux abstract Unix
+name (`listen: "@name"` without `port`) remains supported. Xray-shaped tunnel
+settings may include `rewriteAddress`; Chimera validates the address but does
+not use it as a proxy destination because the inbound is reserved for the API
+control route and gRPC binds directly. Other tunnel settings, stream settings,
+and sniffing remain rejected.
+
+## Xray metrics HTTP endpoint
+
+The top-level `metrics.listen` setting starts an HTTP listener that serves
+`GET /debug/vars` with the Xray-shaped `memstats`, `stats`, and `observatory`
+objects. Traffic counters use Chimera's current inbound/outbound/user totals;
+observatory entries expose the existing outbound observation state. This is
+the endpoint 3x-ui polls for its Xray metrics history.
+
+Rust has no Go runtime heap or garbage collector. On Linux, `memstats.HeapAlloc`
+and `memstats.Sys` therefore report process resident and virtual memory from
+`/proc/self/status` as useful memory-history approximations; they are not
+equivalent to Go allocator counters. `HeapObjects`, `NumGC`, and `PauseNs` are
+zero, and a `chimera` object identifies this distinction. Other operating
+systems currently report zero for process memory until a native source is
+implemented and verified.
+
+When `metrics.tag` is also set, Chimera logs that the Xray tagged outbound
+access path is unavailable while still serving the configured HTTP listener.
+A tag-only metrics config is rejected because it cannot start the 3x-ui HTTP
+endpoint and the outbound routing mode is not implemented.
 
 ## Xray DNS hosts subset
 

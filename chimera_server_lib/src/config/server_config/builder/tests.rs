@@ -1439,6 +1439,58 @@ fn xray_internal_tunnel_preserves_control_plane_identity() {
 }
 
 #[test]
+fn xray_tcp_api_tunnel_accepts_listen_and_port() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 62789,
+        "protocol": "tunnel",
+        "settings": {"rewriteAddress": "127.0.0.1"},
+        "tag": "api"
+    }))
+    .expect("valid Xray TCP API tunnel inbound");
+
+    let config =
+        ServerConfig::try_from(inbound).expect("TCP API tunnel should build");
+    assert!(matches!(config.protocol, ServerProxyConfig::Tunnel));
+    match config.bind_location {
+        crate::address::BindLocation::Address(location) => {
+            assert_eq!(location.address().to_string(), "127.0.0.1");
+            assert_eq!(location.port(), 62789);
+        }
+    }
+}
+
+#[test]
+fn xray_tcp_api_tunnel_rejects_unknown_settings() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "port": 62789,
+        "protocol": "tunnel",
+        "settings": {"rewriteAddress": "127.0.0.1", "unexpected": true},
+        "tag": "api"
+    }))
+    .expect("literal Xray API tunnel should deserialize");
+
+    let error = ServerConfig::try_from(inbound)
+        .expect_err("unrecognized tunnel settings must not be ignored");
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn xray_tcp_api_tunnel_requires_port() {
+    let inbound: InboudItem = serde_json::from_value(serde_json::json!({
+        "listen": "127.0.0.1",
+        "protocol": "tunnel",
+        "tag": "api"
+    }))
+    .expect("literal Xray API tunnel may omit port until build");
+
+    let error = ServerConfig::try_from(inbound)
+        .expect_err("TCP API tunnel without a port must fail");
+    assert!(error.to_string().contains("requires port"));
+}
+
+#[test]
 fn non_tunnel_inbound_still_requires_port() {
     let inbound: InboudItem = serde_json::from_value(serde_json::json!({
         "listen": "127.0.0.1",

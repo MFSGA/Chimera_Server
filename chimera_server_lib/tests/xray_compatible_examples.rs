@@ -34,6 +34,15 @@ fn xray_compatible_examples_validate_through_public_config_path() {
     assert!(!files.is_empty(), "expected xray-compatible examples");
 
     for path in files {
+        if path.file_name().and_then(|name| name.to_str())
+            == Some("3x-ui-default-api.json5")
+        {
+            // This config intentionally references Xray's external geoip.dat.
+            // Its process-level compatibility test supplies a deterministic
+            // GeoIP fixture and validates the original config end to end.
+            continue;
+        }
+
         validate(Options {
             config: ConfigType::File(path.to_string_lossy().into_owned()),
             config_format: Some(ConfigFormat::Json5),

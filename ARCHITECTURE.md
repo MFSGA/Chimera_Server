@@ -52,7 +52,7 @@ Chimera 的最终目标是完整兼容 xray-core 的服务端行为，使现有�
 
 本次设计核对的本地基线：
 
-- `ref/xray-core`：Xray-core `v26.9.9`，提交 `52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120`（pre-release）。
+- `ref/xray-core`：Xray-core `v26.10.10`，提交 `701af60772cda123492f86e383e1fdba066614a9`。
 - `ref/clash-rs`：`c6f25ab847a15bf7628d34108eab6a171325dadb`。
 
 后续兼容工作须重新记录实际参考提交和客户端二进制版本。这些基线不是“永远最新”的声明；外部链接可能随分支更新，具体移植前必须固定所用版本。
@@ -1657,3 +1657,7 @@ The normal `XRAY_BIN=./xray` namespace smoke continues without this optional str
 **Boundaries.** This P0 repair fixes the reproduced TCP Timestamp full-MSS gap. It does not assert exact gVisor MSS advertising, congestion control, SACK retransmit pacing, full PAWS, all physical MTUs or sustained high-load parity. The overall Xray TUN compatibility status remains **Partial**.
 
 **Final verified paired regression.** With the script finalized and not edited while running, `XRAY_TUN_BULK_ECHO=1 XRAY_TUN_SEEDED_NETEM=1 XRAY_BIN=./xray bash scripts/test_xray_tun_routes_netns.sh` **exited 0**. Both Chimera and pinned Xray 26.9.9 passed the zero-loss, one-shot **8192-byte TCP downlink** with exact SHA-256 integrity and post-test clean echo. Both also passed four **128 KiB** kernel TCP echoes at **3% netem packet loss, seed 31991**; the observed qdisc drops were **23/23** and Linux client TCP retransmissions **[5,3,4,11] / [8,3,2,6]**, followed by qdisc removal and successful fresh echo. The rest of the real namespace run passed **8 Timestamp** and **8 Blackhole/TIME_WAIT** reports, IPv4/IPv6 TCP/UDP, SACK/fragment options, XHTTP H3/QUIC, ICMP/PMTU, route-conflict rollback and final TUN and route cleanup. The netstack passed **26 unit + 65 normal integration tests**, with both expensive single-receive-zero-window and 512-active-socket tests **run explicitly and passed**; Chimera TUN library tests passed **40**. Strict all-workspace Clippy, Rustfmt, Bash syntax and `git diff --check` passed. The failed original 8 KiB case and the passing post-fix AF_PACKET traces are retained as separate evidence in the recovery snapshot; default `tun-gateway` and reference sources were not modified.
+
+### 14.33 3x-ui `/debug/vars` metrics listener compatibility (2026-10-11)
+
+The Xray-shaped top-level `metrics.listen` now owns an HTTP listener at `/debug/vars`, started and supervised with the server. The response includes nested traffic counters, active outbound Observatory entries, and the `memstats` field names consumed by the 3x-ui sampler. `metrics.tag` with `listen` remains accepted with an explicit warning because the tagged outbound path is not implemented; tag-only configurations fail validation. Rust does not have Go heap/GC counters: Linux RSS and virtual size are exposed in the legacy `HeapAlloc`/`Sys` slots as memory-history approximations, `HeapObjects`/`NumGC`/`PauseNs` are zero, and a `chimera` marker states these values are not Go runtime equivalents. Non-Linux process-memory collection is not implemented. The process e2e using `examples/xray-compatible/3x-ui-default-api.json5` verifies HTTP JSON fields and existing gRPC Stats/Routing calls; targeted config tests, all-feature integration-target Clippy, formatting, and the actual 3x-ui template `--check` passed. This is endpoint-level Chimera evidence, not a run of the 3x-ui Go sampler or exact Xray allocator/GC parity.

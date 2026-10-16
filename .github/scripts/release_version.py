@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Compute and optionally apply the next stable workspace release version."""
+"""Compute and optionally apply the UTC calendar workspace release version."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import date, datetime, timezone
 import json
 import re
 import subprocess
@@ -11,14 +12,14 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 WORKSPACE_HEADER = "[workspace.package]"
 
 
 def parse_version(value: str) -> tuple[int, int, int]:
-    match = SEMVER_RE.fullmatch(value)
+    match = VERSION_RE.fullmatch(value)
     if match is None:
-        raise ValueError(f"expected stable SemVer X.Y.Z, got {value!r}")
+        raise ValueError(f"expected stable X.Y.Z version, got {value!r}")
     return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 
@@ -26,15 +27,35 @@ def format_version(version: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
-def bump_version(version: tuple[int, int, int], bump: str) -> tuple[int, int, int]:
-    major, minor, patch = version
-    if bump == "patch":
-        return major, minor, patch + 1
-    if bump == "minor":
-        return major, minor + 1, 0
-    if bump == "major":
-        return major + 1, 0, 0
-    raise ValueError(f"unsupported SemVer bump: {bump!r}")
+def release_date_version(
+    release_date: date,
+    tags: list[tuple[int, int, int]] | tuple[tuple[int, int, int], ...] = (),
+) -> str:
+    """Format a release date as Xray-style YY.M.D, advancing for same-day releases."""
+    if release_date.year < 2000 or release_date.year > 2099:
+        raise ValueError("calendar release versions support years 2000 through 2099")
+    year = release_date.year % 100
+    month = release_date.month
+    patch = release_date.day
+    latest_month_patch = max(
+        (tag[2] for tag in tags if tag[:2] == (year, month)),
+        default=0,
+    )
+    if latest_month_patch >= patch:
+        patch = latest_month_patch + 1
+    return f"{year:02d}.{month}.{patch}"
+
+
+def parse_release_date(value: str) -> date:
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is None:
+        raise ValueError(f"expected release date YYYY-MM-DD, got {value!r}")
+    try:
+        release_date = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"expected release date YYYY-MM-DD, got {value!r}") from error
+    if release_date.year < 2000 or release_date.year > 2099:
+        raise ValueError("calendar release versions support years 2000 through 2099")
+    return release_date
 
 
 def read_workspace_version(path: Path) -> str:
@@ -156,17 +177,26 @@ def stable_tags() -> list[tuple[int, int, int]]:
     return versions
 
 
-def release_plan(workspace_version: str, tags: list[tuple[int, int, int]], bump: str) -> dict[str, str]:
-    workspace = parse_version(workspace_version)
+def release_plan(
+    workspace_version: str,
+    tags: list[tuple[int, int, int]],
+    release_date: date,
+) -> dict[str, str]:
+    parse_version(workspace_version)
     latest_tag = max(tags) if tags else None
-    base = max(workspace, latest_tag) if latest_tag is not None else workspace
-    next_version = bump_version(base, bump)
+    version = release_date_version(release_date, tags)
+    version_tuple = parse_version(version)
+    if latest_tag is not None and version_tuple <= latest_tag:
+        raise ValueError(
+            f"generated release tag v{version} would not be newer than the latest tag "
+            f"v{format_version(latest_tag)}"
+        )
     return {
         "workspace_version": workspace_version,
         "latest_tag_version": format_version(latest_tag) if latest_tag is not None else "",
-        "base_version": format_version(base),
-        "version": format_version(next_version),
-        "tag": f"v{format_version(next_version)}",
+        "release_date": release_date.isoformat(),
+        "version": version,
+        "tag": f"v{version}",
     }
 
 
@@ -178,12 +208,25 @@ def append_github_output(path: Path, values: dict[str, str]) -> None:
 
 def self_test() -> None:
     assert parse_version("0.8.0") == (0, 8, 0)
-    assert bump_version((0, 8, 0), "patch") == (0, 8, 1)
-    assert bump_version((0, 8, 0), "minor") == (0, 9, 0)
-    assert bump_version((0, 8, 0), "major") == (1, 0, 0)
-    plan = release_plan("0.7.21", [(0, 7, 21), (0, 8, 0)], "patch")
-    assert plan["base_version"] == "0.8.0"
-    assert plan["version"] == "0.8.1"
+    assert parse_release_date("2026-10-12") == date(2026, 10, 12)
+    plan = release_plan("0.10.0", [(0, 9, 1), (0, 10, 0), (26, 10, 10)], date(2026, 10, 12))
+    assert plan["latest_tag_version"] == "26.10.10"
+    assert plan["version"] == "26.10.12"
+    assert plan["tag"] == "v26.10.12"
+
+    same_day_plan = release_plan("26.10.12", [(26, 10, 12)], date(2026, 10, 12))
+    assert same_day_plan["version"] == "26.10.13"
+    repeated_day_plan = release_plan(
+        "26.10.12", [(26, 10, 12), (26, 10, 13)], date(2026, 10, 12)
+    )
+    assert repeated_day_plan["version"] == "26.10.14"
+
+    try:
+        release_plan("26.10.12", [(26, 11, 1)], date(2026, 10, 12))
+    except ValueError as error:
+        assert "would not be newer" in str(error)
+    else:
+        raise AssertionError("a release date behind the latest tag must be rejected")
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -204,23 +247,26 @@ def self_test() -> None:
             encoding="utf-8",
         )
         assert workspace_package_names(manifest) == ["app"]
-        write_workspace_version(manifest, "0.8.1")
-        write_lock_versions(lockfile, ["app"], "0.7.21", "0.8.1")
-        assert read_workspace_version(manifest) == "0.8.1"
-        assert 'version = "0.8.1"' in lockfile.read_text(encoding="utf-8")
+        write_workspace_version(manifest, "26.10.12")
+        write_lock_versions(lockfile, ["app"], "0.7.21", "26.10.12")
+        assert read_workspace_version(manifest) == "26.10.12"
+        assert 'version = "26.10.12"' in lockfile.read_text(encoding="utf-8")
 
     try:
         parse_version("01.2.3")
     except ValueError:
         pass
     else:
-        raise AssertionError("leading-zero SemVer must be rejected")
+        raise AssertionError("leading-zero version components must be rejected")
     print("release_version self-test passed")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bump", choices=("patch", "minor", "major"))
+    parser.add_argument(
+        "--date",
+        help="UTC release date in YYYY-MM-DD format (defaults to today's UTC date)",
+    )
     parser.add_argument("--write", action="store_true")
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--self-test", action="store_true")
@@ -231,11 +277,9 @@ def main() -> None:
     if args.self_test:
         self_test()
         return
-    if args.bump is None:
-        parser.error("--bump is required unless --self-test is used")
-
     workspace_version = read_workspace_version(args.manifest)
-    plan = release_plan(workspace_version, stable_tags(), args.bump)
+    release_date = parse_release_date(args.date) if args.date else datetime.now(timezone.utc).date()
+    plan = release_plan(workspace_version, stable_tags(), release_date)
     if args.write:
         package_names = workspace_package_names(args.manifest)
         write_workspace_version(args.manifest, plan["version"])

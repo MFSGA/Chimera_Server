@@ -415,39 +415,92 @@ fn parse_ip_rules(
     value: Option<&Value>,
     path: &str,
 ) -> Result<Vec<crate::geodata::proto::IpRule>, String> {
-    use crate::geodata::proto::{Cidr, CidrRule, IpRule, ip_rule};
-
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
     let values = parse_string_list(value, &format!("{path}.ip"))?;
-    values
+    let mut geodata = crate::geodata::GeodataStore::default();
+    if values.iter().any(|text| {
+        let text = text.trim();
+        (text.starts_with("geoip:") && !text.starts_with("geoip:!"))
+            || (text.starts_with("ext:geoip.dat:")
+                && !text.starts_with("ext:geoip.dat:!"))
+            || (text.starts_with("ext-ip:geoip.dat:")
+                && !text.starts_with("ext-ip:geoip.dat:!"))
+    }) {
+        geodata.ensure_default_geoip().map_err(|error| {
+            format!("{path}.ip could not load Xray GeoIP data: {error}")
+        })?;
+    }
+    parse_ip_rule_values(values, path, &geodata)
+}
+
+fn parse_ip_rule_values(
+    values: Vec<String>,
+    path: &str,
+    geodata: &crate::geodata::GeodataStore,
+) -> Result<Vec<crate::geodata::proto::IpRule>, String> {
+    use crate::geodata::proto::{Cidr, CidrRule, IpRule, ip_rule};
+
+    let mut expanded = Vec::new();
+    for text in values {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(format!("{path}.ip contains an empty rule"));
+        }
+        if text.starts_with('!') {
+            return Err(format!(
+                "{path}.ip reverse-match rules are not implemented"
+            ));
+        }
+        let geoip = if let Some(code) = text.strip_prefix("geoip:") {
+            Some(("geoip.dat", code))
+        } else if let Some(reference) = text
+            .strip_prefix("ext:")
+            .or_else(|| text.strip_prefix("ext-ip:"))
+        {
+            let (file, code) = reference.split_once(':').ok_or_else(|| {
+                format!("{path}.ip has invalid external GeoIP syntax")
+            })?;
+            Some((file, code))
+        } else {
+            None
+        };
+        if let Some((file, code)) = geoip {
+            if code.is_empty() || code.starts_with('!') {
+                return Err(format!(
+                    "{path}.ip requires a positive GeoIP code; reverse-match rules are not implemented"
+                ));
+            }
+            let cidrs = geodata
+                .expand_geoip_file(file, code, false)
+                .map_err(|error| format!("{path}.ip GeoIP rule failed: {error}"))?;
+            if cidrs.is_empty() {
+                return Err(format!(
+                    "{path}.ip GeoIP code {code:?} resolved to no CIDRs"
+                ));
+            }
+            if cidrs.iter().any(|cidr| cidr.starts_with('!')) {
+                return Err(format!(
+                    "{path}.ip GeoIP code {code:?} uses reverse-match data, which is not implemented"
+                ));
+            }
+            expanded.extend(cidrs);
+        } else {
+            expanded.push(text.to_string());
+        }
+    }
+
+    expanded
         .into_iter()
         .map(|text| {
-            let text = text.trim();
-            if text.is_empty() {
-                return Err(format!("{path}.ip contains an empty rule"));
-            }
-            if text.starts_with('!') {
-                return Err(format!(
-                    "{path}.ip reverse-match rules are not implemented"
-                ));
-            }
-            if text.starts_with("geoip:")
-                || text.starts_with("ext:")
-                || text.starts_with("ext-ip:")
-            {
-                return Err(format!(
-                    "{path}.ip supports literal CIDRs only; GeoIP rules are not implemented"
-                ));
-            }
-
             let (ip_text, prefix_text) = text
+                .as_str()
                 .split_once('/')
-                .map_or((text, None), |(ip, prefix)| (ip, Some(prefix)));
-            let address = ip_text
-                .parse::<IpAddr>()
-                .map_err(|_| format!("{path}.ip contains an invalid literal IP or CIDR"))?;
+                .map_or((text.as_str(), None), |(ip, prefix)| (ip, Some(prefix)));
+            let address = ip_text.parse::<IpAddr>().map_err(|_| {
+                format!("{path}.ip contains an invalid literal IP or CIDR")
+            })?;
             let max_prefix = if address.is_ipv4() { 32 } else { 128 };
             let prefix = prefix_text
                 .map(|prefix| {
@@ -602,10 +655,6 @@ mod tests {
     fn unsupported_final_rule_inputs_fail_explicitly() {
         for (rule, expected) in [
             (
-                serde_json::json!({"action":"allow", "ip":"geoip:private"}),
-                "GeoIP",
-            ),
-            (
                 serde_json::json!({"action":"block", "blockDelay":"30-60"}),
                 "blockDelay",
             ),
@@ -613,9 +662,77 @@ mod tests {
                 serde_json::json!({"action":"allow", "ip":"!10.0.0.0/8"}),
                 "reverse-match",
             ),
+            (
+                serde_json::json!({"action":"allow", "ip":"geoip:!private"}),
+                "reverse-match",
+            ),
         ] {
             let error = compile_static_final_rules(&[rule], "direct").unwrap_err();
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn geoip_final_rule_expands_data_and_preserves_first_match_blocking() {
+        use crate::geodata::proto::{Cidr, GeoIp, GeoIpList};
+        use prost::Message as _;
+
+        let mut geodata = crate::geodata::GeodataStore::default();
+        geodata
+            .load_geoip_bytes(
+                &GeoIpList {
+                    entry: vec![GeoIp {
+                        code: "PRIVATE".into(),
+                        cidr: vec![Cidr {
+                            ip: vec![10, 0, 0, 0],
+                            prefix: 8,
+                        }],
+                        reverse_match: false,
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .expect("load deterministic private GeoIP fixture");
+        let ip = parse_ip_rule_values(
+            vec!["geoip:private".into()],
+            "freedom outbound direct finalRules[0]",
+            &geodata,
+        )
+        .expect("expand configured GeoIP rule");
+        let decoded = decode_final_rules(
+            &[
+                FreedomFinalRulePayload {
+                    action: 1,
+                    networks: Vec::new(),
+                    port_list: None,
+                    ip,
+                    block_delay: None,
+                },
+                FreedomFinalRulePayload {
+                    action: 0,
+                    networks: Vec::new(),
+                    port_list: None,
+                    ip: Vec::new(),
+                    block_delay: None,
+                },
+            ],
+            "direct",
+        )
+        .expect("decode expanded GeoIP final rules");
+
+        assert!(!allows(
+            &decoded,
+            Some("freedom"),
+            2,
+            "10.4.5.6".parse().unwrap(),
+            443,
+        ));
+        assert!(allows(
+            &decoded,
+            Some("freedom"),
+            2,
+            "8.8.8.8".parse().unwrap(),
+            443,
+        ));
     }
 }

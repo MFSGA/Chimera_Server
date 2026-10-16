@@ -18,6 +18,8 @@ pub struct LiteralConfig {
     pub log: Option<LogConfig>,
     #[serde(default)]
     pub stats: Option<StatsConfig>,
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
     pub api: Option<ApiConfig>,
     #[serde(default)]
     pub policy: Option<PolicyConfig>,
@@ -880,6 +882,18 @@ pub struct OutboundItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatsConfig {}
+
+/// Xray-compatible HTTP metrics listener configuration. `tag` is retained so
+/// configs that also set `listen` can start the HTTP endpoint; routing requests
+/// through a tagged metrics outbound is not implemented yet.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub listen: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

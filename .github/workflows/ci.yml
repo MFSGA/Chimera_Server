@@ -40,6 +40,9 @@ jobs:
       - name: Release version helper
         run: python3 .github/scripts/release_version.py --self-test
 
+      - name: Auto-merge policy self-test
+        run: python3 .github/scripts/auto_merge_after_ci.py --self-test
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -143,3 +146,25 @@ jobs:
             --locked \
             --target "$TARGET" \
             --package chimera_server_app
+
+  required-checks:
+    name: Required checks
+    if: always()
+    needs: [lint, test, feature-matrix, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          FEATURE_RESULT: ${{ needs.feature-matrix.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          for result in "$LINT_RESULT" "$TEST_RESULT" "$FEATURE_RESULT" "$BUILD_RESULT"; do
+            if [ "$result" != success ]; then
+              echo "Required CI job ended with: $result"
+              exit 1
+            fi
+          done

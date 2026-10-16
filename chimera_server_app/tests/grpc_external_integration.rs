@@ -43,6 +43,8 @@ fn trace_step(step: impl AsRef<str>) {
 
 const PATH_STATS_GET_SYS_STATS: &str =
     "/xray.app.stats.command.StatsService/GetSysStats";
+const PATH_STATS_QUERY_STATS: &str =
+    "/xray.app.stats.command.StatsService/QueryStats";
 const PATH_LOGGER_RESTART: &str =
     "/xray.app.log.command.LoggerService/RestartLogger";
 const PATH_HANDLER_LIST_INBOUNDS: &str =
@@ -73,22 +75,40 @@ struct ServerProcess {
 
 impl ServerProcess {
     fn spawn(config_content: &str) -> io::Result<Self> {
+        Self::spawn_inner(config_content, None)
+    }
+
+    fn spawn_with_geoip_fixture(config_content: &str) -> io::Result<Self> {
+        Self::spawn_inner(config_content, Some(geoip_private_fixture()))
+    }
+
+    fn spawn_inner(
+        config_content: &str,
+        geoip_fixture: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
         let workdir = unique_test_dir()?;
         trace_step(format!(
             "spawn server with temporary workspace {}",
             workdir.display()
         ));
         fs::write(workdir.join("config.json5"), config_content)?;
+        if let Some(bytes) = &geoip_fixture {
+            fs::write(workdir.join("geoip.dat"), bytes)?;
+        }
 
         let log_path = workdir.join("server.log");
         let stdout_file = File::create(&log_path)?;
         let stderr_file = stdout_file.try_clone()?;
 
-        let child = Command::new(env!("CARGO_BIN_EXE_chimera_server_app"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_chimera_server_app"));
+        command
             .current_dir(&workdir)
             .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()?;
+            .stderr(Stdio::from(stderr_file));
+        if geoip_fixture.is_some() {
+            command.env("XRAY_LOCATION_ASSET", &workdir);
+        }
+        let child = command.spawn()?;
         trace_step(format!(
             "server spawned pid={} log={}",
             child.id(),
@@ -145,6 +165,34 @@ impl ServerProcess {
     }
 }
 
+fn geoip_private_fixture() -> Vec<u8> {
+    GeoIpList {
+        entry: vec![GeoIp {
+            code: "PRIVATE".into(),
+            cidr: vec![
+                GeoCidr {
+                    ip: vec![10, 0, 0, 0],
+                    prefix: 8,
+                },
+                GeoCidr {
+                    ip: vec![127, 0, 0, 0],
+                    prefix: 8,
+                },
+                GeoCidr {
+                    ip: vec![172, 16, 0, 0],
+                    prefix: 12,
+                },
+                GeoCidr {
+                    ip: vec![192, 168, 0, 0],
+                    prefix: 16,
+                },
+            ],
+            reverse_match: false,
+        }],
+    }
+    .encode_to_vec()
+}
+
 impl Drop for ServerProcess {
     fn drop(&mut self) {
         trace_step(format!(
@@ -177,6 +225,37 @@ fn free_localhost_port() -> io::Result<u16> {
     let port = listener.local_addr()?.port();
     trace_step(format!("allocated localhost tcp port {}", port));
     Ok(port)
+}
+
+fn get_debug_vars(address: SocketAddr) -> io::Result<serde_json::Value> {
+    use io::{Read, Write};
+
+    let mut stream = TcpStream::connect_timeout(&address, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    write!(
+        stream,
+        "GET /debug/vars HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("HTTP response has no header terminator"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if !headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "))
+    {
+        return Err(io::Error::other(format!(
+            "metrics endpoint returned {}",
+            headers.lines().next().unwrap_or("no status line")
+        )));
+    }
+    serde_json::from_slice(&response[header_end + 4..])
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 #[cfg(target_os = "linux")]
@@ -422,6 +501,52 @@ struct SysStatsRequest {}
 struct SysStatsResponse {
     #[prost(uint32, tag = "10")]
     uptime: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct QueryStatsRequest {
+    #[prost(string, tag = "1")]
+    pattern: String,
+    #[prost(bool, tag = "2")]
+    reset: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct QueryStatsResponse {
+    #[prost(message, repeated, tag = "1")]
+    stats: Vec<StatMessage>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct StatMessage {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(int64, tag = "2")]
+    value: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GeoCidr {
+    #[prost(bytes = "vec", tag = "1")]
+    ip: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    prefix: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GeoIp {
+    #[prost(string, tag = "1")]
+    code: String,
+    #[prost(message, repeated, tag = "2")]
+    cidr: Vec<GeoCidr>,
+    #[prost(bool, tag = "3")]
+    reverse_match: bool,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GeoIpList {
+    #[prost(message, repeated, tag = "1")]
+    entry: Vec<GeoIp>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -803,6 +928,108 @@ fn grpc_services_external_end_to_end() {
     assert!(observed_tags.contains(BACKUP_TAG));
     trace_step("observatory rpc returned expected outbound tags");
     trace_step("==== test grpc_services_external_end_to_end done ====");
+}
+
+#[test]
+fn three_x_ui_default_api_config_and_grpc_calls_end_to_end() {
+    trace_step("==== 3x-ui default API compatibility e2e start ====");
+    let _guard = global_test_lock()
+        .lock()
+        .expect("failed to acquire test lock");
+    let grpc_port = free_localhost_port().expect("failed to allocate API port");
+    let metrics_port = loop {
+        let port = free_localhost_port().expect("failed to allocate metrics port");
+        if port != grpc_port {
+            break port;
+        }
+    };
+    let grpc_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port);
+    let metrics_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, metrics_port);
+    let config =
+        include_str!("../../examples/xray-compatible/3x-ui-default-api.json5")
+            .replace("62789", &grpc_port.to_string())
+            .replace("127.0.0.1:11111", &metrics_addr.to_string());
+    let mut server = ServerProcess::spawn_with_geoip_fixture(&config)
+        .expect("failed to spawn Chimera with 3x-ui API fixture");
+    server
+        .wait_until_ready(SocketAddr::V4(grpc_addr))
+        .unwrap_or_else(|err| panic!("3x-ui API listener did not start: {err}"));
+    server
+        .wait_until_ready(SocketAddr::V4(metrics_addr))
+        .unwrap_or_else(|err| panic!("3x-ui metrics listener did not start: {err}"));
+
+    let metrics =
+        get_debug_vars(SocketAddr::V4(metrics_addr)).unwrap_or_else(|err| {
+            panic!("GET /debug/vars failed: {err}; logs:\n{}", server.logs())
+        });
+    assert!(metrics["memstats"]["HeapAlloc"].is_u64());
+    assert!(metrics["memstats"]["Sys"].is_u64());
+    assert_eq!(metrics["memstats"]["NumGC"], 0);
+    assert!(metrics["stats"]["inbound"].is_object());
+    assert!(metrics["observatory"].is_object());
+    assert!(
+        !metrics["chimera"]["memory_values_are_xray_go_runtime_equivalents"]
+            .as_bool()
+            .expect("memory equivalence marker should be boolean")
+    );
+    assert!(
+        metrics["chimera"]["traffic_stats_enabled"]
+            .as_bool()
+            .expect("traffic feature marker should be boolean")
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create Tokio runtime");
+    let channel = runtime
+        .block_on(connect_channel(SocketAddr::V4(grpc_addr)))
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to connect to 3x-ui API listener: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+
+    let stats: QueryStatsResponse = runtime
+        .block_on(grpc_unary(
+            channel.clone(),
+            PATH_STATS_QUERY_STATS,
+            QueryStatsRequest {
+                pattern: String::new(),
+                reset: false,
+            },
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "StatsService.QueryStats failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    let _ = stats.stats;
+
+    let route: RoutingContext = runtime
+        .block_on(grpc_unary(
+            channel,
+            PATH_ROUTING_TEST_ROUTE,
+            TestRouteRequest {
+                routing_context: Some(RoutingContext {
+                    inbound_tag: "api".into(),
+                    outbound_group_tags: Vec::new(),
+                    outbound_tag: String::new(),
+                }),
+                field_selectors: Vec::new(),
+                publish_result: false,
+            },
+        ))
+        .unwrap_or_else(|err| {
+            panic!(
+                "RoutingService.TestRoute failed: {err}; logs:\n{}",
+                server.logs()
+            )
+        });
+    assert_eq!(route.outbound_tag, "api");
+    trace_step("3x-ui StatsService.QueryStats and RoutingService.TestRoute passed");
 }
 
 #[cfg(target_os = "linux")]

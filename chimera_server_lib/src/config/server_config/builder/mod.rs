@@ -172,6 +172,13 @@ struct DokodemoDoorSettings {
     user_level: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApiTunnelSettings {
+    #[serde(default)]
+    rewrite_address: Option<String>,
+}
+
 #[cfg(feature = "wireguard")]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -724,31 +731,52 @@ fn build_api_tunnel_server(
     stream_settings: Option<crate::config::StreamSettings>,
     sniffing: Option<serde_json::Value>,
 ) -> Result<ServerConfig, Error> {
-    if port.is_some() {
-        return Err(Error::InvalidConfig(format!(
-            "api tunnel inbound {tag} must not configure a TCP/UDP port"
-        )));
+    if let Some(settings) = settings {
+        let settings =
+            settings
+                .deserialize::<ApiTunnelSettings>()
+                .map_err(|error| {
+                    Error::InvalidConfig(format!(
+                        "invalid API tunnel settings for inbound {tag}: {error}"
+                    ))
+                })?;
+        if let Some(address) = settings.rewrite_address {
+            Address::from(&address).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "invalid API tunnel rewriteAddress for inbound {tag}: {error}"
+                ))
+            })?;
+        }
+        // Xray accepts Dokodemo settings for protocol="tunnel". Once routed
+        // to Xray's API outbound, rewriteAddress does not select a proxy
+        // destination. Chimera's control-only tunnel likewise consumes the
+        // API route and binds gRPC directly, so validate and preserve input
+        // compatibility without applying it to a data-plane destination.
     }
-    if settings.is_some() || stream_settings.is_some() || sniffing.is_some() {
+    if stream_settings.is_some() || sniffing.is_some() {
         return Err(Error::InvalidConfig(format!(
             "api tunnel inbound {tag} must not configure proxy or stream settings"
         )));
     }
     let listen = listen.ok_or_else(|| {
         Error::InvalidConfig(format!(
-            "api tunnel inbound {tag} requires an abstract Unix listen name"
+            "api tunnel inbound {tag} requires a listen address"
         ))
     })?;
-    if !listen.starts_with('@') {
-        return Err(Error::InvalidConfig(format!(
-            "api tunnel inbound {tag} listen must start with @"
-        )));
-    }
+    let bind_port = match port {
+        Some(port) => port,
+        None if listen.starts_with('@') => 0,
+        None => {
+            return Err(Error::InvalidConfig(format!(
+                "api tunnel inbound {tag} requires port unless listen is an abstract Unix name"
+            )));
+        }
+    };
     Ok(ServerConfig {
         tag,
         bind_location: BindLocation::Address(NetLocation::new(
             Address::Hostname(listen),
-            0,
+            bind_port,
         )),
         protocol: ServerProxyConfig::Tunnel,
         transport: Transport::Tcp,

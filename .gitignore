@@ -13,7 +13,9 @@ config.json5
 .omo/
 .vscode/
 
-docs
+docs/*
+!docs/ai-development-governance.md
+!docs/ai-review-checklist.md
 
 deploy/
 deploy/**/.generated/

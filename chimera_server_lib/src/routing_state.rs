@@ -361,6 +361,12 @@ impl RoutingState {
         observations
     }
 
+    pub(crate) fn active_observations(
+        &self,
+    ) -> HashMap<String, OutboundObservation> {
+        self.observations.snapshot_all()
+    }
+
     fn observation_snapshot_for(
         &self,
         targets: &BalancerTargetSet,
