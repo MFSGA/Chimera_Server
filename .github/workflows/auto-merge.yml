@@ -1,4 +1,4 @@
-name: Auto-merge eligible PRs
+name: Auto-merge Dependabot updates
 
 on:
   workflow_run:
@@ -17,15 +17,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  request-auto-merge:
+  merge-dependabot-pr:
     if: >-
       (github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.head_repository.full_name == github.repository) ||
       (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'pull_request_review' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -38,7 +40,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Complete or request GitHub Auto-merge when every gate is satisfied
+      - name: Merge eligible Dependabot dependency update
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}

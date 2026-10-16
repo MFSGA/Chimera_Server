@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge same-repository PRs after required CI and branch-protection gates pass."""
+"""Merge Dependabot dependency PRs after CI and branch-protection gates pass."""
 
 from __future__ import annotations
 
@@ -28,6 +28,15 @@ EXPECTED_CI_JOBS = frozenset(
         "Required checks",
     }
 )
+PROTECTED_PATH_PREFIXES = (
+    ".github/",
+    "docs/ai-",
+    "ref/",
+    "vendor/",
+    "release",
+    "install",
+)
+PROTECTED_PATHS = frozenset({"AGENTS.md", "LESSONS.md"})
 
 
 class SkipAutomation(Exception):
@@ -96,15 +105,6 @@ class GitHubApi:
             url = next_link(headers.get("Link", ""))
         return values
 
-    def graphql(self, query: str, variables: dict[str, Any]) -> Any:
-        value, _ = self.request(
-            "https://api.github.com/graphql",
-            {"query": query, "variables": variables},
-        )
-        if value.get("errors"):
-            raise GitHubApiError("GitHub GraphQL request failed")
-        return value["data"]
-
 
 def next_link(header: str) -> str:
     for item in header.split(","):
@@ -145,22 +145,6 @@ def ci_jobs_for_run(api: GitHubApi, repository: str, run_id: str) -> list[Any]:
     return api.get_all(path, collection_key="jobs")
 
 
-def enable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
-    api.graphql(
-        """
-        mutation EnableAutoMerge($pullRequestId: ID!) {
-          enablePullRequestAutoMerge(input: {
-            pullRequestId: $pullRequestId,
-            mergeMethod: SQUASH
-          }) {
-            pullRequest { number autoMergeRequest { enabledAt } }
-          }
-        }
-        """,
-        {"pullRequestId": pull_request["node_id"]},
-    )
-
-
 def merge_pull_request(
     api: GitHubApi,
     repository: str,
@@ -175,61 +159,19 @@ def merge_pull_request(
         raise GitHubApiError("GitHub did not confirm the pull request merge")
 
 
-def complete_or_queue_auto_merge(
+def merge_when_ready(
     api: GitHubApi,
     repository: str,
     pull_request: dict[str, Any],
     expected_head_sha: str,
-) -> bool:
-    if pull_request.get("mergeable_state") == "clean":
-        merge_pull_request(api, repository, pull_request, expected_head_sha)
-        return False
-
-    try:
-        enable_auto_merge(api, pull_request)
-        return True
-    except GitHubApiError:
-        # The PR can become clean after the last GET but before the GraphQL
-        # mutation. In that race, finish with GitHub's head-SHA-guarded merge API.
-        latest = api.get(api_path(repository, f"/pulls/{pull_request['number']}"))
-        if (
-            latest.get("mergeable_state") != "clean"
-            or latest.get("head", {}).get("sha") != expected_head_sha
-        ):
-            raise
-        merge_pull_request(api, repository, latest, expected_head_sha)
-        return False
+) -> None:
+    if pull_request.get("mergeable_state") != "clean":
+        raise SkipAutomation("GitHub has not satisfied the PR merge gates yet")
+    merge_pull_request(api, repository, pull_request, expected_head_sha)
 
 
-def disable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
-    pull_request_id = pull_request.get("node_id")
-    if not pull_request_id:
-        return
-    current = api.graphql(
-        """
-        query AutoMergeState($pullRequestId: ID!) {
-          node(id: $pullRequestId) {
-            ... on PullRequest { autoMergeRequest { enabledAt } }
-          }
-        }
-        """,
-        {"pullRequestId": pull_request_id},
-    )
-    node = current.get("node") or {}
-    if not node.get("autoMergeRequest"):
-        return
-    api.graphql(
-        """
-        mutation DisableAutoMerge($pullRequestId: ID!) {
-          disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
-            pullRequest { number }
-          }
-        }
-        """,
-        {"pullRequestId": pull_request_id},
-    )
-    number = pull_request.get("number", "?")
-    print(f"Disabled stale GitHub Auto-merge request for PR #{number}.")
+def is_dependabot_pull_request(pull_request: dict[str, Any]) -> bool:
+    return (pull_request.get("user") or {}).get("login") == "dependabot[bot]"
 
 
 def is_auto_merge_eligible(
@@ -238,11 +180,37 @@ def is_auto_merge_eligible(
 ) -> bool:
     head_repository = pull_request.get("head", {}).get("repo") or {}
     return (
-        pull_request.get("state") == "open"
+        is_dependabot_pull_request(pull_request)
+        and pull_request.get("state") == "open"
         and pull_request.get("draft") is not True
         and pull_request.get("base", {}).get("ref") == "master"
         and head_repository.get("full_name") == repository
     )
+
+
+def auto_merge_scope_allowed(
+    files: list[Any],
+    expected_file_count: Any,
+) -> bool:
+    if (
+        not isinstance(expected_file_count, int)
+        or isinstance(expected_file_count, bool)
+        or expected_file_count != len(files)
+    ):
+        return False
+
+    for changed_file in files:
+        path = changed_file.get("filename") if isinstance(changed_file, dict) else None
+        if not isinstance(path, str):
+            return False
+        if (
+            path in PROTECTED_PATHS
+            or path.rsplit("/", 1)[-1] == "CODEOWNERS"
+            or path.startswith(PROTECTED_PATH_PREFIXES)
+            or path.rsplit("/", 1)[-1] not in {"Cargo.toml", "Cargo.lock"}
+        ):
+            return False
+    return True
 
 
 def event_targets_auto_merge_branch(
@@ -250,6 +218,10 @@ def event_targets_auto_merge_branch(
     event: dict[str, Any],
     pull_request: dict[str, Any],
 ) -> bool:
+    # workflow_run's associated PR payload omits the author; the live PR is
+    # checked by process_pull_request before any merge state can be changed.
+    if event_name != "workflow_run" and not is_dependabot_pull_request(pull_request):
+        return False
     if pull_request.get("base", {}).get("ref") == "master":
         return True
     if event_name == "pull_request_target" and event.get("action") == "edited":
@@ -309,9 +281,18 @@ def process_pull_request(
         raise SkipAutomation("the CI run has no associated pull request number")
 
     pr = api.get(api_path(repository, f"/pulls/{number}"))
+    if not is_dependabot_pull_request(pr):
+        raise SkipAutomation(f"PR #{number} was not created by Dependabot")
     if not is_auto_merge_eligible(pr, repository):
-        disable_auto_merge(api, pr)
-        raise SkipAutomation(f"PR #{number} is not an open same-repository PR targeting master")
+        raise SkipAutomation(f"Dependabot PR #{number} is not eligible for master auto-merge")
+
+    files = api.get_all(
+        api_path(repository, f"/pulls/{number}/files?per_page=100")
+    )
+    if not auto_merge_scope_allowed(files, pr.get("changed_files")):
+        raise SkipAutomation(
+            f"Dependabot PR #{number} changes a protected path or has an incomplete file list"
+        )
 
     head = pr.get("head", {})
     if head.get("sha") != event_pr.get("head", {}).get("sha"):
@@ -334,25 +315,29 @@ def process_pull_request(
         )
 
     settings = api.get(f"/repos/{repository}")
-    if settings.get("allow_auto_merge") is not True:
-        raise SkipAutomation("repository Auto-merge is disabled")
     if settings.get("default_branch") != "master":
         raise SkipAutomation("the repository default branch is not master")
 
     latest_pr = api.get(api_path(repository, f"/pulls/{number}"))
     latest_head = latest_pr.get("head", {})
+    if not is_dependabot_pull_request(latest_pr):
+        raise SkipAutomation(f"PR #{number} is no longer a Dependabot PR")
     if not is_auto_merge_eligible(latest_pr, repository):
-        disable_auto_merge(api, latest_pr)
-        raise SkipAutomation(f"PR #{number} became ineligible during auto-merge preflight")
+        raise SkipAutomation(f"Dependabot PR #{number} became ineligible during auto-merge preflight")
     if latest_head.get("sha") != head.get("sha"):
         raise SkipAutomation(f"PR #{number} changed during auto-merge preflight")
+    if latest_pr.get("base", {}).get("sha") != pr.get("base", {}).get("sha"):
+        raise SkipAutomation(f"PR #{number} base changed during auto-merge preflight")
+    latest_files = api.get_all(
+        api_path(repository, f"/pulls/{number}/files?per_page=100")
+    )
+    if not auto_merge_scope_allowed(latest_files, latest_pr.get("changed_files")):
+        raise SkipAutomation(
+            f"Dependabot PR #{number} changes a protected path or has an incomplete file list"
+        )
 
-    # If the PR is not ready, GitHub holds native Auto-merge until its required
-    # gates pass. A clean PR cannot be queued, so merge it with the same head SHA.
-    if complete_or_queue_auto_merge(api, repository, latest_pr, latest_head["sha"]):
-        print(f"Enabled GitHub Auto-merge for eligible PR #{number}.")
-    else:
-        print(f"Merged eligible PR #{number} through GitHub.")
+    merge_when_ready(api, repository, latest_pr, latest_head["sha"])
+    print(f"Merged eligible Dependabot PR #{number} through GitHub.")
 
 
 def self_test() -> None:
@@ -432,21 +417,16 @@ def self_test() -> None:
     class MergeFlowApiStub:
         def __init__(self) -> None:
             self.put_calls: list[tuple[str, dict[str, Any]]] = []
-            self.graphql_calls: list[str] = []
 
         def put(self, path: str, payload: dict[str, Any]) -> dict[str, bool]:
             self.put_calls.append((path, payload))
             return {"merged": True}
 
-        def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-            self.graphql_calls.append(query)
-            return {}
-
         def get(self, path: str) -> dict[str, Any]:
             raise AssertionError(f"unexpected API read: {path}")
 
     immediate_merge_api = MergeFlowApiStub()
-    assert not complete_or_queue_auto_merge(
+    merge_when_ready(
         immediate_merge_api,
         "MFSGA/Chimera_Server",
         {"number": 42, "mergeable_state": "clean"},
@@ -458,42 +438,25 @@ def self_test() -> None:
             {"sha": "head-sha", "merge_method": "squash"},
         )
     ]
-    assert not immediate_merge_api.graphql_calls
-
-    queued_merge_api = MergeFlowApiStub()
-    assert complete_or_queue_auto_merge(
-        queued_merge_api,
-        "MFSGA/Chimera_Server",
-        {"number": 42, "mergeable_state": "blocked", "node_id": "PR_node"},
-        "head-sha",
-    )
-    assert not queued_merge_api.put_calls
-    assert len(queued_merge_api.graphql_calls) == 1
-
-    class CleanRaceApiStub(MergeFlowApiStub):
-        def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-            raise GitHubApiError("simulated clean-state auto-merge rejection")
-
-        def get(self, path: str) -> dict[str, Any]:
-            assert path == "/repos/MFSGA/Chimera_Server/pulls/42"
-            return {
-                "number": 42,
-                "mergeable_state": "clean",
-                "head": {"sha": "head-sha"},
-            }
-
-    clean_race_api = CleanRaceApiStub()
-    assert not complete_or_queue_auto_merge(
-        clean_race_api,
-        "MFSGA/Chimera_Server",
-        {"number": 42, "mergeable_state": "blocked", "node_id": "PR_node"},
-        "head-sha",
-    )
-    assert len(clean_race_api.put_calls) == 1
+    blocked_merge_api = MergeFlowApiStub()
+    try:
+        merge_when_ready(
+            blocked_merge_api,
+            "MFSGA/Chimera_Server",
+            {"number": 42, "mergeable_state": "blocked"},
+            "head-sha",
+        )
+    except SkipAutomation as skip:
+        assert "merge gates" in str(skip)
+    else:
+        raise AssertionError("PR with unsatisfied merge gates was merged")
+    assert not blocked_merge_api.put_calls
 
     eligible_pr = {
         "state": "open",
         "draft": False,
+        "changed_files": 1,
+        "user": {"login": "dependabot[bot]"},
         "base": {"ref": "master"},
         "head": {
             "sha": "head-sha",
@@ -511,6 +474,9 @@ def self_test() -> None:
     assert not is_auto_merge_eligible(
         {**eligible_pr, "base": {"ref": "develop"}}, "MFSGA/Chimera_Server"
     )
+    ordinary_pr = {**eligible_pr, "user": {"login": "human-maintainer"}}
+    assert not is_dependabot_pull_request(ordinary_pr)
+    assert not is_auto_merge_eligible(ordinary_pr, "MFSGA/Chimera_Server")
     assert not is_auto_merge_eligible(
         {
             **eligible_pr,
@@ -518,8 +484,34 @@ def self_test() -> None:
         },
         "MFSGA/Chimera_Server",
     )
+    assert auto_merge_scope_allowed([{"filename": "Cargo.lock"}], 1)
+    assert auto_merge_scope_allowed([{"filename": "chimera_server_lib/Cargo.toml"}], 1)
+    assert not auto_merge_scope_allowed([{"filename": "README.md"}], 1)
+    for protected_path in (
+        ".github/workflows/ci.yml",
+        "docs/ai-development-governance.md",
+        "ref/xray-core/config.go",
+        "vendor/dependency/src/lib.rs",
+        "release/notes.md",
+        "install.sh",
+        "AGENTS.md",
+        "LESSONS.md",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+    ):
+        assert not auto_merge_scope_allowed([{"filename": protected_path}], 1)
+    assert not auto_merge_scope_allowed([], 1)
+    assert not auto_merge_scope_allowed([{}], 1)
     assert event_targets_auto_merge_branch(
         "pull_request_target", {"action": "opened"}, eligible_pr
+    )
+    assert not event_targets_auto_merge_branch(
+        "pull_request_target", {"action": "opened"}, ordinary_pr
+    )
+    # The workflow_run PR summary omits `user`; the live API fetch performs the
+    # authoritative Dependabot check before any merge request is made.
+    assert event_targets_auto_merge_branch(
+        "workflow_run", {}, {"number": 42, "base": {"ref": "master"}}
     )
     non_master_pr = {**eligible_pr, "base": {"ref": "develop"}}
     assert not event_targets_auto_merge_branch(
@@ -533,6 +525,62 @@ def self_test() -> None:
         },
         non_master_pr,
     )
+
+    class OrdinaryPullRequestApiStub(MergeFlowApiStub):
+        def get(self, path: str) -> dict[str, Any]:
+            assert path == "/repos/MFSGA/Chimera_Server/pulls/42"
+            return {**eligible_pr, "user": {"login": "human-maintainer"}}
+
+    ordinary_api = OrdinaryPullRequestApiStub()
+    try:
+        process_pull_request(
+            ordinary_api,
+            "MFSGA/Chimera_Server",
+            {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+            {"number": 42, "head": {"sha": "head-sha"}},
+            protection_confirmed=True,
+        )
+    except SkipAutomation as skip:
+        assert "not created by Dependabot" in str(skip)
+    else:
+        raise AssertionError("ordinary pull request was accepted for auto-merge")
+    assert not ordinary_api.put_calls
+
+    class ProtectedPathPullRequestApiStub(MergeFlowApiStub):
+        def get(self, path: str) -> dict[str, Any]:
+            assert path == "/repos/MFSGA/Chimera_Server/pulls/42"
+            return {
+                **eligible_pr,
+                "number": 42,
+                "node_id": "PR_node",
+                "changed_files": 1,
+            }
+
+        def get_all(
+            self,
+            path: str,
+            *,
+            collection_key: str | None = None,
+        ) -> list[Any]:
+            assert path == "/repos/MFSGA/Chimera_Server/pulls/42/files?per_page=100"
+            assert collection_key is None
+            return [{"filename": ".github/workflows/ci.yml"}]
+
+    protected_path_api = ProtectedPathPullRequestApiStub()
+    try:
+        process_pull_request(
+            protected_path_api,
+            "MFSGA/Chimera_Server",
+            {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+            {"number": 42, "head": {"sha": "head-sha"}},
+            protection_confirmed=True,
+        )
+    except SkipAutomation as skip:
+        assert "protected path" in str(skip)
+    else:
+        raise AssertionError("Dependabot workflow change was accepted for auto-merge")
+    assert not protected_path_api.put_calls
+
     assert not event_targets_auto_merge_branch(
         "pull_request_target",
         {
@@ -551,7 +599,7 @@ def self_test() -> None:
             if path == "/repos/MFSGA/Chimera_Server/pulls/42":
                 return self.pull_requests.pop(0)
             if path == "/repos/MFSGA/Chimera_Server":
-                return {"allow_auto_merge": True, "default_branch": "master"}
+                return {"default_branch": "master"}
             raise AssertionError(f"unexpected API read: {path}")
 
         def get_all(
@@ -560,17 +608,22 @@ def self_test() -> None:
             *,
             collection_key: str | None = None,
         ) -> list[Any]:
-            assert path == (
+            if path == "/repos/MFSGA/Chimera_Server/pulls/42/files?per_page=100":
+                assert collection_key is None
+                return [{"filename": "Cargo.lock"}]
+            if path == (
                 "/repos/MFSGA/Chimera_Server/actions/runs/123/jobs?per_page=100"
-            )
-            assert collection_key == "jobs"
-            return successful_jobs
+            ):
+                assert collection_key == "jobs"
+                return successful_jobs
+            raise AssertionError(f"unexpected API list: {path}")
 
     eligible_pr.update(
         {
             "number": 42,
-            "node_id": "PR_node",
-            "mergeable_state": "blocked",
+            "base": {"ref": "master", "sha": "base-sha"},
+            "mergeable_state": "clean",
+            "changed_files": 1,
         }
     )
     eligible_api = EligiblePullRequestApiStub()
@@ -581,9 +634,93 @@ def self_test() -> None:
         {"number": 42, "head": {"sha": "head-sha"}},
         protection_confirmed=True,
     )
-    assert not eligible_api.put_calls
-    assert len(eligible_api.graphql_calls) == 1
-    assert "enablePullRequestAutoMerge" in eligible_api.graphql_calls[0]
+    assert eligible_api.put_calls == [
+        (
+            "/repos/MFSGA/Chimera_Server/pulls/42/merge",
+            {"sha": "head-sha", "merge_method": "squash"},
+        )
+    ]
+
+    class RetargetedPullRequestApiStub(EligiblePullRequestApiStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pull_requests = [
+                dict(eligible_pr),
+                {**eligible_pr, "base": {"ref": "master", "sha": "changed-base-sha"}},
+            ]
+
+    retargeted_api = RetargetedPullRequestApiStub()
+    try:
+        process_pull_request(
+            retargeted_api,
+            "MFSGA/Chimera_Server",
+            {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+            {"number": 42, "head": {"sha": "head-sha"}},
+            protection_confirmed=True,
+        )
+    except SkipAutomation as skip:
+        assert "base changed" in str(skip)
+    else:
+        raise AssertionError("PR with a changed base was merged")
+    assert not retargeted_api.put_calls
+
+    class NewlyProtectedFileApiStub(EligiblePullRequestApiStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.file_reads = 0
+
+        def get_all(
+            self,
+            path: str,
+            *,
+            collection_key: str | None = None,
+        ) -> list[Any]:
+            if path == "/repos/MFSGA/Chimera_Server/pulls/42/files?per_page=100":
+                assert collection_key is None
+                self.file_reads += 1
+                return [
+                    {
+                        "filename": (
+                            "Cargo.lock"
+                            if self.file_reads == 1
+                            else ".github/workflows/auto-merge.yml"
+                        )
+                    }
+                ]
+            return super().get_all(path, collection_key=collection_key)
+
+    newly_protected_file_api = NewlyProtectedFileApiStub()
+    try:
+        process_pull_request(
+            newly_protected_file_api,
+            "MFSGA/Chimera_Server",
+            {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+            {"number": 42, "head": {"sha": "head-sha"}},
+            protection_confirmed=True,
+        )
+    except SkipAutomation as skip:
+        assert "protected path" in str(skip)
+    else:
+        raise AssertionError("PR with a protected file at final check was merged")
+    assert newly_protected_file_api.file_reads == 2
+    assert not newly_protected_file_api.put_calls
+
+    blocked_pr = {**eligible_pr, "mergeable_state": "blocked"}
+    blocked_api = EligiblePullRequestApiStub()
+    blocked_api.pull_requests = [dict(blocked_pr), dict(blocked_pr)]
+    try:
+        process_pull_request(
+            blocked_api,
+            "MFSGA/Chimera_Server",
+            {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+            {"number": 42, "head": {"sha": "head-sha"}},
+            protection_confirmed=True,
+        )
+    except SkipAutomation as skip:
+        assert "merge gates" in str(skip)
+    else:
+        raise AssertionError("Dependabot PR with unsatisfied gates was merged")
+    assert not blocked_api.put_calls
     print("Auto-merge policy self-test passed.")
 
 

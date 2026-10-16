@@ -13,7 +13,8 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| LESSON-20261015-001 | 2026-10-15 | Workflow | 自动合并预检把 Actions jobs 响应误判为列表 | Mitigated locally; remote verification pending | [Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030) |
+| LESSON-20261016-001 | 2026-10-16 | Workflow | 自动合并范围误设为所有同仓 PR | Mitigated locally; corrective CI pending | [Overbroad policy commit 22fdde9](https://github.com/MFSGA/Chimera_Server/commit/22fdde9a87685fdc057ec9dc15d52cf417b0c2bb) |
+| LESSON-20261015-001 | 2026-10-15 | Workflow | 自动合并预检把 Actions jobs 响应误判为列表 | Pushed; remote verification pending | [Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030) |
 
 ## 记录模板（复制后填写；不要将空白模板当作事故记录）
 
@@ -36,11 +37,26 @@
 
 ## 已确认经验
 
+### LESSON-20261016-001: 自动合并策略范围误设为所有同仓 PR
+- 发现日期（UTC）：2026-10-16
+- 分类：Workflow
+- 严重度：Medium
+- 状态：Mitigated locally; corrective CI pending
+- 证据：[过宽策略提交 22fdde9](https://github.com/MFSGA/Chimera_Server/commit/22fdde9a87685fdc057ec9dc15d52cf417b0c2bb)；用户澄清目标仅为 Dependabot 依赖更新；检查时所有 13 个打开 PR 均为 Dependabot，且均无已启用的 Auto-merge 请求。
+- 影响范围：自动合并候选资格；若非 Dependabot PR 触发工作流，过宽策略可能为它们请求或完成合并。
+- 观察到的失败：实现把“依赖更新自动合并”扩大成“同仓目标为 master 的所有 PR 自动合并”；尚未观察到非 Dependabot PR 被启用或合并。
+- 根本原因：将自动合并范围从 PR 的来源/类别误推断为所有满足 CI 和分支规则的 PR。
+- 修复措施：仅允许 `dependabot[bot]` 的同仓 `master` Cargo 依赖 PR，变更必须只包含 `Cargo.toml`/`Cargo.lock`，并排除 L3 治理、工作流、发布、参考源码和 vendor 路径；普通 PR 在调用合并 API 前即跳过。只在所有门禁已满足时用固定 head SHA 同步合并，不创建可延迟完成的原生 Auto-merge 请求。
+- 预防措施：CI 自测明确验证 Cargo 依赖 PR 可合并、普通 PR/非 Cargo 文件/L3 路径不可合并、base 或文件清单复查变化时跳过、门禁未满足时不调用合并 API；工作流文档同步明确范围。
+- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check`；纠正提交推送后的 CI 待验证。
+- 重复事件：LESSON-20261015-001 是不同问题（GitHub jobs 响应解析）。
+- 是否提议升级为强制规则：否；针对该范围的候选资格自测已加入 CI。
+
 ### LESSON-20261015-001: 自动合并预检误读 GitHub Actions jobs 响应
 - 发现日期（UTC）：2026-10-15
 - 分类：Workflow
 - 严重度：Medium
-- 状态：Mitigated（本地修复；等待推送后的 CI 验证）
+- 状态：Mitigated（修复已推送；远端验证待完成）
 - 证据：[失败的 Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030)；关联 CI run 38737272211 成功，GitHub jobs 接口返回 12 个 job。
 - 影响范围：`auto-merge.yml` 的 `workflow_run` 预检路径；符合现有分支保护规则的 PR（包括 Dependabot 更新）在 CI 成功后无法进入自动合并预检。
 - 观察到的失败：预期从成功 CI run 读取全部 job；实际报 `GitHub API returned an unexpected list response` 并安全退出。
