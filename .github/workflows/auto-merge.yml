@@ -1,12 +1,11 @@
-name: Auto-merge low-risk PRs
+name: Auto-merge eligible PRs
 
 on:
   workflow_run:
     workflows: [CI]
     types: [completed]
   pull_request_target:
-    branches: [master]
-    types: [edited, labeled, synchronize, unlabeled]
+    types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft]
   pull_request_review:
     types: [dismissed, edited, submitted]
 
@@ -27,14 +26,12 @@ jobs:
       (github.event_name == 'pull_request_target' &&
       github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'pull_request_review' &&
-      github.event.pull_request.base.ref == 'master' &&
       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: read
       contents: write
-      issues: read
       pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,5 +46,4 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED: ${{ vars.CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED }}
-          CHIMERA_AUTOMERGE_MAINTAINERS: ${{ vars.CHIMERA_AUTOMERGE_MAINTAINERS }}
         run: python3 .github/scripts/auto_merge_after_ci.py

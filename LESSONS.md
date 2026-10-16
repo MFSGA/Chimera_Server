@@ -42,7 +42,7 @@
 - 严重度：Medium
 - 状态：Mitigated（本地修复；等待推送后的 CI 验证）
 - 证据：[失败的 Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030)；关联 CI run 38737272211 成功，GitHub jobs 接口返回 12 个 job。
-- 影响范围：`auto-merge.yml` 的 `workflow_run` 预检路径；符合现有策略的 README PR 在 CI 成功后无法进入自动合并预检。
+- 影响范围：`auto-merge.yml` 的 `workflow_run` 预检路径；符合现有分支保护规则的 PR（包括 Dependabot 更新）在 CI 成功后无法进入自动合并预检。
 - 观察到的失败：预期从成功 CI run 读取全部 job；实际报 `GitHub API returned an unexpected list response` 并安全退出。
 - 根本原因：脚本将 `GET /actions/runs/{run_id}/jobs` 当成裸数组解析；GitHub 实际返回 `{ "total_count": ..., "jobs": [...] }` 分页对象。issue events 和 PR files 接口仍返回裸数组，不能统一假定所有列表端点具有相同外层结构。
 - 修复措施：`get_all` 可按显式 `collection_key` 读取包装列表，CI jobs 使用 `jobs` 键；原有裸数组读取保持不变。

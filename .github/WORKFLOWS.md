@@ -7,7 +7,7 @@ The repository uses five entry-point workflows and two shared local actions. Kee
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
 | `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
-| `auto-merge.yml` | Successful `CI` completion, PR authorization changes, and review updates | Revalidates low-risk PRs, cancels stale Auto-merge requests, and queues or completes the merge only after every gate passes |
+| `auto-merge.yml` | Successful `CI` completion, PR state changes, and review updates | Revalidates same-repository PRs targeting `master` and queues or completes the merge after every required gate passes |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
@@ -27,9 +27,12 @@ an autonomous coding or AI review GitHub Action has already been installed.
 - The existing Rust CI jobs remain the authoritative mechanical quality gates.
   AI feedback is additive and cannot replace format, Clippy, Windows/Linux tests,
   feature-matrix checks or release candidate validation.
-- Low-risk L0/L1 auto-merge requires protected branch rules, independent checks
-  and constrained tokens; L2/L3 remain human-merged. AI-generated PR labels or
-  checkboxes alone cannot grant merge authorization.
+- The auto-merge workflow is authorized for same-repository PRs targeting
+  `master`; it requests/completes merges only after every required CI job
+  succeeds and GitHub's required reviews/checks are met. Dependabot PRs are
+  included. Repository Auto-merge and the confirmed branch protections must be
+  enabled for it to activate. Fork PRs are excluded, and labels do not grant
+  merge authorization.
 - AI review workflows must not run untrusted PR code with writable credentials
   or invoke privileged tooling on untrusted Issue/PR content.
 - Stable releases remain **manual** via `release.yml`. Do not attach release
@@ -62,17 +65,18 @@ required-checks stable aggregate over every required CI job
 
 Jobs run in parallel. A formatting failure should not hide a Windows compile failure, and one target failure should not cancel the other matrix entries.
 
-`auto-merge.yml` runs after the trusted `CI` workflow completes, when a PR is synchronized, edited, labeled, or unlabeled, and when its review is submitted, edited, or dismissed. Events are serialized per PR. It checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. For a PR with current or historical auto-merge risk labeling, a head or label change first cancels any queued native Auto-merge request; each relevant PR or review event then revalidates the live PR state. It re-reads head, labels, and changed files immediately before requesting or completing the merge, and only proceeds when all of the following hold:
+`auto-merge.yml` runs after the trusted `CI` workflow completes, when a same-repository PR opens, reopens, synchronizes, changes base/draft status, becomes ready for review, and when its review is submitted, edited, or dismissed. It only acts on PRs targeting `master`; a PR retargeted away from `master` can have a stale Auto-merge request disabled, while PRs for other base branches are left alone. Events are serialized per PR. It checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. It re-reads the PR and head immediately before requesting or completing the merge, and only proceeds when all of the following hold:
 
-- The PR comes from this repository, targets `master`, is open, and its head has not changed since the successful CI run.
-- A username listed in `CHIMERA_AUTOMERGE_MAINTAINERS`, other than the PR author, applied exactly one of `automerge:l0` or `automerge:l1`; the label is a risk classification, not a review substitute.
-- Every changed file is one of the root README files (`README.md`, `README.en.md`, `README.fa.md`, `README.ru.md`). Code, workflow, configuration, reference, vendor, and other documentation changes remain manual-merge only.
-- Repository Auto-merge is enabled, and the repository variables `CHIMERA_AUTOMERGE_MAINTAINERS` and `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` are configured. The maintainer variable is a comma-separated list of GitHub usernames permitted to apply the risk labels. The confirmation variable is an administrator's assertion that classic `master` branch protection enforces strict/up-to-date `CI / Required checks`, at least one approval, stale-approval dismissal, and admin enforcement; no active ruleset, merge queue, or bypass actor can skip those gates.
-- If GitHub reports that the PR is already clean and mergeable, the workflow completes it through the pull-request merge API pinned to the verified head SHA. Otherwise it requests native GitHub Auto-merge, which waits for remaining required reviews/checks. The job needs `contents: write` for the ready-to-merge API call and executes only this trusted script from the default branch.
+- The PR comes from this repository, targets `master`, is open, is not a draft, and its head has not changed since the successful CI run.
+- Every expected CI job succeeded on that exact head SHA and run attempt.
+- Repository Auto-merge is enabled and `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` is set. An administrator uses that variable to confirm that `CI / Required checks`, required approvals and stale-approval dismissal apply to the workflow token, with no merge queue configured. For L3 changes, required approval must come from a designated maintainer or Code Owner. The configured administrator exception may remain; the Actions token must not be granted a bypass.
+- If GitHub reports that the PR is already clean and mergeable, the workflow completes it through the pull-request merge API pinned to the verified head SHA. Otherwise it requests native GitHub Auto-merge, which waits for branch protection checks and reviews. The job needs `contents: write` for the ready-to-merge API call and executes only this trusted script from the default branch.
 
-The workflow skips when a prerequisite is absent. GitHub Actions `GITHUB_TOKEN` cannot read repository administration settings, so the workflow does not inspect branch protection or rulesets itself; setting the confirmation variable without those protections would allow an unsafe immediate merge. An administrator must verify the protections, enable GitHub Auto-merge, set both variables, and create the two labels before this automation can activate. The current repository settings do not meet those prerequisites.
+The synchronous merge API does not support merge queues. The final live PR read and head-SHA pin also cannot atomically pin the base branch; if someone retargets a PR in the small interval before the merge request, GitHub may evaluate the then-current base. The workflow attempts to cancel an existing request when it observes a retarget event, but that cancellation is not atomic with merging.
 
-Label revocation is best-effort: GitHub does not provide an atomic operation that combines the final label check with enabling native Auto-merge. If all merge gates become satisfied in the small interval before the cancellation event is handled, GitHub may merge first. Required CI, up-to-date branch and review protections remain enforced by GitHub.
+The workflow skips when a prerequisite is absent. GitHub Actions `GITHUB_TOKEN` cannot read repository administration settings, so the workflow does not inspect branch protection or rulesets itself; setting the confirmation variable without those protections would allow an unsafe immediate merge. An administrator must verify the protections, enable GitHub Auto-merge and set the confirmation variable before this automation can activate. The current read-only account could not verify those administrator settings through the API.
+
+Required CI, up-to-date branch and review protections remain enforced by GitHub when the workflow requests or completes a merge. The administrator exception permits administrators to bypass those protections for their own actions; the workflow token is not an administrator and must not be added as a bypass actor.
 
 Build/reference rules:
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enable native GitHub Auto-merge for explicitly approved low-risk PRs."""
+"""Merge same-repository PRs after required CI and branch-protection gates pass."""
 
 from __future__ import annotations
 
@@ -26,15 +26,6 @@ EXPECTED_CI_JOBS = frozenset(
         "Build (linux-musl)",
         "Build (windows-msvc)",
         "Required checks",
-    }
-)
-AUTO_MERGE_LABELS = frozenset({"automerge:l0", "automerge:l1"})
-AUTO_MERGEABLE_DOCS = frozenset(
-    {
-        "README.md",
-        "README.en.md",
-        "README.fa.md",
-        "README.ru.md",
     }
 )
 
@@ -144,43 +135,6 @@ def protection_confirmation_enabled(value: str | None) -> bool:
     return value == "true"
 
 
-def configured_maintainers(value: str | None) -> set[str]:
-    return {
-        login.strip().casefold()
-        for login in (value or "").split(",")
-        if login.strip()
-    }
-
-
-def high_risk_file(path: str) -> bool:
-    return path not in AUTO_MERGEABLE_DOCS
-
-
-def current_risk_label_actor(
-    label: str,
-    events: list[dict[str, Any]],
-) -> str | None:
-    history = [
-        event
-        for event in events
-        if (event.get("label") or {}).get("name", "").lower() == label.lower()
-        and event.get("event") in {"labeled", "unlabeled"}
-    ]
-    if not history:
-        return None
-
-    def event_order(event: dict[str, Any]) -> tuple[str, int]:
-        try:
-            event_id = int(event.get("id", 0))
-        except (TypeError, ValueError):
-            event_id = 0
-        return event.get("created_at", ""), event_id
-
-    latest = max(history, key=event_order)
-    actor = (latest.get("actor") or {}).get("login", "")
-    return actor if latest.get("event") == "labeled" and actor else None
-
-
 def api_path(repository: str, suffix: str) -> str:
     owner, repo = repository.split("/", 1)
     return f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}{suffix}"
@@ -189,24 +143,6 @@ def api_path(repository: str, suffix: str) -> str:
 def ci_jobs_for_run(api: GitHubApi, repository: str, run_id: str) -> list[Any]:
     path = api_path(repository, f"/actions/runs/{run_id}/jobs?per_page=100")
     return api.get_all(path, collection_key="jobs")
-
-
-def maintainer_applied_current_label(
-    api: GitHubApi,
-    label: str,
-    author: str,
-    events: list[dict[str, Any]],
-    maintainers: set[str],
-) -> bool:
-    actor = current_risk_label_actor(label, events)
-    if (
-        not actor
-        or actor.casefold() == author.casefold()
-        or actor.casefold() not in maintainers
-    ):
-        return False
-    user = api.get(f"/users/{urllib.parse.quote(actor, safe='')}")
-    return user.get("type") == "User"
 
 
 def enable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
@@ -296,30 +232,32 @@ def disable_auto_merge(api: GitHubApi, pull_request: dict[str, Any]) -> None:
     print(f"Disabled stale GitHub Auto-merge request for PR #{number}.")
 
 
-def should_cancel_auto_merge(
-    action: str,
+def is_auto_merge_eligible(
+    pull_request: dict[str, Any],
+    repository: str,
+) -> bool:
+    head_repository = pull_request.get("head", {}).get("repo") or {}
+    return (
+        pull_request.get("state") == "open"
+        and pull_request.get("draft") is not True
+        and pull_request.get("base", {}).get("ref") == "master"
+        and head_repository.get("full_name") == repository
+    )
+
+
+def event_targets_auto_merge_branch(
+    event_name: str,
     event: dict[str, Any],
     pull_request: dict[str, Any],
-    label_events: list[dict[str, Any]],
 ) -> bool:
-    labels = {
-        label.get("name", "").lower()
-        for label in pull_request.get("labels", [])
-    }
-    changed_label = (event.get("label") or {}).get("name", "").lower()
-    has_policy_history = any(
-        (item.get("label") or {}).get("name", "").lower() in AUTO_MERGE_LABELS
-        and item.get("event") in {"labeled", "unlabeled"}
-        for item in label_events
-    )
-    return (
-        action in {"synchronize", "edited", "labeled", "unlabeled"}
-        and (
-            bool(labels & AUTO_MERGE_LABELS)
-            or changed_label in AUTO_MERGE_LABELS
-            or has_policy_history
-        )
-    )
+    if pull_request.get("base", {}).get("ref") == "master":
+        return True
+    if event_name == "pull_request_target" and event.get("action") == "edited":
+        changes = event.get("changes") or {}
+        base_change = changes.get("base") or {}
+        ref_change = base_change.get("ref") or {}
+        return ref_change.get("from") == "master"
+    return False
 
 
 def latest_ci_run_for_pull_request(
@@ -362,9 +300,8 @@ def latest_ci_run_for_pull_request(
 def process_pull_request(
     api: GitHubApi,
     repository: str,
-    workflow_run: dict[str, Any],
+    workflow_run: dict[str, Any] | None,
     event_pr: dict[str, Any],
-    maintainers: set[str],
     protection_confirmed: bool,
 ) -> None:
     number = event_pr.get("number")
@@ -372,15 +309,16 @@ def process_pull_request(
         raise SkipAutomation("the CI run has no associated pull request number")
 
     pr = api.get(api_path(repository, f"/pulls/{number}"))
-    if pr.get("state") != "open" or pr.get("draft"):
-        raise SkipAutomation(f"PR #{number} is closed or draft")
-    if pr.get("base", {}).get("ref") != "master":
-        raise SkipAutomation(f"PR #{number} does not target master")
+    if not is_auto_merge_eligible(pr, repository):
+        disable_auto_merge(api, pr)
+        raise SkipAutomation(f"PR #{number} is not an open same-repository PR targeting master")
+
     head = pr.get("head", {})
-    if not head.get("repo") or head["repo"].get("full_name") != repository:
-        raise SkipAutomation(f"PR #{number} is not from this repository")
     if head.get("sha") != event_pr.get("head", {}).get("sha"):
         raise SkipAutomation(f"PR #{number} changed after this CI run")
+
+    if workflow_run is None:
+        workflow_run = latest_ci_run_for_pull_request(api, repository, pr)
     if workflow_run.get("head_sha") != head.get("sha"):
         raise SkipAutomation(f"PR #{number} CI run is for a different head SHA")
 
@@ -395,25 +333,6 @@ def process_pull_request(
             "set CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true after configuring master protections"
         )
 
-    labels = {label.get("name", "").lower() for label in pr.get("labels", [])}
-    authorized_labels = labels & AUTO_MERGE_LABELS
-    if len(authorized_labels) != 1:
-        raise SkipAutomation(f"PR #{number} must have exactly one L0/L1 auto-merge label")
-
-    events = api.get_all(api_path(repository, f"/issues/{number}/events?per_page=100"))
-    author = pr.get("user", {}).get("login", "")
-    label = next(iter(authorized_labels))
-    if not maintainer_applied_current_label(api, label, author, events, maintainers):
-        raise SkipAutomation(
-            f"PR #{number} risk label was not applied by a different configured maintainer"
-        )
-
-    files = api.get_all(api_path(repository, f"/pulls/{number}/files?per_page=100"))
-    if pr.get("changed_files", 0) != len(files):
-        raise SkipAutomation(f"PR #{number} file list is incomplete")
-    if any(high_risk_file(file.get("filename", "")) for file in files):
-        raise SkipAutomation(f"PR #{number} changes protected/high-risk paths")
-
     settings = api.get(f"/repos/{repository}")
     if settings.get("allow_auto_merge") is not True:
         raise SkipAutomation("repository Auto-merge is disabled")
@@ -422,40 +341,14 @@ def process_pull_request(
 
     latest_pr = api.get(api_path(repository, f"/pulls/{number}"))
     latest_head = latest_pr.get("head", {})
-    latest_labels = {
-        label.get("name", "").lower() for label in latest_pr.get("labels", [])
-    }
-    latest_authorized_labels = latest_labels & AUTO_MERGE_LABELS
-    if (
-        latest_pr.get("state") != "open"
-        or latest_pr.get("draft")
-        or latest_pr.get("base", {}).get("ref") != "master"
-        or not latest_head.get("repo")
-        or latest_head["repo"].get("full_name") != repository
-        or latest_head.get("sha") != head.get("sha")
-        or latest_authorized_labels != {label}
-    ):
+    if not is_auto_merge_eligible(latest_pr, repository):
+        disable_auto_merge(api, latest_pr)
+        raise SkipAutomation(f"PR #{number} became ineligible during auto-merge preflight")
+    if latest_head.get("sha") != head.get("sha"):
         raise SkipAutomation(f"PR #{number} changed during auto-merge preflight")
-
-    latest_events = api.get_all(
-        api_path(repository, f"/issues/{number}/events?per_page=100")
-    )
-    if not maintainer_applied_current_label(
-        api, label, author, latest_events, maintainers
-    ):
-        raise SkipAutomation(f"PR #{number} risk label authorization changed during preflight")
-    latest_files = api.get_all(
-        api_path(repository, f"/pulls/{number}/files?per_page=100")
-    )
-    if latest_pr.get("changed_files", 0) != len(latest_files) or any(
-        high_risk_file(file.get("filename", "")) for file in latest_files
-    ):
-        raise SkipAutomation(f"PR #{number} file scope changed during auto-merge preflight")
 
     # If the PR is not ready, GitHub holds native Auto-merge until its required
     # gates pass. A clean PR cannot be queued, so merge it with the same head SHA.
-    # Label revocation remains best-effort because there is no atomic
-    # label-check-and-merge operation.
     if complete_or_queue_auto_merge(api, repository, latest_pr, latest_head["sha"]):
         print(f"Enabled GitHub Auto-merge for eligible PR #{number}.")
     else:
@@ -535,43 +428,6 @@ def self_test() -> None:
     assert not protection_confirmation_enabled(None)
     assert not protection_confirmation_enabled("True")
     assert not protection_confirmation_enabled("false")
-    assert configured_maintainers(" Alice, bob ,") == {"alice", "bob"}
-    assert configured_maintainers(None) == set()
-
-    class UserLookupStub:
-        def get(self, path: str) -> dict[str, str]:
-            assert path == "/users/maintainer"
-            return {"type": "User"}
-
-    authorized_label_event = [
-        {
-            "event": "labeled",
-            "label": {"name": "automerge:l1"},
-            "actor": {"login": "maintainer"},
-            "created_at": "2026-10-14T10:00:00Z",
-        }
-    ]
-    assert maintainer_applied_current_label(
-        UserLookupStub(),
-        "automerge:l1",
-        "pr-author",
-        authorized_label_event,
-        {"maintainer"},
-    )
-    assert not maintainer_applied_current_label(
-        UserLookupStub(),
-        "automerge:l1",
-        "maintainer",
-        authorized_label_event,
-        {"maintainer"},
-    )
-    assert not maintainer_applied_current_label(
-        UserLookupStub(),
-        "automerge:l1",
-        "pr-author",
-        authorized_label_event,
-        set(),
-    )
 
     class MergeFlowApiStub:
         def __init__(self) -> None:
@@ -635,78 +491,99 @@ def self_test() -> None:
     )
     assert len(clean_race_api.put_calls) == 1
 
-    assert high_risk_file(".github/workflows/ci.yml")
-    assert high_risk_file("chimera_server_lib/src/config/def.rs")
-    assert high_risk_file("chimera_cli/src/main.rs")
-    assert high_risk_file("Cargo.lock")
-    assert high_risk_file("VLESS_REVERSE_DESIGN.md")
-    assert not high_risk_file("README.md")
-    assert not high_risk_file("README.en.md")
-    events = [
+    eligible_pr = {
+        "state": "open",
+        "draft": False,
+        "base": {"ref": "master"},
+        "head": {
+            "sha": "head-sha",
+            "repo": {"full_name": "MFSGA/Chimera_Server"},
+        },
+        "labels": [],
+    }
+    assert is_auto_merge_eligible(eligible_pr, "MFSGA/Chimera_Server")
+    assert not is_auto_merge_eligible(
+        {**eligible_pr, "state": "closed"}, "MFSGA/Chimera_Server"
+    )
+    assert not is_auto_merge_eligible(
+        {**eligible_pr, "draft": True}, "MFSGA/Chimera_Server"
+    )
+    assert not is_auto_merge_eligible(
+        {**eligible_pr, "base": {"ref": "develop"}}, "MFSGA/Chimera_Server"
+    )
+    assert not is_auto_merge_eligible(
         {
-            "event": "labeled",
-            "label": {"name": "automerge:l1"},
-            "actor": {"login": "maintainer"},
-            "created_at": "2026-10-14T10:00:00Z",
+            **eligible_pr,
+            "head": {"sha": "head-sha", "repo": {"full_name": "contributor/fork"}},
+        },
+        "MFSGA/Chimera_Server",
+    )
+    assert event_targets_auto_merge_branch(
+        "pull_request_target", {"action": "opened"}, eligible_pr
+    )
+    non_master_pr = {**eligible_pr, "base": {"ref": "develop"}}
+    assert not event_targets_auto_merge_branch(
+        "pull_request_target", {"action": "opened"}, non_master_pr
+    )
+    assert event_targets_auto_merge_branch(
+        "pull_request_target",
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "master"}}},
+        },
+        non_master_pr,
+    )
+    assert not event_targets_auto_merge_branch(
+        "pull_request_target",
+        {
+            "action": "edited",
+            "changes": {"base": {"ref": {"from": "develop"}}},
+        },
+        non_master_pr,
+    )
+
+    class EligiblePullRequestApiStub(MergeFlowApiStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pull_requests = [dict(eligible_pr), dict(eligible_pr)]
+
+        def get(self, path: str) -> dict[str, Any]:
+            if path == "/repos/MFSGA/Chimera_Server/pulls/42":
+                return self.pull_requests.pop(0)
+            if path == "/repos/MFSGA/Chimera_Server":
+                return {"allow_auto_merge": True, "default_branch": "master"}
+            raise AssertionError(f"unexpected API read: {path}")
+
+        def get_all(
+            self,
+            path: str,
+            *,
+            collection_key: str | None = None,
+        ) -> list[Any]:
+            assert path == (
+                "/repos/MFSGA/Chimera_Server/actions/runs/123/jobs?per_page=100"
+            )
+            assert collection_key == "jobs"
+            return successful_jobs
+
+    eligible_pr.update(
+        {
+            "number": 42,
+            "node_id": "PR_node",
+            "mergeable_state": "blocked",
         }
-    ]
-    assert current_risk_label_actor("automerge:l1", events) == "maintainer"
-    assert current_risk_label_actor(
-        "automerge:l1",
-        [{**events[0], "actor": {"login": "github-actions[bot]"}}],
-    ) == "github-actions[bot]"
-    assert current_risk_label_actor(
-        "automerge:l1",
-        [{**events[0], "event": "unlabeled"}],
-    ) is None
-    same_second_transitions = [
-        {
-            "id": 100,
-            "event": "labeled",
-            "label": {"name": "automerge:l1"},
-            "actor": {"login": "maintainer"},
-            "created_at": "2026-10-14T10:00:00Z",
-        },
-        {
-            "id": 101,
-            "event": "unlabeled",
-            "label": {"name": "automerge:l1"},
-            "actor": {"login": "author"},
-            "created_at": "2026-10-14T10:00:00Z",
-        },
-        {
-            "id": 102,
-            "event": "labeled",
-            "label": {"name": "automerge:l1"},
-            "actor": {"login": "author"},
-            "created_at": "2026-10-14T10:00:00Z",
-        },
-    ]
-    assert current_risk_label_actor("automerge:l1", same_second_transitions) == "author"
-    assert should_cancel_auto_merge(
-        "synchronize",
-        {},
-        {"labels": [{"name": "automerge:l0"}]},
-        [],
     )
-    assert should_cancel_auto_merge(
-        "unlabeled",
-        {"label": {"name": "automerge:l1"}},
-        {"labels": []},
-        [],
+    eligible_api = EligiblePullRequestApiStub()
+    process_pull_request(
+        eligible_api,
+        "MFSGA/Chimera_Server",
+        {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+        {"number": 42, "head": {"sha": "head-sha"}},
+        protection_confirmed=True,
     )
-    assert not should_cancel_auto_merge(
-        "synchronize",
-        {},
-        {"labels": [{"name": "bug"}]},
-        [],
-    )
-    assert should_cancel_auto_merge(
-        "labeled",
-        {"label": {"name": "bug"}},
-        {"labels": [{"name": "bug"}]},
-        [{"event": "unlabeled", "label": {"name": "automerge:l0"}}],
-    )
+    assert not eligible_api.put_calls
+    assert len(eligible_api.graphql_calls) == 1
+    assert "enablePullRequestAutoMerge" in eligible_api.graphql_calls[0]
     print("Auto-merge policy self-test passed.")
 
 
@@ -725,9 +602,6 @@ def main() -> int:
         repository = os.environ.get("GITHUB_REPOSITORY", "")
         if not token or not repository:
             raise GitHubApiError("required GitHub Actions environment is missing")
-        maintainers = configured_maintainers(
-            os.environ.get("CHIMERA_AUTOMERGE_MAINTAINERS")
-        )
         protection_confirmed = protection_confirmation_enabled(
             os.environ.get("CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED")
         )
@@ -754,16 +628,15 @@ def main() -> int:
             event_pr = event.get("pull_request") or {}
             action = event.get("action")
             if event_name == "pull_request_target":
-                if action not in {"synchronize", "unlabeled", "labeled", "edited"}:
+                if action not in {
+                    "opened",
+                    "reopened",
+                    "synchronize",
+                    "edited",
+                    "ready_for_review",
+                    "converted_to_draft",
+                }:
                     raise SkipAutomation("the pull request event does not affect merge authorization")
-                number = event_pr.get("number")
-                label_events = (
-                    api.get_all(api_path(repository, f"/issues/{number}/events?per_page=100"))
-                    if isinstance(number, int)
-                    else []
-                )
-                if should_cancel_auto_merge(action, event, event_pr, label_events):
-                    disable_auto_merge(api, event_pr)
             elif action not in {"submitted", "edited", "dismissed"}:
                 raise SkipAutomation("the pull request review event is not actionable")
             pull_requests = [event_pr]
@@ -772,16 +645,18 @@ def main() -> int:
             raise SkipAutomation("this workflow event does not authorize auto-merge checks")
 
         for event_pr in pull_requests:
-            try:
-                current_run = workflow_run or latest_ci_run_for_pull_request(
-                    api, repository, event_pr
+            if not event_targets_auto_merge_branch(event_name, event, event_pr):
+                print(
+                    f"Skipping PR #{event_pr.get('number', '?')}: "
+                    "it does not target master or change away from master"
                 )
+                continue
+            try:
                 process_pull_request(
                     api,
                     repository,
-                    current_run,
+                    workflow_run,
                     event_pr,
-                    maintainers,
                     protection_confirmed,
                 )
             except SkipAutomation as skip:
