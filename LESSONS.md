@@ -13,7 +13,7 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| — | — | — | 尚无经本流程确认的记录 | — | — |
+| LESSON-20261015-001 | 2026-10-15 | Workflow | 自动合并预检把 Actions jobs 响应误判为列表 | Mitigated locally; remote verification pending | [Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030) |
 
 ## 记录模板（复制后填写；不要将空白模板当作事故记录）
 
@@ -36,4 +36,17 @@
 
 ## 已确认经验
 
-*尚无经过上述证据要求确认并收录的新记录。已有历史事故与实施证据继续以 `ARCHITECTURE.md`、`ITERATION_GUIDE.md`、实际 PR/CI 为准，不在此虚构。*
+### LESSON-20261015-001: 自动合并预检误读 GitHub Actions jobs 响应
+- 发现日期（UTC）：2026-10-15
+- 分类：Workflow
+- 严重度：Medium
+- 状态：Mitigated（本地修复；等待推送后的 CI 验证）
+- 证据：[失败的 Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030)；关联 CI run 38737272211 成功，GitHub jobs 接口返回 12 个 job。
+- 影响范围：`auto-merge.yml` 的 `workflow_run` 预检路径；符合现有策略的 README PR 在 CI 成功后无法进入自动合并预检。
+- 观察到的失败：预期从成功 CI run 读取全部 job；实际报 `GitHub API returned an unexpected list response` 并安全退出。
+- 根本原因：脚本将 `GET /actions/runs/{run_id}/jobs` 当成裸数组解析；GitHub 实际返回 `{ "total_count": ..., "jobs": [...] }` 分页对象。issue events 和 PR files 接口仍返回裸数组，不能统一假定所有列表端点具有相同外层结构。
+- 修复措施：`get_all` 可按显式 `collection_key` 读取包装列表，CI jobs 使用 `jobs` 键；原有裸数组读取保持不变。
+- 预防措施：CI 中的 auto-merge policy self-test 覆盖包装分页、`Link` 翻页、现有裸数组和缺失 `jobs` 字段时 fail closed。
+- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check` 均通过；修复后远端 Actions 验证尚未执行。
+- 重复事件：无已知关联事件。
+- 是否提议升级为强制规则：否；现有 CI 自测足以覆盖这一具体 API 响应契约。

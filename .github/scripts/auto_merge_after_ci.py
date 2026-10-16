@@ -86,14 +86,22 @@ class GitHubApi:
         value, _ = self.request(f"https://api.github.com{path}", payload, method="PUT")
         return value
 
-    def get_all(self, path: str) -> list[Any]:
+    def get_all(self, path: str, *, collection_key: str | None = None) -> list[Any]:
         url = f"https://api.github.com{path}"
         values: list[Any] = []
         while url:
             page, headers = self.request(url)
-            if not isinstance(page, list):
-                raise GitHubApiError("GitHub API returned an unexpected list response")
-            values.extend(page)
+            if collection_key is None:
+                if not isinstance(page, list):
+                    raise GitHubApiError("GitHub API returned an unexpected list response")
+                items = page
+            else:
+                items = page.get(collection_key) if isinstance(page, dict) else None
+                if not isinstance(items, list):
+                    raise GitHubApiError(
+                        f"GitHub API response did not contain a {collection_key} list"
+                    )
+            values.extend(items)
             url = next_link(headers.get("Link", ""))
         return values
 
@@ -176,6 +184,11 @@ def current_risk_label_actor(
 def api_path(repository: str, suffix: str) -> str:
     owner, repo = repository.split("/", 1)
     return f"/repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}{suffix}"
+
+
+def ci_jobs_for_run(api: GitHubApi, repository: str, run_id: str) -> list[Any]:
+    path = api_path(repository, f"/actions/runs/{run_id}/jobs?per_page=100")
+    return api.get_all(path, collection_key="jobs")
 
 
 def maintainer_applied_current_label(
@@ -371,12 +384,8 @@ def process_pull_request(
     if workflow_run.get("head_sha") != head.get("sha"):
         raise SkipAutomation(f"PR #{number} CI run is for a different head SHA")
 
-    jobs_path = api_path(
-        repository,
-        f"/actions/runs/{workflow_run['id']}/jobs?per_page=100",
-    )
     if not required_jobs_passed(
-        api.get_all(jobs_path),
+        ci_jobs_for_run(api, repository, str(workflow_run["id"])),
         workflow_run.get("run_attempt", 1),
     ):
         raise SkipAutomation(f"PR #{number} is missing a successful required CI job")
@@ -474,6 +483,54 @@ def self_test() -> None:
         successful_jobs + [successful_jobs[0]],
         1,
     )
+
+    class PaginatedApiStub(GitHubApi):
+        def __init__(self, pages: list[tuple[Any, dict[str, str]]]) -> None:
+            super().__init__("test-token")
+            self.pages = pages
+            self.requested_urls: list[str] = []
+
+        def request(
+            self,
+            url: str,
+            payload: dict[str, Any] | None = None,
+            method: str | None = None,
+        ) -> tuple[Any, dict[str, str]]:
+            assert payload is None
+            assert method is None
+            self.requested_urls.append(url)
+            return self.pages.pop(0)
+
+    first_jobs_page = [successful_jobs[0]]
+    second_jobs_page = successful_jobs[1:]
+    jobs_api = PaginatedApiStub(
+        [
+            (
+                {"total_count": len(successful_jobs), "jobs": first_jobs_page},
+                {"Link": '<https://api.github.com/jobs?page=2>; rel="next"'},
+            ),
+            ({"total_count": len(successful_jobs), "jobs": second_jobs_page}, {}),
+        ]
+    )
+    assert ci_jobs_for_run(
+        jobs_api, "MFSGA/Chimera_Server", "123"
+    ) == first_jobs_page + second_jobs_page
+    assert jobs_api.requested_urls == [
+        "https://api.github.com/repos/MFSGA/Chimera_Server/actions/runs/123/jobs?per_page=100",
+        "https://api.github.com/jobs?page=2",
+    ]
+    events_api = PaginatedApiStub([([{"event": "labeled"}], {})])
+    assert events_api.get_all("/issues/123/events?per_page=100") == [
+        {"event": "labeled"}
+    ]
+    malformed_jobs_api = PaginatedApiStub([({"total_count": 1, "workflow_runs": []}, {})])
+    try:
+        malformed_jobs_api.get_all("/actions/runs/123/jobs", collection_key="jobs")
+    except GitHubApiError as error:
+        assert str(error) == "GitHub API response did not contain a jobs list"
+    else:
+        raise AssertionError("malformed jobs response was accepted")
+
     assert protection_confirmation_enabled("true")
     assert not protection_confirmation_enabled(None)
     assert not protection_confirmation_enabled("True")
