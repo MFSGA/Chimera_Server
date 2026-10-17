@@ -1,6 +1,6 @@
 # GitHub Actions layout
 
-The repository uses five entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
+The repository uses six entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
 
 ## Workflows
 
@@ -8,6 +8,7 @@ The repository uses five entry-point workflows and two shared local actions. Kee
 | --- | --- | --- |
 | `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
 | `auto-merge.yml` | Successful `CI` completion and Dependabot PR state/review updates | Auto-merges only same-repository Dependabot Cargo dependency PRs targeting `master`, after required gates pass |
+| `xray-compatibility.yml` | Manual only | Runs a small real-client smoke suite against the checksum-verified pinned Xray binary |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
@@ -64,6 +65,25 @@ required-checks stable aggregate over every required CI job
 ```
 
 Jobs run in parallel. A formatting failure should not hide a Windows compile failure, and one target failure should not cancel the other matrix entries.
+
+## Xray compatibility smoke contract
+
+`xray-compatibility.yml` is a manual smoke workflow and is not a required check. Select `master`
+when dispatching it; a runtime check fails fast if another ref was selected. This check prevents
+accidental ref selection but is not a security boundary: GitHub runs the workflow definition from
+the selected ref. The job has read-only repository permissions, uses no secrets, and downloads Xray
+through the existing checksum-verifying `setup-pinned-xray` action. It then runs exact ignored
+real-client tests for VLESS over TCP, gRPC, and HTTPUpgrade against local TCP echo targets. The
+workflow records the client version and Xray source-reference commit and uploads each test log for
+30 days. A missing or unmatched test is treated as a failure rather than a successful empty run.
+
+The client binary version comes from `bench/.xray-version` (currently `v26.7.28`) and its checksum
+from `bench/.xray-linux-64.sha256`. This published client build is distinct from the checked-out
+Xray source reference (`ref/xray-core` v26.10.10, commit
+`701af60772cda123492f86e383e1fdba066614a9`); the workflow reports both and does not claim that the
+older client binary is the reference source build. This smoke suite does not certify TLS/REALITY,
+UDP, the full compatibility matrix, or Xray TUN/system-namespace behavior. Those checks still need
+their explicitly recorded client versions and prerequisites.
 
 `auto-merge.yml` checks successful PR CI completions and Dependabot PR state/review events. The live PR must be authored by `dependabot[bot]`, come from this repository, target `master`, be open and ready for review. The changed files must be Cargo manifests or lockfiles only. Ordinary PRs and other bots are skipped without changing their merge state. Dependabot PRs touching `.github/**`, `docs/ai-*`, `ref/**`, `vendor/**`, release/install paths, `AGENTS.md`, `LESSONS.md`, `CODEOWNERS`, or any non-Cargo file stay manual. Events are serialized per PR. The workflow checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. It re-reads the PR, base, head and complete file list immediately before merging, and only proceeds when all of the following hold:
 
