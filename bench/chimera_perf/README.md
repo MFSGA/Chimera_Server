@@ -832,6 +832,20 @@ that two identities plus an identity-free record under one protocol still emit
 correct aggregate protocol totals and per-identity cardinality. No new lock,
 unsafe code, interning, or steady-state allocation is introduced.
 
+A follow-up removed a repeated allocation from the identity+inbound hot path.
+`accumulate_inbound` previously called `entry(inbound.to_owned())` for every
+record, even when that inbound tag was already in the map. It now looks up the
+borrowed `&str` first and allocates an owned tag only on the first record. A
+strict same-probe A/B used the `identity-inbound` shape on an AMD Ryzen 7 5800,
+Linux x86_64, with four writers pinned to CPUs 0-3, five million records per
+sample, one warmup pair and six measured pairs per process. Three independent
+baseline/candidate process pairs ran in alternating order. Median borrowed-ref
+CPU cost across the three process medians fell from **0.104770 to 0.092406
+s/Mrecord (-11.8%)**; per-process CPU CVs stayed between **0.76% and 1.26%**.
+This is a traffic-recorder microbenchmark result, not an end-to-end server
+throughput claim. Existing traffic snapshot tests verify that inbound totals
+and per-user totals remain unchanged.
+
 ## UDP freedom session batching probe
 
 `udp_session_probe` is a Linux-only follow-up that mirrors the hot structure of

@@ -262,7 +262,11 @@ fn accumulate_inbound(
         return;
     }
 
-    let stats = totals.entry(inbound.to_owned()).or_default();
+    let stats = if let Some(stats) = totals.get_mut(inbound) {
+        stats
+    } else {
+        totals.entry(inbound.to_owned()).or_default()
+    };
     if let Some((upload, download)) = inbound_totals {
         stats.totals.accumulate(upload, download);
     }
