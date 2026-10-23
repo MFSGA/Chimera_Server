@@ -13,7 +13,7 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| LESSON-20261023-001 | 2026-10-23 | Workflow | 自动合并首次预检未重试暂时不完整的 CI job 列表 | Mitigated locally; remote verification pending | [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938), [auto-merge run 39917597051, attempts 1–2](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051), [merged PR #31](https://github.com/MFSGA/Chimera_Server/pull/31) |
+| LESSON-20261023-001 | 2026-10-23 | Workflow | 自动合并首次预检未重试暂时不完整的 CI job 列表 | Verified | [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938), [auto-merge run 39917597051, attempts 1–2](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051), [merged PR #31](https://github.com/MFSGA/Chimera_Server/pull/31), [fix CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) |
 | LESSON-20261017-001 | 2026-10-17 | Test/Workflow | Xray smoke test 依赖被忽略的本地证书 | Verified | [Failed run 39077494361](https://github.com/MFSGA/Chimera_Server/actions/runs/39077494361), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
 | LESSON-20261017-002 | 2026-10-17 | Test/Workflow | Xray smoke 的 loopback echo 目标被 Freedom 私网默认规则拒绝 | Verified | [Local reproduction log](/tmp/chimera-xray-client-vless-tcp-none-149849-1792278770553/chimera.stderr.log), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
 | LESSON-20261016-001 | 2026-10-16 | Workflow | 自动合并范围误设为所有同仓 PR | Mitigated locally; corrective CI pending | [Overbroad policy commit 22fdde9](https://github.com/MFSGA/Chimera_Server/commit/22fdde9a87685fdc057ec9dc15d52cf417b0c2bb) |
@@ -44,14 +44,14 @@
 - 发现日期（UTC）：2026-10-23
 - 分类：Workflow
 - 严重度：Medium
-- 状态：Mitigated locally; remote verification pending
-- 证据：PR #31 head `58f20524bc6510f2a4f92c90ba7e2bff31110c00` 的 [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938) 全部 12 个必需 job 均成功。该次完成事件的 [自动合并 run 39917597051 第一次执行](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051) 报告缺少成功 job；同一预检使用相同 CI run 重跑后，[第二次执行成功并合并 PR #31](https://github.com/MFSGA/Chimera_Server/pull/31)。
+- 状态：Verified
+- 证据：PR #31 head `58f20524bc6510f2a4f92c90ba7e2bff31110c00` 的 [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938) 全部 12 个必需 job 均成功。该次完成事件的 [自动合并 run 39917597051 第一次执行](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051) 报告缺少成功 job；同一预检使用相同 CI run 重跑后，[第二次执行成功并合并 PR #31](https://github.com/MFSGA/Chimera_Server/pull/31)。修复提交 `ee61eb93450de9b680aa5b9b710fa950253f88cd` 的 [CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) 全部 12 个 job 成功，包含 `Required checks`。
 - 影响范围：符合资格的 Dependabot Cargo PR 在 CI 全绿时可能因第一次检查 job 列表不完整而保持打开。
 - 观察到的失败：CI 成功后自动合并首次预检报告缺少必需 job 并安全跳过；随后对同一 workflow-run 事件重跑则成功。
 - 根本原因：脚本只读取一次 Actions jobs API；当该读取没有显示全部已完成 job 时立即跳过，没有对短暂不完整的列表做有界重试。首次响应内容未被保留，具体缺失字段或 job 不确定；同一 run 后续重读和重跑均成功，支持这是短时可见性问题。
 - 修复措施：将必需 job 检查区分为暂未可见/运行中、失败和重复；只对暂未可见或未完成的 job 列表最多重读五次，间隔两秒。失败、重复和重试耗尽仍安全跳过，并报告相关 job 名称。
 - 预防措施：策略自检使用模拟 API 覆盖先返回不完整列表、后返回全绿列表的重试路径，以及重试耗尽、真实失败和重复 job 不误合并的情况。
-- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`（通过，覆盖临时不完整后恢复、重试耗尽和真实失败）、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`（通过）、`git diff --check`（通过）；修复后的远端 CI 待验证。
+- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`（通过，覆盖临时不完整后恢复、重试耗尽、失败和重复 job）、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`（通过）、`git diff --check`（通过）；推送后的 [CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) 在 commit `ee61eb93450de9b680aa5b9b710fa950253f88cd` 上 12/12 job 成功。
 - 重复事件：LESSON-20261015-001 涉及不同问题（jobs API 分页响应形状），不是同一故障。
 - 是否提议升级为强制规则：否；以脚本重试和回归自检覆盖该短时不完整响应。
 
