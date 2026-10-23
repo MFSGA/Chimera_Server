@@ -13,6 +13,8 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
+| LESSON-20261017-001 | 2026-10-17 | Test/Workflow | Xray smoke test 依赖被忽略的本地证书 | Verified | [Failed run 39077494361](https://github.com/MFSGA/Chimera_Server/actions/runs/39077494361), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
+| LESSON-20261017-002 | 2026-10-17 | Test/Workflow | Xray smoke 的 loopback echo 目标被 Freedom 私网默认规则拒绝 | Verified | [Local reproduction log](/tmp/chimera-xray-client-vless-tcp-none-149849-1792278770553/chimera.stderr.log), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
 | LESSON-20261016-001 | 2026-10-16 | Workflow | 自动合并范围误设为所有同仓 PR | Mitigated locally; corrective CI pending | [Overbroad policy commit 22fdde9](https://github.com/MFSGA/Chimera_Server/commit/22fdde9a87685fdc057ec9dc15d52cf417b0c2bb) |
 | LESSON-20261015-001 | 2026-10-15 | Workflow | 自动合并预检把 Actions jobs 响应误判为列表 | Pushed; remote verification pending | [Auto-merge run 38738346030](https://github.com/MFSGA/Chimera_Server/actions/runs/38738346030) |
 
@@ -36,6 +38,36 @@
 ```
 
 ## 已确认经验
+
+### LESSON-20261017-001: Xray smoke test 误依赖被忽略的本地证书
+- 发现日期（UTC）：2026-10-17
+- 分类：CI
+- 严重度：Low
+- 状态：Verified
+- 证据：[失败的 Xray Compatibility Smoke run 39077494361](https://github.com/MFSGA/Chimera_Server/actions/runs/39077494361) 首个测试在 `first_cert_sha256_hex` 打开 `cert/cert.pem` 时失败；修复后的 [Xray Compatibility Smoke run 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) 全部通过。
+- 影响范围：`xray_client_can_proxy_tcp_through_chimera_vless_tcp` 在干净 checkout 中无法启动；该测试的 TCP/none 分支不使用 TLS。
+- 观察到的失败：手动 smoke workflow 下载和验证 Xray 成功，运行第一个端到端测试时因 `cert/cert.pem` 不存在而 panic；`cert/` 被 `.gitignore` 忽略。
+- 根本原因：公共传输测试 helper 在匹配 TCP/WebSocket/TLS 场景之前无条件打开工作区证书，而非 TLS 场景也执行这一步。开发者本地忽略目录掩盖了 clean-checkout 问题。
+- 修复措施：仅在 WebSocket TLS 用例中于临时测试目录生成证书，并据此计算 pin；非 TLS 用例不再访问 `cert/`。
+- 预防措施：端到端测试证书由测试自身生成；手动兼容性 workflow 需在干净的 GitHub runner 上运行。
+- 回归验证：使用校验和固定的 Xray 26.7.28 客户端，GitHub workflow 中 VLESS TCP、gRPC、HTTPUpgrade 三条精确 ignored 测试均通过；另在本地运行的 `xray_client_can_proxy_tcp_through_chimera_vless_ws` 与 `xray_client_can_proxy_tcp_through_chimera_vless_wss` 用例也通过。workflow：[39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338)。
+- 重复事件：无已知关联事件。
+- 是否提议升级为强制规则：否；问题局限于测试夹具的自包含性。
+
+### LESSON-20261017-002: Xray smoke 的 loopback echo 目标被 Freedom 私网默认规则拒绝
+- 发现日期（UTC）：2026-10-17
+- 分类：CI
+- 严重度：Low
+- 状态：Verified
+- 证据：Xray 26.7.28 下复现；Chimera 日志 `/tmp/chimera-xray-client-vless-tcp-none-149849-1792278770553/chimera.stderr.log` 显示选中了 `direct` Freedom outbound，随后以 `TCP outbound routing rejected connection` 关闭会话。修复后的 [Xray Compatibility Smoke run 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) 通过。
+- 影响范围：手动 smoke 中 VLESS TCP、gRPC、HTTPUpgrade 三项都通过 loopback TCP echo server 验证数据面。
+- 观察到的失败：Xray 成功连入 Chimera，SOCKS 建立成功，但请求 `127.0.0.1:<echo-port>` 被拒绝，客户端读取 echo 时遇到 EOF。
+- 根本原因：Chimera 按 Xray VLESS 默认规则拒绝私有 IP；测试夹具没有为本地 echo 目标设置显式 Freedom allow 规则。这不是传输实现故障。
+- 修复措施：仅在三个兼容性测试的 Freedom 配置中允许 `127.0.0.1/32`、TCP 和该测试随机分配的 echo 端口；生产策略保持不变。
+- 预防措施：端到端测试使用受限的显式策略放行本机 fixture，不能通过放宽生产默认策略来绕开测试环境限制。
+- 回归验证：GitHub workflow 中 VLESS TCP、gRPC、HTTPUpgrade 三条精确 ignored 测试全部通过；本地使用同一固定版本 Xray 的这三项及额外 VLESS WebSocket TLS 用例也分别通过。Xray client：26.7.28；`ref/xray-core`：`701af60772cda123492f86e383e1fdba066614a9`。workflow：[39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338)。
+- 重复事件：无已知关联事件。
+- 是否提议升级为强制规则：否；通过显式测试配置即可避免。
 
 ### LESSON-20261016-001: 自动合并策略范围误设为所有同仓 PR
 - 发现日期（UTC）：2026-10-16

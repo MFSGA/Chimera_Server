@@ -34,4 +34,4 @@
 - [ ] 已读取 `AGENTS.md` 及相关设计、历史 Lesson
 - [ ] 修改范围最小，未引入无关变更
 - [ ] 明确列出未执行的检查，不伪造通过结果
-- 自动合并范围：仅 `dependabot[bot]` 的同仓 Cargo 依赖 PR，且只改 `Cargo.toml`/`Cargo.lock`；普通 PR、GitHub Actions 依赖更新和其他 L3 改动仍由人工合并，所有 required Review/checks 继续生效。
+- 自动合并范围：仅 `dependabot[bot]` 的同仓 Cargo 依赖 PR，且只改 `Cargo.toml`/`Cargo.lock`；必须满足所有 required CI 和其他 GitHub 合并条件。普通 PR、GitHub Actions 依赖更新和其他 L3 改动仍由人工合并；`master` 保留必需 CI 检查，但不由 GitHub 强制要求审批人数，仓库审查流程仍适用。
