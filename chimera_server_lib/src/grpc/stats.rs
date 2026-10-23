@@ -267,21 +267,25 @@ impl StatsServiceImpl {
 
     fn user_traffic_value(
         &self,
-        current_stats: &HashMap<String, i64>,
+        user_totals: &HashMap<String, (u64, u64)>,
         email: &str,
-        direction: &str,
+        upload: bool,
         reset: bool,
     ) -> i64 {
+        let Some((uplink, downlink)) = user_totals.get(email).copied() else {
+            return 0;
+        };
+        let (direction, value) = if upload {
+            ("uplink", uplink)
+        } else {
+            ("downlink", downlink)
+        };
         let name = format!("user>>>{email}>>>traffic>>>{direction}");
-        match current_stats.get(&name).copied() {
-            Some(value) => {
-                if reset {
-                    self.reset.reset(&name, value)
-                } else {
-                    value.saturating_sub(self.reset.read(&name))
-                }
-            }
-            None => 0,
+        let value = value as i64;
+        if reset {
+            self.reset.reset(&name, value)
+        } else {
+            value.saturating_sub(self.reset.read(&name))
         }
     }
 
@@ -482,8 +486,11 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
         Status,
     > {
         let request = request.into_inner();
-        let current_stats = self.current_stats();
         let mut users = self.collect_user_stats();
+        let traffic_by_user = request.include_traffic.then(|| {
+            let identities = users.keys().cloned().collect::<HashSet<_>>();
+            traffic::user_traffic_for(&identities)
+        });
         let mut response_users = Vec::with_capacity(users.len());
 
         for (email, mut user) in users.drain() {
@@ -500,26 +507,24 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
                     .then(left.last_seen.cmp(&right.last_seen))
             });
 
-            let traffic = if request.include_traffic {
+            let traffic = traffic_by_user.as_ref().map(|user_totals| {
                 let uplink = self.user_traffic_value(
-                    &current_stats,
+                    user_totals,
                     &email,
-                    "uplink",
+                    true,
                     request.reset,
                 );
                 let downlink = self.user_traffic_value(
-                    &current_stats,
+                    user_totals,
                     &email,
-                    "downlink",
+                    false,
                     request.reset,
                 );
-                Some(proto::xray::app::stats::command::TrafficUserStat {
+                proto::xray::app::stats::command::TrafficUserStat {
                     uplink,
                     downlink,
-                })
-            } else {
-                None
-            };
+                }
+            });
 
             response_users.push(proto::xray::app::stats::command::UserStat {
                 email: user.email,

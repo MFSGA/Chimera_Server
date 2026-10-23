@@ -688,6 +688,13 @@ async fn stats_get_users_stats_includes_ips_and_traffic() {
         .with_client_ip(ip2);
     let _guard3 = traffic::register_connection(Some(&ctx2));
 
+    let idle_user = unique_tag("userstats-idle");
+    let idle_context = TrafficContext::new("test")
+        .with_inbound_tag(&tag)
+        .with_identity(&idle_user)
+        .with_client_ip(IpAddr::V4(Ipv4Addr::new(10, 4, 1, 3)));
+    let _idle_guard = traffic::register_connection(Some(&idle_context));
+
     record_transfer(&tag, &user, 120, 450);
     record_transfer(&tag, &user, 30, 70);
 
@@ -726,6 +733,15 @@ async fn stats_get_users_stats_includes_ips_and_traffic() {
     assert_eq!(traffic.uplink, 150);
     assert_eq!(traffic.downlink, 520);
 
+    let idle_stat = response
+        .users
+        .iter()
+        .find(|entry| entry.email == idle_user)
+        .expect("idle user stat not found");
+    let idle_traffic = idle_stat.traffic.as_ref().expect("idle traffic missing");
+    assert_eq!(idle_traffic.uplink, 0);
+    assert_eq!(idle_traffic.downlink, 0);
+
     let response = service
         .get_users_stats(Request::new(
             proto::xray::app::stats::command::GetUsersStatsRequest {
@@ -746,6 +762,26 @@ async fn stats_get_users_stats_includes_ips_and_traffic() {
     assert_eq!(traffic.uplink, 150);
     assert_eq!(traffic.downlink, 520);
 
+    record_transfer(&tag, &user, 5, 7);
+
+    let response = service
+        .get_users_stats(Request::new(
+            proto::xray::app::stats::command::GetUsersStatsRequest {
+                include_traffic: false,
+                reset: true,
+            },
+        ))
+        .await
+        .expect("get_users_stats without traffic failed")
+        .into_inner();
+    let user_stat = response
+        .users
+        .iter()
+        .find(|entry| entry.email == user)
+        .expect("user stat not found without traffic");
+    assert_eq!(user_stat.ips.len(), 2);
+    assert!(user_stat.traffic.is_none());
+
     record_transfer(&tag, &user, 10, 20);
 
     let response = service
@@ -765,8 +801,115 @@ async fn stats_get_users_stats_includes_ips_and_traffic() {
         .find(|entry| entry.email == user)
         .expect("user stat not found after delta");
     let traffic = user_stat.traffic.as_ref().expect("traffic missing");
-    assert_eq!(traffic.uplink, 10);
-    assert_eq!(traffic.downlink, 20);
+    assert_eq!(traffic.uplink, 15);
+    assert_eq!(traffic.downlink, 27);
+}
+
+#[tokio::test]
+#[ignore = "manual release-mode GetUsersStats snapshot probe"]
+async fn get_users_stats_without_traffic_probe() {
+    use std::{collections::HashSet, hint::black_box, time::Instant};
+
+    const INBOUND_COUNT: usize = 128;
+    const USER_COUNT: usize = 64;
+    const ITERATIONS: usize = 25;
+
+    let namespace = unique_tag("get-users-stats-probe");
+    let users = (0..USER_COUNT)
+        .map(|index| format!("{namespace}-user-{index}"))
+        .collect::<Vec<_>>();
+    let mut connections = Vec::with_capacity(USER_COUNT);
+    for (index, user) in users.iter().enumerate() {
+        let context = TrafficContext::new("probe")
+            .with_identity(user)
+            .with_client_ip(IpAddr::V4(Ipv4Addr::new(
+                198,
+                18,
+                0,
+                (index + 1) as u8,
+            )));
+        connections.push(traffic::register_connection(Some(&context)));
+    }
+
+    for inbound_index in 0..INBOUND_COUNT {
+        let inbound = format!("{namespace}-inbound-{inbound_index}");
+        for user in &users {
+            let context = TrafficContext::new("probe")
+                .with_inbound_tag(&inbound)
+                .with_identity(user);
+            traffic::record_transfer(Some(context), 1, 2);
+        }
+    }
+
+    let service = StatsServiceImpl::new();
+    let request = || {
+        Request::new(proto::xray::app::stats::command::GetUsersStatsRequest {
+            include_traffic: false,
+            reset: false,
+        })
+    };
+    let response = service
+        .get_users_stats(request())
+        .await
+        .expect("probe request should succeed")
+        .into_inner();
+    assert_eq!(response.users.len(), USER_COUNT);
+    assert!(response.users.iter().all(|user| user.traffic.is_none()));
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        // This recreates the unconditional full-snapshot work performed by
+        // the previous GetUsersStats implementation when traffic was omitted.
+        black_box(service.current_stats());
+        let response = service
+            .get_users_stats(request())
+            .await
+            .expect("baseline probe request should succeed")
+            .into_inner();
+        black_box(response.users.len());
+    }
+    let previous_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let response = service
+            .get_users_stats(request())
+            .await
+            .expect("optimized probe request should succeed")
+            .into_inner();
+        black_box(response.users.len());
+    }
+    let optimized_elapsed = started.elapsed();
+    let ratio = previous_elapsed.as_secs_f64()
+        / optimized_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "inbounds={INBOUND_COUNT} users_per_inbound={USER_COUNT} iterations={ITERATIONS} previous={previous_elapsed:?} optimized={optimized_elapsed:?} ratio={ratio:.2}x"
+    );
+
+    let identities = users.iter().cloned().collect::<HashSet<_>>();
+    let selected = traffic::user_traffic_for(&identities);
+    assert_eq!(selected.len(), USER_COUNT);
+    assert!(selected.values().all(|totals| {
+        *totals == (INBOUND_COUNT as u64, (INBOUND_COUNT * 2) as u64)
+    }));
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        black_box(service.current_stats());
+    }
+    let full_snapshot_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        black_box(traffic::user_traffic_for(&identities));
+    }
+    let selected_users_elapsed = started.elapsed();
+    let aggregation_ratio = full_snapshot_elapsed.as_secs_f64()
+        / selected_users_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "inbounds={INBOUND_COUNT} users_per_inbound={USER_COUNT} iterations={ITERATIONS} full_stats_snapshot={full_snapshot_elapsed:?} selected_user_traffic={selected_users_elapsed:?} ratio={aggregation_ratio:.2}x"
+    );
+    drop(connections);
 }
 
 #[tokio::test]
