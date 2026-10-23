@@ -285,6 +285,18 @@ mod traffic_noop {
         TrafficSnapshot::default()
     }
 
+    pub fn user_traffic(_: &str) -> Option<(u64, u64)> {
+        None
+    }
+
+    pub fn inbound_traffic(_: &str) -> Option<(u64, u64)> {
+        None
+    }
+
+    pub fn outbound_traffic(_: &str) -> Option<(u64, u64)> {
+        None
+    }
+
     pub fn register_connection(_: Option<&TrafficContext>) -> ConnectionGuard {
         ConnectionGuard::new()
     }
@@ -301,8 +313,9 @@ mod traffic_noop {
 #[cfg(not(feature = "traffic"))]
 pub use traffic_noop::{
     ActiveConnectionSnapshot, ConnectionGuard, TrafficContext, TrafficSnapshot,
-    TransferTotals, active_connection_count, active_connections, record_transfer,
-    record_transfer_ref, register_connection, register_identity, snapshot,
+    TransferTotals, active_connection_count, active_connections, inbound_traffic,
+    outbound_traffic, record_transfer, record_transfer_ref, register_connection,
+    register_identity, snapshot, user_traffic,
 };
 
 #[cfg(all(test, feature = "traffic"))]

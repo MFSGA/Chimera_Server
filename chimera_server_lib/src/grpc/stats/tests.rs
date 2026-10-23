@@ -33,6 +33,37 @@ fn name_inbound(tag: &str, suffix: &str) -> String {
     format!("inbound>>>{tag}>>>traffic>>>{suffix}")
 }
 
+#[test]
+fn parse_traffic_counter_preserves_scope_key_and_terminal_direction() {
+    let identity = "alice>>>traffic>>>uplink";
+    assert!(matches!(
+        parse_traffic_counter(&format!(
+            "user>>>{identity}>>>traffic>>>downlink"
+        )),
+        Some(TrafficCounter::User {
+            identity: parsed,
+            upload: false
+        }) if parsed == identity
+    ));
+    let empty_tag_name = format!("inbound>>>{}>>>traffic>>>uplink", "");
+    assert!(matches!(
+        parse_traffic_counter(&empty_tag_name),
+        Some(TrafficCounter::Inbound {
+            tag: "",
+            upload: true
+        })
+    ));
+    assert!(matches!(
+        parse_traffic_counter("outbound>>>direct>>>traffic>>>downlink"),
+        Some(TrafficCounter::Outbound {
+            tag: "direct",
+            upload: false
+        })
+    ));
+    assert!(parse_traffic_counter("inbound>>>edge>>>traffic").is_none());
+    assert!(parse_traffic_counter("unknown>>>edge>>>traffic>>>uplink").is_none());
+}
+
 #[tokio::test]
 async fn registered_identity_is_visible_before_first_transfer() {
     let service = StatsServiceImpl::new();
@@ -144,6 +175,151 @@ async fn stats_get_stats_and_reset() {
         .expect("delta downlink failed")
         .into_inner();
     assert_eq!(response.stat.unwrap().value, 70);
+}
+
+#[tokio::test]
+async fn stats_get_single_user_counter_aggregates_inbounds_and_resets() {
+    let service = StatsServiceImpl::new();
+    let user = unique_tag("single-stat-user");
+    let first_inbound = unique_tag("single-stat-inbound");
+    let second_inbound = unique_tag("single-stat-inbound");
+    traffic::register_identity(user.clone());
+
+    let uplink_name = format!("user>>>{user}>>>traffic>>>uplink");
+    let downlink_name = format!("user>>>{user}>>>traffic>>>downlink");
+    let zero = service
+        .get_stats(Request::new(
+            proto::xray::app::stats::command::GetStatsRequest {
+                name: uplink_name.clone(),
+                reset: false,
+            },
+        ))
+        .await
+        .expect("registered user stat should be visible")
+        .into_inner();
+    assert_eq!(zero.stat.expect("registered user counter").value, 0);
+
+    record_transfer(&first_inbound, &user, 80, 120);
+    record_transfer(&second_inbound, &user, 40, 60);
+
+    let value = service
+        .get_stats(Request::new(
+            proto::xray::app::stats::command::GetStatsRequest {
+                name: uplink_name.clone(),
+                reset: false,
+            },
+        ))
+        .await
+        .expect("user uplink stat should aggregate inbounds")
+        .into_inner();
+    assert_eq!(value.stat.expect("user uplink counter").value, 120);
+
+    let reset_value = service
+        .get_stats(Request::new(
+            proto::xray::app::stats::command::GetStatsRequest {
+                name: uplink_name.clone(),
+                reset: true,
+            },
+        ))
+        .await
+        .expect("user uplink reset should succeed")
+        .into_inner();
+    assert_eq!(reset_value.stat.expect("reset user counter").value, 120);
+
+    record_transfer(&second_inbound, &user, 7, 11);
+    let delta = service
+        .get_stats(Request::new(
+            proto::xray::app::stats::command::GetStatsRequest {
+                name: uplink_name,
+                reset: false,
+            },
+        ))
+        .await
+        .expect("user uplink delta should succeed")
+        .into_inner();
+    assert_eq!(delta.stat.expect("user uplink delta").value, 7);
+
+    let downlink = service
+        .get_stats(Request::new(
+            proto::xray::app::stats::command::GetStatsRequest {
+                name: downlink_name,
+                reset: false,
+            },
+        ))
+        .await
+        .expect("user downlink stat should succeed")
+        .into_inner();
+    assert_eq!(downlink.stat.expect("user downlink counter").value, 191);
+
+    let unknown = unique_tag("unknown-stat-user");
+    let error = service
+        .get_stats(Request::new(
+            proto::xray::app::stats::command::GetStatsRequest {
+                name: format!("user>>>{unknown}>>>traffic>>>uplink"),
+                reset: false,
+            },
+        ))
+        .await
+        .expect_err("unknown user counter should remain not found");
+    assert_eq!(error.code(), Code::NotFound);
+}
+
+#[test]
+#[ignore = "manual release-mode single-counter query probe"]
+fn stats_single_counter_query_probe() {
+    use std::{hint::black_box, time::Instant};
+
+    const INBOUND_COUNT: usize = 128;
+    const USER_COUNT: usize = 64;
+    const ITERATIONS: usize = 50;
+
+    let namespace = unique_tag("stats-query-probe");
+    let users = (0..USER_COUNT)
+        .map(|index| format!("{namespace}-user-{index}"))
+        .collect::<Vec<_>>();
+
+    for inbound_index in 0..INBOUND_COUNT {
+        let inbound = format!("{namespace}-inbound-{inbound_index}");
+        for user in &users {
+            let context = TrafficContext::new("probe")
+                .with_inbound_tag(&inbound)
+                .with_identity(user);
+            traffic::record_transfer(Some(context), 1, 2);
+        }
+    }
+
+    let service = StatsServiceImpl::new();
+    let counter_name = format!(
+        "user>>>{}>>>traffic>>>uplink",
+        users.last().expect("at least one probe user")
+    );
+    assert_eq!(service.current_stats()[&counter_name], INBOUND_COUNT as i64);
+    assert_eq!(
+        service.get_stat_value(&counter_name, false),
+        Some(INBOUND_COUNT as i64)
+    );
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        let current_stats = service.current_stats();
+        let value = current_stats
+            .get(&counter_name)
+            .copied()
+            .map(|value| value.saturating_sub(service.reset.read(&counter_name)));
+        black_box(value);
+    }
+    let snapshot_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    for _ in 0..ITERATIONS {
+        black_box(service.get_stat_value(&counter_name, false));
+    }
+    let direct_elapsed = started.elapsed();
+    let speedup = snapshot_elapsed.as_secs_f64()
+        / direct_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "inbounds={INBOUND_COUNT} users_per_inbound={USER_COUNT} iterations={ITERATIONS} full_snapshot={snapshot_elapsed:?} direct_counter={direct_elapsed:?} ratio={speedup:.2}x"
+    );
 }
 
 #[tokio::test]

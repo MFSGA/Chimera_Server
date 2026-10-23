@@ -133,6 +133,13 @@ pub struct TransferTotals {
     pub download_bytes: u64,
 }
 
+type TrafficBytes = (u64, u64);
+
+fn add_traffic_bytes(target: &mut TrafficBytes, totals: &TransferTotals) {
+    target.0 = target.0.saturating_add(totals.upload_bytes);
+    target.1 = target.1.saturating_add(totals.download_bytes);
+}
+
 impl TransferTotals {
     fn accumulate(&mut self, upload: u64, download: u64) {
         self.connections = self.connections.saturating_add(1);
@@ -469,6 +476,52 @@ impl TrafficRecorder {
         }
         snapshot
     }
+
+    fn user_traffic(&self, identity: &str) -> Option<TrafficBytes> {
+        let mut found = false;
+        let mut bytes = (0, 0);
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            found |= guard.known_identities.contains(identity);
+            for inbound in guard.per_inbound.values() {
+                if let Some(totals) = inbound.per_user.get(identity) {
+                    found = true;
+                    add_traffic_bytes(&mut bytes, totals);
+                }
+            }
+        }
+        found.then_some(bytes)
+    }
+
+    fn inbound_traffic(&self, tag: &str) -> Option<TrafficBytes> {
+        let mut found = false;
+        let mut bytes = (0, 0);
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            let Some(inbound) = guard.per_inbound.get(tag) else {
+                continue;
+            };
+            if inbound.totals.connections == 0 {
+                continue;
+            }
+            found = true;
+            add_traffic_bytes(&mut bytes, &inbound.totals);
+        }
+        found.then_some(bytes)
+    }
+
+    fn outbound_traffic(&self, tag: &str) -> Option<TrafficBytes> {
+        let mut found = false;
+        let mut bytes = (0, 0);
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            if let Some(totals) = guard.per_outbound.get(tag) {
+                found = true;
+                add_traffic_bytes(&mut bytes, totals);
+            }
+        }
+        found.then_some(bytes)
+    }
 }
 
 pub fn record_transfer(context: Option<TrafficContext>, upload: u64, download: u64) {
@@ -506,6 +559,22 @@ pub fn register_identity(identity: impl Into<String>) {
 
 pub fn snapshot() -> TrafficSnapshot {
     TrafficRecorder::global().snapshot()
+}
+
+/// Read one user's aggregate inbound traffic without materializing a full
+/// traffic snapshot. Returns `None` when the identity has never been exposed.
+pub fn user_traffic(identity: &str) -> Option<(u64, u64)> {
+    TrafficRecorder::global().user_traffic(identity)
+}
+
+/// Read one inbound's totals without materializing a full traffic snapshot.
+pub fn inbound_traffic(tag: &str) -> Option<(u64, u64)> {
+    TrafficRecorder::global().inbound_traffic(tag)
+}
+
+/// Read one outbound's totals without materializing a full traffic snapshot.
+pub fn outbound_traffic(tag: &str) -> Option<(u64, u64)> {
+    TrafficRecorder::global().outbound_traffic(tag)
 }
 
 #[derive(Debug, Clone)]
@@ -825,6 +894,54 @@ mod tests {
     }
 
     #[test]
+    fn direct_counter_reads_match_snapshot_presence_and_aggregation() {
+        let recorder = TrafficRecorder::default();
+        recorder.register_identity("configured-only");
+        assert_eq!(recorder.user_traffic("configured-only"), Some((0, 0)));
+        assert_eq!(recorder.user_traffic("missing"), None);
+
+        for (inbound, upload, download) in [("edge-a", 13, 17), ("edge-b", 7, 11)] {
+            recorder.record(
+                &TrafficContext::new("vless")
+                    .with_identity("alice")
+                    .with_inbound_tag(inbound)
+                    .with_outbound_tag("direct"),
+                upload,
+                download,
+            );
+        }
+
+        assert_eq!(recorder.user_traffic("alice"), Some((20, 28)));
+        assert_eq!(recorder.inbound_traffic("edge-a"), Some((13, 17)));
+        assert_eq!(recorder.outbound_traffic("direct"), Some((20, 28)));
+        assert_eq!(recorder.inbound_traffic("missing"), None);
+        assert_eq!(recorder.outbound_traffic("missing"), None);
+
+        recorder.record(
+            &TrafficContext::new("vless").with_identity("without-inbound"),
+            5,
+            9,
+        );
+        assert_eq!(recorder.user_traffic("without-inbound"), Some((0, 0)));
+
+        let mut hidden_user = TrafficContext::new("vless")
+            .with_identity("hidden-user")
+            .with_inbound_tag("hidden-inbound");
+        hidden_user.set_user_stats_policy(false, false, false);
+        recorder.record(&hidden_user, 2, 3);
+        assert_eq!(recorder.user_traffic("hidden-user"), None);
+        assert_eq!(recorder.inbound_traffic("hidden-inbound"), Some((2, 3)));
+
+        let mut user_only = TrafficContext::new("vless")
+            .with_identity("user-only")
+            .with_inbound_tag("user-only-inbound");
+        user_only.set_system_stats_policy(false, false, false, false);
+        recorder.record(&user_only, 19, 23);
+        assert_eq!(recorder.user_traffic("user-only"), Some((19, 23)));
+        assert_eq!(recorder.inbound_traffic("user-only-inbound"), None);
+    }
+
+    #[test]
     fn online_stats_policy_hides_identity_but_keeps_connection_metadata() {
         let started_at = SystemTime::UNIX_EPOCH;
         let mut context = TrafficContext::new("vless")
@@ -897,6 +1014,18 @@ mod tests {
             expected_records
         );
         assert!(snapshot.known_identities.contains("alice"));
+        assert_eq!(
+            recorder.user_traffic("alice"),
+            Some((expected_records * 7, expected_records * 11))
+        );
+        assert_eq!(
+            recorder.inbound_traffic("edge"),
+            Some((expected_records * 7, expected_records * 11))
+        );
+        assert_eq!(
+            recorder.outbound_traffic("direct"),
+            Some((expected_records * 7, expected_records * 11))
+        );
     }
 
     #[test]

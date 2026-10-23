@@ -35,6 +35,40 @@ impl StatsReset {
         value.saturating_sub(base)
     }
 }
+
+#[derive(Clone, Copy)]
+enum TrafficCounter<'a> {
+    User { identity: &'a str, upload: bool },
+    Inbound { tag: &'a str, upload: bool },
+    Outbound { tag: &'a str, upload: bool },
+}
+
+fn parse_traffic_counter(name: &str) -> Option<TrafficCounter<'_>> {
+    let (scope, rest) = if let Some(rest) = name.strip_prefix("user>>>") {
+        ("user", rest)
+    } else if let Some(rest) = name.strip_prefix("inbound>>>") {
+        ("inbound", rest)
+    } else {
+        ("outbound", name.strip_prefix("outbound>>>")?)
+    };
+
+    let (key, upload) = if let Some(key) = rest.strip_suffix(">>>traffic>>>uplink") {
+        (key, true)
+    } else {
+        (rest.strip_suffix(">>>traffic>>>downlink")?, false)
+    };
+
+    match scope {
+        "user" => Some(TrafficCounter::User {
+            identity: key,
+            upload,
+        }),
+        "inbound" => Some(TrafficCounter::Inbound { tag: key, upload }),
+        "outbound" => Some(TrafficCounter::Outbound { tag: key, upload }),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct StatsServiceImpl {
     start_time: Instant,
@@ -113,8 +147,18 @@ impl StatsServiceImpl {
     }
 
     fn get_stat_value(&self, name: &str, reset: bool) -> Option<i64> {
-        let current_stats = self.current_stats();
-        let value = current_stats.get(name).copied()?;
+        let (bytes, upload) = match parse_traffic_counter(name)? {
+            TrafficCounter::User { identity, upload } => {
+                (traffic::user_traffic(identity)?, upload)
+            }
+            TrafficCounter::Inbound { tag, upload } => {
+                (traffic::inbound_traffic(tag)?, upload)
+            }
+            TrafficCounter::Outbound { tag, upload } => {
+                (traffic::outbound_traffic(tag)?, upload)
+            }
+        };
+        let value = (if upload { bytes.0 } else { bytes.1 }) as i64;
         if reset {
             Some(self.reset.reset(name, value))
         } else {
