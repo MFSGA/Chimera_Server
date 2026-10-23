@@ -15,6 +15,8 @@ use crate::handler::hysteria2::connection::HysteriaUserStore;
 use crate::handler::shadowsocks::ShadowsocksUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
+#[cfg(feature = "vless")]
+use crate::handler::vless_handler::CompiledVlessUsers;
 #[cfg(feature = "wireguard")]
 use crate::wireguard::WireGuardPeerStore;
 use crate::{
@@ -176,7 +178,10 @@ impl InboundManager {
     }
 
     #[cfg(feature = "vless")]
-    pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
+    pub(crate) fn vless_users_snapshot(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<CompiledVlessUsers>> {
         self.state
             .read()
             .expect("inbound manager lock poisoned")
@@ -184,7 +189,7 @@ impl InboundManager {
             .iter()
             .find(|entry| entry.config.tag == tag)
             .and_then(|entry| entry.vless_users.as_ref())
-            .map(VlessUserStore::snapshot)
+            .map(VlessUserStore::compiled_snapshot)
     }
 
     #[cfg(feature = "vmess")]
@@ -555,19 +560,12 @@ impl InboundManager {
         };
 
         if let Some(store) = vless_store {
-            let original_users = store.snapshot();
             let update_in_place = store
                 .update(update_vless_users)
                 .map_err(AlterInboundError::Update)?;
             if update_in_place {
                 return Ok(());
             }
-            store
-                .update::<(), E, _>(|users| {
-                    *users = original_users;
-                    Ok(())
-                })
-                .map_err(AlterInboundError::Update)?;
         }
 
         self.alter_started_locked(runtime, tag, update_config).await

@@ -17,6 +17,8 @@ use crate::handler::hysteria2::connection::HysteriaUserStore;
 use crate::handler::shadowsocks::ShadowsocksUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
+#[cfg(feature = "vless")]
+use crate::handler::vless_handler::CompiledVlessUsers;
 #[cfg(feature = "wireguard")]
 use crate::inbound::AlterInboundError;
 #[cfg(feature = "wireguard")]
@@ -527,7 +529,10 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "vless")]
-    pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
+    pub(crate) fn vless_users_snapshot(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<CompiledVlessUsers>> {
         self.data_plane.0.inbound_manager.vless_users_snapshot(tag)
     }
 

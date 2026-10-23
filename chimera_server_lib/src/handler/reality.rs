@@ -16,7 +16,9 @@ use crate::handler::tcp::tcp_handler::{
     TcpServerConnectionContext, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::handler::tls_deframer::TlsDeframer;
-use crate::handler::vless_handler::setup_reality_mixed_vless_server_stream;
+use crate::handler::vless_handler::{
+    CompiledVlessUsers, parse_vless_users, setup_reality_mixed_vless_server_stream,
+};
 use crate::reality::{BufReader, RealityServerConnection, RealityTlsStream};
 use crate::resolver::{NativeResolver, Resolver, resolve_single_address};
 use crate::util::socket::new_tcp_socket;
@@ -784,7 +786,7 @@ impl TcpServerHandler for RealityServerHandler {
 #[derive(Debug)]
 pub struct RealityVisionVlessServerHandler {
     transport_config: RealityTransportConfig,
-    users: Vec<VlessUser>,
+    users: Arc<CompiledVlessUsers>,
     fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
@@ -798,7 +800,7 @@ impl RealityVisionVlessServerHandler {
     ) -> Self {
         Self {
             transport_config: config,
-            users,
+            users: Arc::new(parse_vless_users(&users)),
             fallbacks,
             inbound_tag: inbound_tag.to_string(),
         }
@@ -835,7 +837,7 @@ impl TcpServerHandler for RealityVisionVlessServerHandler {
         let dynamic_users = handshake_runtime
             .as_ref()
             .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
-        let users = dynamic_users.as_deref().unwrap_or(&self.users);
+        let users = dynamic_users.as_deref().unwrap_or(self.users.as_ref());
         let timeout = handshake_runtime
             .as_ref()
             .map(|runtime| runtime.xray_handshake_timeout_for_level(0))

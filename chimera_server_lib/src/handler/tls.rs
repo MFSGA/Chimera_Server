@@ -32,14 +32,17 @@ use crate::{
 #[cfg(feature = "vless")]
 use crate::{
     config::server_config::{VlessFallback, VlessUser},
-    handler::vless_handler::{VisionRecordIo, setup_tls_mixed_vless_server_stream},
+    handler::vless_handler::{
+        CompiledVlessUsers, VisionRecordIo, parse_vless_users,
+        setup_tls_mixed_vless_server_stream,
+    },
 };
 
 enum TlsInner {
     Handler(Box<dyn TcpServerHandler>),
     #[cfg(feature = "vless")]
     VisionVless {
-        users: Vec<VlessUser>,
+        users: Arc<CompiledVlessUsers>,
         fallbacks: Vec<VlessFallback>,
         inbound_tag: String,
     },
@@ -146,7 +149,7 @@ impl TlsServerHandler {
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             inner: TlsInner::VisionVless {
-                users: users.to_vec(),
+                users: Arc::new(parse_vless_users(users)),
                 fallbacks: fallbacks.to_vec(),
                 inbound_tag: inbound_tag.to_string(),
             },
@@ -233,7 +236,7 @@ impl TcpServerHandler for TlsServerHandler {
                 let dynamic_users = handshake_runtime
                     .as_ref()
                     .and_then(|runtime| runtime.vless_users_snapshot(inbound_tag));
-                let users = dynamic_users.as_deref().unwrap_or(users);
+                let users = dynamic_users.as_deref().unwrap_or(users.as_ref());
                 let setup = async {
                     let tls_stream = self
                         .acceptor

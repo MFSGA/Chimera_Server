@@ -1,6 +1,6 @@
 #![cfg(feature = "vless")]
 
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
@@ -60,11 +60,38 @@ pub(crate) use vision::setup_tls_mixed_vless_server_stream;
 
 const SERVER_RESPONSE_HEADER: &[u8] = &[0u8, 0u8];
 
-type ParsedVlessUser = (Box<[u8]>, String, String, String, u32, Option<String>);
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedVlessUser {
+    pub user_id_bytes: Box<[u8]>,
+    pub user_id: String,
+    pub user_label: String,
+    pub flow: String,
+    pub user_level: u32,
+    pub reverse_tag: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CompiledVlessUsers {
+    users: Vec<ParsedVlessUser>,
+    by_id: HashMap<[u8; 16], usize>,
+}
+
+impl CompiledVlessUsers {
+    pub(crate) fn find(&self, user_id: &[u8]) -> Option<&ParsedVlessUser> {
+        let user_id: &[u8; 16] = user_id.try_into().ok()?;
+        self.by_id
+            .get(user_id)
+            .and_then(|index| self.users.get(*index))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &ParsedVlessUser> {
+        self.users.iter()
+    }
+}
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
-    users: Vec<ParsedVlessUser>,
+    users: Arc<CompiledVlessUsers>,
     fallbacks: Vec<VlessFallback>,
     inbound_tag: String,
 }
@@ -81,27 +108,36 @@ impl VlessTcpHandler {
         inbound_tag: &str,
     ) -> Self {
         Self {
-            users: parse_vless_users(users),
+            users: Arc::new(parse_vless_users(users)),
             fallbacks: fallbacks.to_vec(),
             inbound_tag: inbound_tag.to_string(),
         }
     }
 }
 
-fn parse_vless_users(users: &[VlessUser]) -> Vec<ParsedVlessUser> {
-    users
+pub(crate) fn parse_vless_users(users: &[VlessUser]) -> CompiledVlessUsers {
+    let parsed_users = users
         .iter()
-        .map(|user| {
-            (
-                parse_hex(&user.user_id),
-                user.user_id.clone(),
-                user.user_label.clone(),
-                user.flow.clone(),
-                user.user_level,
-                user.reverse.as_ref().map(|reverse| reverse.tag.clone()),
-            )
+        .map(|user| ParsedVlessUser {
+            user_id_bytes: parse_hex(&user.user_id),
+            user_id: user.user_id.clone(),
+            user_label: user.user_label.clone(),
+            flow: user.flow.clone(),
+            user_level: user.user_level,
+            reverse_tag: user.reverse.as_ref().map(|reverse| reverse.tag.clone()),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut by_id = HashMap::with_capacity(parsed_users.len());
+    for (index, user) in parsed_users.iter().enumerate() {
+        if let Ok(user_id) = <[u8; 16]>::try_from(user.user_id_bytes.as_ref()) {
+            // The previous Vec::iter().find() selected the first matching ID.
+            by_id.entry(user_id).or_insert(index);
+        }
+    }
+    CompiledVlessUsers {
+        users: parsed_users,
+        by_id,
+    }
 }
 
 pub fn users_require_vision(users: &[VlessUser]) -> bool {
@@ -111,7 +147,7 @@ pub fn users_require_vision(users: &[VlessUser]) -> bool {
 impl VlessTcpHandler {
     async fn setup_server_stream_with_metadata(
         &self,
-        users: &[ParsedVlessUser],
+        users: &CompiledVlessUsers,
         mut server_stream: Box<dyn AsyncStream>,
         server_name: &str,
         alpn: &str,
@@ -130,12 +166,8 @@ impl VlessTcpHandler {
                 .map_err(|_| vless_handshake_timeout_error())?,
                 None => read_vless_auth_prefix(&mut server_stream).await,
             };
-            let authenticated = candidate.is_some_and(|candidate| {
-                users.iter().any(|(stored_user_id, _, _, _, _, _)| {
-                    stored_user_id.len() == 16
-                        && stored_user_id.as_ref() == candidate.as_slice()
-                })
-            });
+            let authenticated = candidate
+                .is_some_and(|candidate| users.find(candidate.as_slice()).is_some());
             if !authenticated {
                 extend_prefix_for_path(
                     &mut server_stream,
@@ -179,17 +211,10 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = header;
-        let matched_user = users.iter().find(|(stored_user_id, _, _, _, _, _)| {
-            stored_user_id.len() == 16
-                && stored_user_id.as_ref() == user_id.as_slice()
-        });
-
-        let Some((_, user_id, user_label, configured_flow, user_level, reverse_tag)) =
-            matched_user
-        else {
+        let Some(user) = users.find(user_id.as_slice()) else {
             let expected = users
                 .iter()
-                .map(|(user_id, _, _, _, _, _)| encode_hex(user_id.as_ref()))
+                .map(|user| encode_hex(user.user_id_bytes.as_ref()))
                 .collect::<Vec<_>>()
                 .join(",");
             let got = encode_hex(&user_id);
@@ -206,16 +231,16 @@ impl VlessTcpHandler {
             ));
         };
 
-        authorize_reverse_command(reverse_tag.is_some(), command)?;
+        authorize_reverse_command(user.reverse_tag.is_some(), command)?;
 
-        validate_request_flow(configured_flow, &request_flow, command)?;
+        validate_request_flow(&user.flow, &request_flow, command)?;
 
         let traffic_context = Some(
             TrafficContext::new("vless")
-                .with_identity(user_label.clone())
-                .with_policy_identity(user_id.clone())
+                .with_identity(user.user_label.clone())
+                .with_policy_identity(user.user_id.clone())
                 .with_inbound_tag(self.inbound_tag.clone())
-                .with_user_level(*user_level),
+                .with_user_level(user.user_level),
         );
 
         match command {
@@ -242,7 +267,8 @@ impl VlessTcpHandler {
             }),
             #[cfg(feature = "vless-reverse")]
             COMMAND_RVS => Ok(TcpServerSetupResult::ReversePortal {
-                reverse_tag: reverse_tag
+                reverse_tag: user
+                    .reverse_tag
                     .clone()
                     .expect("authorized Reverse command requires a reverse tag"),
                 stream: server_stream,
@@ -299,9 +325,8 @@ impl TcpServerHandler for VlessTcpHandler {
             .map(|runtime| runtime.xray_handshake_timeout_for_level(0));
         let dynamic_users = handshake_runtime
             .as_ref()
-            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag))
-            .map(|users| parse_vless_users(&users));
-        let users = dynamic_users.as_deref().unwrap_or(&self.users);
+            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
+        let users = dynamic_users.as_deref().unwrap_or(self.users.as_ref());
         self.setup_server_stream_with_metadata(
             users,
             server_stream,
@@ -597,6 +622,113 @@ mod tests {
 
     fn plain_vless_handler(user_id: &str, user_label: &str) -> VlessTcpHandler {
         plain_vless_handler_with_level(user_id, user_label, 0)
+    }
+
+    #[test]
+    fn compiled_user_index_preserves_first_duplicate_id_match() {
+        let user_id = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let users = [
+            VlessUser {
+                user_id: user_id.into(),
+                user_label: "first".into(),
+                user_level: 0,
+                flow: String::new(),
+                reverse: None,
+            },
+            VlessUser {
+                user_id: user_id.into(),
+                user_label: "second".into(),
+                user_level: 0,
+                flow: String::new(),
+                reverse: None,
+            },
+        ];
+        let compiled = parse_vless_users(&users);
+        let parsed_id = parse_hex(user_id);
+
+        assert_eq!(
+            compiled
+                .find(&parsed_id)
+                .map(|user| user.user_label.as_str()),
+            Some("first")
+        );
+        assert!(compiled.find(&[0u8; 15]).is_none());
+    }
+
+    // A focused probe for the repeated parse-and-scan work removed from each
+    // authentication attempt. Run explicitly in release mode; this does not
+    // represent end-to-end connection throughput.
+    #[test]
+    #[ignore = "manual release-mode authentication lookup probe"]
+    fn vless_user_resolution_probe() {
+        use std::{hint::black_box, time::Instant};
+
+        for (user_count, iterations) in [
+            (1usize, 20_000usize),
+            (16, 8_000),
+            (256, 1_000),
+            (4096, 100),
+        ] {
+            let users = (0..user_count)
+                .map(|index| VlessUser {
+                    user_id: format!(
+                        "00000000-0000-4000-8000-{value:012x}",
+                        value = index + 1
+                    ),
+                    user_label: format!("user-{index}"),
+                    user_level: 0,
+                    flow: String::new(),
+                    reverse: None,
+                })
+                .collect::<Vec<_>>();
+            let target_id =
+                parse_hex(&users.last().expect("at least one test user").user_id);
+            let compiled = Arc::new(parse_vless_users(&users));
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let snapshot = users.clone();
+                let parsed = snapshot
+                    .iter()
+                    .map(|user| ParsedVlessUser {
+                        user_id_bytes: parse_hex(&user.user_id),
+                        user_id: user.user_id.clone(),
+                        user_label: user.user_label.clone(),
+                        flow: user.flow.clone(),
+                        user_level: user.user_level,
+                        reverse_tag: user
+                            .reverse
+                            .as_ref()
+                            .map(|reverse| reverse.tag.clone()),
+                    })
+                    .collect::<Vec<_>>();
+                black_box(
+                    parsed
+                        .iter()
+                        .find(|user| {
+                            user.user_id_bytes.as_ref() == target_id.as_ref()
+                        })
+                        .map(|user| &user.user_label),
+                );
+            }
+            let legacy_elapsed = started.elapsed();
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                let snapshot = Arc::clone(&compiled);
+                black_box(
+                    snapshot
+                        .find(black_box(&target_id))
+                        .map(|user| &user.user_label),
+                );
+            }
+            let indexed_elapsed = started.elapsed();
+            let speedup = legacy_elapsed.as_secs_f64()
+                / indexed_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+            eprintln!(
+                "users={user_count} iterations={iterations} legacy={legacy_elapsed:?} indexed={indexed_elapsed:?} ratio={speedup:.2}x"
+            );
+        }
     }
 
     fn plain_vless_handler_with_level(
