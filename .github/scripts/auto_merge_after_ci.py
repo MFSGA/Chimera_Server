@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 
@@ -28,6 +30,8 @@ EXPECTED_CI_JOBS = frozenset(
         "Required checks",
     }
 )
+CI_JOB_READ_ATTEMPTS = 5
+CI_JOB_RETRY_DELAY_SECONDS = 2
 PROTECTED_PATH_PREFIXES = (
     ".github/",
     "docs/ai-",
@@ -115,20 +119,62 @@ def next_link(header: str) -> str:
 
 
 def required_jobs_passed(jobs: list[dict[str, Any]], attempt: int) -> bool:
+    state, _ = required_jobs_status(jobs, attempt)
+    return state == "passed"
+
+
+def required_jobs_status(
+    jobs: list[dict[str, Any]],
+    attempt: int,
+) -> tuple[str, list[str]]:
     current: dict[str, dict[str, Any]] = {}
+    duplicates: set[str] = set()
     for job in jobs:
         if job.get("run_attempt", attempt) != attempt:
             continue
         name = job.get("name")
         if name in EXPECTED_CI_JOBS:
             if name in current:
-                return False
+                duplicates.add(name)
             current[name] = job
-    return all(
-        current.get(name, {}).get("status") == "completed"
-        and current.get(name, {}).get("conclusion") == "success"
-        for name in EXPECTED_CI_JOBS
-    )
+    if duplicates:
+        return "invalid", sorted(duplicates)
+
+    pending: list[str] = []
+    failed: list[str] = []
+    for name in EXPECTED_CI_JOBS:
+        job = current.get(name)
+        if job is None or job.get("status") != "completed":
+            pending.append(name)
+        elif job.get("conclusion") != "success":
+            failed.append(name)
+    if failed:
+        return "failed", sorted(failed)
+    if pending:
+        return "pending", sorted(pending)
+    return "passed", []
+
+
+def wait_for_required_jobs(
+    fetch_jobs: Callable[[], list[dict[str, Any]]],
+    attempt: int,
+    *,
+    max_attempts: int = CI_JOB_READ_ATTEMPTS,
+    retry_delay_seconds: float = CI_JOB_RETRY_DELAY_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, str, list[str]]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    state = "pending"
+    names: list[str] = []
+    for read_number in range(max_attempts):
+        state, names = required_jobs_status(fetch_jobs(), attempt)
+        if state != "pending":
+            return state == "passed", state, names
+        if read_number + 1 < max_attempts:
+            sleep(retry_delay_seconds)
+    return False, state, names
 
 
 def protection_confirmation_enabled(value: str | None) -> bool:
@@ -303,11 +349,22 @@ def process_pull_request(
     if workflow_run.get("head_sha") != head.get("sha"):
         raise SkipAutomation(f"PR #{number} CI run is for a different head SHA")
 
-    if not required_jobs_passed(
-        ci_jobs_for_run(api, repository, str(workflow_run["id"])),
+    ci_run_id = str(workflow_run["id"])
+    jobs_passed, jobs_state, job_names = wait_for_required_jobs(
+        lambda: ci_jobs_for_run(api, repository, ci_run_id),
         workflow_run.get("run_attempt", 1),
-    ):
-        raise SkipAutomation(f"PR #{number} is missing a successful required CI job")
+    )
+    if not jobs_passed:
+        if jobs_state == "pending":
+            reason = (
+                f"required CI jobs were still missing or incomplete after "
+                f"{CI_JOB_READ_ATTEMPTS} reads: {', '.join(job_names)}"
+            )
+        elif jobs_state == "invalid":
+            reason = f"GitHub returned duplicate required CI jobs: {', '.join(job_names)}"
+        else:
+            reason = f"required CI jobs did not pass: {', '.join(job_names)}"
+        raise SkipAutomation(f"PR #{number} {reason}")
 
     if not protection_confirmed:
         raise SkipAutomation(
@@ -361,6 +418,93 @@ def self_test() -> None:
         successful_jobs + [successful_jobs[0]],
         1,
     )
+    duplicate_fetch_count = 0
+
+    def fetch_duplicate_jobs() -> list[dict[str, Any]]:
+        nonlocal duplicate_fetch_count
+        duplicate_fetch_count += 1
+        return successful_jobs + [successful_jobs[0]]
+
+    assert wait_for_required_jobs(
+        fetch_duplicate_jobs,
+        1,
+        max_attempts=3,
+        retry_delay_seconds=0,
+        sleep=lambda _: None,
+    ) == (False, "invalid", [successful_jobs[0]["name"]])
+    assert duplicate_fetch_count == 1
+    assert required_jobs_status(successful_jobs[:-1], 1)[0] == "pending"
+    assert required_jobs_status(
+        [
+            {
+                **job,
+                "conclusion": "failure" if job["name"] == "Lint" else "success",
+            }
+            for job in successful_jobs
+        ],
+        1,
+    ) == ("failed", ["Lint"])
+
+    transient_job_responses = [successful_jobs[:-1], successful_jobs]
+    transient_fetch_count = 0
+    retry_delays: list[float] = []
+
+    def fetch_transient_jobs() -> list[dict[str, Any]]:
+        nonlocal transient_fetch_count
+        response_index = min(transient_fetch_count, len(transient_job_responses) - 1)
+        transient_fetch_count += 1
+        return transient_job_responses[response_index]
+
+    assert wait_for_required_jobs(
+        fetch_transient_jobs,
+        1,
+        max_attempts=3,
+        retry_delay_seconds=2,
+        sleep=retry_delays.append,
+    ) == (True, "passed", [])
+    assert transient_fetch_count == 2
+    assert retry_delays == [2]
+
+    incomplete_fetch_count = 0
+    incomplete_jobs = [
+        job for job in successful_jobs if job["name"] != "Required checks"
+    ]
+
+    def fetch_incomplete_jobs() -> list[dict[str, Any]]:
+        nonlocal incomplete_fetch_count
+        incomplete_fetch_count += 1
+        return incomplete_jobs
+
+    assert wait_for_required_jobs(
+        fetch_incomplete_jobs,
+        1,
+        max_attempts=3,
+        retry_delay_seconds=0,
+        sleep=lambda _: None,
+    ) == (False, "pending", ["Required checks"])
+    assert incomplete_fetch_count == 3
+
+    failed_fetch_count = 0
+
+    def fetch_failed_jobs() -> list[dict[str, Any]]:
+        nonlocal failed_fetch_count
+        failed_fetch_count += 1
+        return [
+            {
+                **job,
+                "conclusion": "failure" if job["name"] == "Lint" else "success",
+            }
+            for job in successful_jobs
+        ]
+
+    assert wait_for_required_jobs(
+        fetch_failed_jobs,
+        1,
+        max_attempts=3,
+        retry_delay_seconds=0,
+        sleep=lambda _: None,
+    ) == (False, "failed", ["Lint"])
+    assert failed_fetch_count == 1
 
     class PaginatedApiStub(GitHubApi):
         def __init__(self, pages: list[tuple[Any, dict[str, str]]]) -> None:

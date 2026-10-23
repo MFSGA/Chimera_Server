@@ -92,6 +92,7 @@ their explicitly recorded client versions and prerequisites.
 - The complete changed-file list is available and every changed path is a `Cargo.toml` or `Cargo.lock`; this excludes `.github/**` workflow dependency updates and other L3 paths.
 - The workflow does not classify dependency update versions; major Cargo upgrades are included if they satisfy the same CI and merge gates.
 - Every expected CI job succeeded on that exact head SHA and run attempt.
+- If the Jobs API has not exposed all expected jobs yet, the script re-reads it up to five times, two seconds apart. It fails closed with the remaining job names if the list is still incomplete; completed failed or duplicate jobs are not retried.
 - `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` is set. An administrator uses that variable to confirm that `CI / Required checks` still applies to the workflow token, no approval count is required on `master`, and no merge queue is configured. The configured administrator exception may remain; the Actions token must not be granted a bypass.
 - GitHub reports the PR as clean and mergeable; the workflow immediately uses the pull-request merge API pinned to the verified head SHA. If gates are still pending, it skips and retries on the next CI completion or PR event. It does not create a persistent GitHub Auto-merge request. The job uses `actions: read`, `contents: write`, and `pull-requests: write`, and executes only this trusted script from the default branch.
 
