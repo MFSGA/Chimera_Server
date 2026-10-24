@@ -3416,9 +3416,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tun"
-version = "0.7.22"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7904c94104239657089d14bccbf23fd6d363e30639ce49af21ef008a445baf97"
+checksum = "dd9b35e3ba2b50284437061a8a30097f56473f287f48b3fe7660712cc03e9047"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -3427,11 +3427,11 @@ dependencies = [
  "ipnet",
  "libc",
  "log",
- "nix 0.30.1",
+ "nix 0.31.3",
  "thiserror",
  "tokio",
  "tokio-util",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "wintun-bindings",
 ]
 
