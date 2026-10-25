@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::warn;
 
 #[cfg(any(feature = "tls", feature = "reality"))]
 use crate::config::server_config::VlessFallback;
@@ -37,7 +36,7 @@ use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
 use super::udp_stream::VlessUdpStream;
 use super::vision_stream::VisionServerStream;
 use super::{
-    CompiledVlessUsers, ParsedVlessUser, authorize_reverse_command, encode_hex,
+    CompiledVlessUsers, ParsedVlessUser, authorize_reverse_command,
     parse_vless_users, reverse_portal_runtime_unavailable,
 };
 
@@ -506,27 +505,7 @@ fn find_matching_vless_user<'a>(
     user_id: &[u8; 16],
     inbound_tag: &str,
 ) -> std::io::Result<&'a ParsedVlessUser> {
-    let Some(user) = users.find(user_id) else {
-        let expected = users
-            .iter()
-            .map(|user| encode_hex(user.user_id_bytes.as_ref()))
-            .collect::<Vec<_>>()
-            .join(",");
-        let got = encode_hex(user_id);
-        warn!(
-            inbound_tag = %inbound_tag,
-            expected = %expected,
-            got = %got,
-            "VLESS inbound rejected request with mismatched user id"
-        );
-
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("invalid VLESS user id: {got}"),
-        ));
-    };
-
-    Ok(user)
+    super::find_vless_user(users, user_id, inbound_tag, "vision")
 }
 
 fn find_matching_user_label<'a>(
@@ -534,27 +513,7 @@ fn find_matching_user_label<'a>(
     user_id: &[u8; 16],
     inbound_tag: &str,
 ) -> std::io::Result<&'a ParsedVlessUser> {
-    let Some(user) = users.find(user_id) else {
-        let expected = users
-            .iter()
-            .map(|user| encode_hex(user.user_id_bytes.as_ref()))
-            .collect::<Vec<_>>()
-            .join(",");
-        let got = encode_hex(user_id);
-        warn!(
-            inbound_tag = %inbound_tag,
-            expected = %expected,
-            got = %got,
-            "Vision VLESS inbound rejected request with mismatched user id"
-        );
-
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("invalid VLESS user id: {got}"),
-        ));
-    };
-
-    Ok(user)
+    super::find_vless_user(users, user_id, inbound_tag, "vision")
 }
 
 fn validate_vision_request_flow(
@@ -580,8 +539,34 @@ fn validate_vision_request_flow(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_vision_request_flow;
+    #[cfg(any(feature = "tls", feature = "reality"))]
+    use super::find_matching_vless_user;
+    use super::{find_matching_user_label, validate_vision_request_flow};
+    use crate::handler::vless_handler::CompiledVlessUsers;
     use crate::handler::vless_handler::protocol::XTLS_VISION_FLOW;
+
+    #[test]
+    fn unmatched_vision_user_errors_do_not_echo_the_user_id() {
+        let users = CompiledVlessUsers::default();
+        let user_id = [0x42; 16];
+        let user_id_hex: String =
+            user_id.iter().map(|byte| format!("{byte:02x}")).collect();
+
+        let error = find_matching_user_label(&users, &user_id, "vision-test")
+            .expect_err("unknown user must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "invalid VLESS user id");
+        assert!(!error.to_string().contains(&user_id_hex));
+
+        #[cfg(any(feature = "tls", feature = "reality"))]
+        {
+            let error = find_matching_vless_user(&users, &user_id, "vision-test")
+                .expect_err("unknown Vision user must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "invalid VLESS user id");
+            assert!(!error.to_string().contains(&user_id_hex));
+        }
+    }
 
     #[cfg(feature = "vless-reverse")]
     use tokio::io::{AsyncWriteExt, duplex};

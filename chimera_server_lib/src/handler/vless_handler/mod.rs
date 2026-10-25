@@ -84,6 +84,7 @@ impl CompiledVlessUsers {
             .and_then(|index| self.users.get(*index))
     }
 
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &ParsedVlessUser> {
         self.users.iter()
     }
@@ -211,25 +212,12 @@ impl VlessTcpHandler {
             command,
             remote_location,
         } = header;
-        let Some(user) = users.find(user_id.as_slice()) else {
-            let expected = users
-                .iter()
-                .map(|user| encode_hex(user.user_id_bytes.as_ref()))
-                .collect::<Vec<_>>()
-                .join(",");
-            let got = encode_hex(&user_id);
-            warn!(
-                inbound_tag = %self.inbound_tag,
-                expected = %expected,
-                got = %got,
-                "VLESS inbound rejected request with mismatched user id"
-            );
-
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("invalid VLESS user id: {got}"),
-            ));
-        };
+        let user = find_vless_user(
+            users,
+            user_id.as_slice(),
+            &self.inbound_tag,
+            "standard",
+        )?;
 
         authorize_reverse_command(user.reverse_tag.is_some(), command)?;
 
@@ -428,13 +416,34 @@ fn parse_hex(hex_asm: &str) -> Box<[u8]> {
     bytes.into_boxed_slice()
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+fn warn_unconfigured_vless_user(
+    inbound_tag: &str,
+    mode: &'static str,
+    users: &CompiledVlessUsers,
+) {
+    warn!(
+        inbound_tag,
+        protocol = "vless",
+        mode,
+        rejection_reason = "unknown_user_id",
+        configured_users = users.users.len(),
+        "VLESS authentication rejected request"
+    );
+}
+
+fn find_vless_user<'a>(
+    users: &'a CompiledVlessUsers,
+    user_id: &[u8],
+    inbound_tag: &str,
+    mode: &'static str,
+) -> std::io::Result<&'a ParsedVlessUser> {
+    users.find(user_id).ok_or_else(|| {
+        warn_unconfigured_vless_user(inbound_tag, mode, users);
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "invalid VLESS user id",
+        )
+    })
 }
 
 pub(crate) fn looks_like_tls_record(data: &[u8]) -> bool {
@@ -1257,6 +1266,84 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("invalid VLESS user id"));
+        assert!(!error.to_string().contains(configured_user));
+        assert!(!error.to_string().contains(request_user));
+    }
+
+    #[derive(Clone)]
+    struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut output = self.0.lock().map_err(|_| {
+                std::io::Error::other("captured log buffer was poisoned")
+            })?;
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn unknown_user_log_keeps_safe_diagnostic_context() {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CapturedLogWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(writer)
+            .finish();
+        let configured_user = VlessUser {
+            user_id: "3ac9b383-75a1-431c-8184-106c80eb2273".into(),
+            user_label: "configured-user".into(),
+            user_level: 0,
+            flow: String::new(),
+            reverse: None,
+        };
+        let users = parse_vless_users(&[configured_user]);
+
+        let request_user = "e041e73e-a0a0-49f5-9754-6401aa621fb7";
+        let error = tracing::subscriber::with_default(subscriber, || {
+            find_vless_user(
+                &users,
+                &parse_hex(request_user),
+                "vless-test",
+                "standard",
+            )
+        });
+        let error = error.expect_err("unknown user must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!error.to_string().contains(request_user));
+        assert!(
+            !error
+                .to_string()
+                .contains("3ac9b383-75a1-431c-8184-106c80eb2273")
+        );
+
+        let log =
+            String::from_utf8(buffer.lock().expect("capture log output").clone())
+                .expect("log output is UTF-8");
+        assert!(log.contains("inbound_tag=\"vless-test\""), "{log}");
+        assert!(log.contains("protocol=\"vless\""), "{log}");
+        assert!(log.contains("mode=\"standard\""), "{log}");
+        assert!(
+            log.contains("rejection_reason=\"unknown_user_id\""),
+            "{log}"
+        );
+        assert!(log.contains("configured_users=1"), "{log}");
+        assert!(!log.contains("3ac9b383-75a1-431c-8184-106c80eb2273"));
+        assert!(!log.contains("e041e73e-a0a0-49f5-9754-6401aa621fb7"));
     }
 
     #[tokio::test]

@@ -6,6 +6,8 @@ pub mod internal;
 
 pub mod def;
 
+pub(crate) mod parse_error;
+
 pub mod server_config;
 
 pub mod rule;

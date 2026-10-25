@@ -2887,6 +2887,12 @@ fn vmess_builder_rejects_invalid_uuid_shape() {
             error.to_string().contains("invalid VMess UUID"),
             "unexpected error for {invalid_id:?}: {error}"
         );
+        if !invalid_id.is_empty() {
+            assert!(
+                !error.to_string().contains(invalid_id),
+                "VMess UUID must not be included in config errors: {error}"
+            );
+        }
     }
 }
 

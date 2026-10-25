@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Error, config::def::LiteralConfig};
+use crate::{
+    Error,
+    config::{def::LiteralConfig, parse_error},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -142,15 +145,23 @@ pub(crate) fn parse_config_content(
 ) -> Result<LiteralConfig, Error> {
     match format {
         Some(ConfigFormat::Json) => serde_json::from_str(content).map_err(|err| {
-            Error::InvalidConfig(format!("could not parse JSON: {err}"))
+            Error::InvalidConfig(format!(
+                "could not parse JSON: {}",
+                parse_error::json(&err)
+            ))
         }),
         Some(ConfigFormat::Json5) => json5::from_str(content).map_err(|err| {
-            Error::InvalidConfig(format!("could not parse JSON5: {err}"))
+            Error::InvalidConfig(format!(
+                "could not parse JSON5: {}",
+                parse_error::json5(&err)
+            ))
         }),
         None => serde_json::from_str(content).or_else(|json_err| {
             json5::from_str(content).map_err(|json5_err| {
                 Error::InvalidConfig(format!(
-                    "could not parse config as JSON ({json_err}) or JSON5 ({json5_err})"
+                    "could not parse config as JSON ({}) or JSON5 ({})",
+                    parse_error::json(&json_err),
+                    parse_error::json5(&json5_err)
                 ))
             })
         }),
@@ -341,9 +352,30 @@ fn expand_env_placeholders(input: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_chunked_body, expand_env_placeholders, is_external_config_source,
-        parse_unix_socket_target, safe_config_source_label,
+        ConfigFormat, decode_chunked_body, expand_env_placeholders,
+        is_external_config_source, parse_config_content, parse_unix_socket_target,
+        safe_config_source_label,
     };
+
+    #[test]
+    fn config_parse_errors_redact_input_and_keep_format_location() {
+        let secret = "config-password-sentinel";
+        let content = format!("\"{secret}\"");
+
+        for (format, expected_format) in [
+            (Some(ConfigFormat::Json), "JSON"),
+            (Some(ConfigFormat::Json5), "JSON5"),
+            (None, "JSON"),
+        ] {
+            let error = parse_config_content(&content, format)
+                .expect_err("a scalar cannot be used as the full server config")
+                .to_string();
+
+            assert!(error.contains(expected_format), "{error}");
+            assert!(error.contains("line 1"), "{error}");
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
 
     #[test]
     fn expands_env_placeholders() {

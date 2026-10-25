@@ -1486,7 +1486,7 @@ pub(crate) fn parse_xray_uuid(value: &str) -> Result<[u8; 16], String> {
     let text = value.as_bytes();
     if text.len() < 32 || text.len() > 36 {
         if text.is_empty() || text.len() > 30 {
-            return Err(format!("invalid VLESS UUID: {value}"));
+            return Err("invalid VLESS UUID".to_string());
         }
         let mut input = [0u8; 16].to_vec();
         input.extend_from_slice(text);
@@ -1509,13 +1509,13 @@ pub(crate) fn parse_xray_uuid(value: &str) -> Result<[u8; 16], String> {
             source = &source[1..];
         }
         if source.len() < group_len {
-            return Err(format!("invalid VLESS UUID: {value}"));
+            return Err("invalid VLESS UUID".to_string());
         }
         for pair in source[..group_len].as_chunks::<2>().0 {
             let encoded = std::str::from_utf8(pair)
-                .map_err(|_| format!("invalid VLESS UUID: {value}"))?;
+                .map_err(|_| "invalid VLESS UUID".to_string())?;
             uuid[offset] = u8::from_str_radix(encoded, 16)
-                .map_err(|_| format!("invalid VLESS UUID: {value}"))?;
+                .map_err(|_| "invalid VLESS UUID".to_string())?;
             offset += 1;
         }
         source = &source[group_len..];

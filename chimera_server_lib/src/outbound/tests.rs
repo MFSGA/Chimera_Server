@@ -1134,6 +1134,20 @@ fn static_vless_outbound_compiles_xray_short_form_and_rejects_unsupported_transp
     );
 }
 
+#[cfg(feature = "vless")]
+#[test]
+fn invalid_vless_uuid_error_does_not_echo_credential() {
+    for invalid_id in [
+        "outbound-vless-secret-sentinel-that-is-too-long",
+        "zzzzzzzz-0000-0000-0000-000000000000",
+    ] {
+        let error =
+            parse_xray_uuid(invalid_id).expect_err("invalid VLESS UUID must fail");
+        assert_eq!(error, "invalid VLESS UUID");
+        assert!(!error.contains(invalid_id));
+    }
+}
+
 #[cfg(all(feature = "vless", feature = "tls"))]
 #[test]
 fn static_vless_tcp_tls_outbound_compiles_verified_sender_settings() {
