@@ -22,7 +22,7 @@ use crate::runtime::DataPlaneRuntime;
 use crate::runtime::OutboundSummary;
 use crate::{
     address::NetLocation,
-    traffic::{TrafficContext, record_transfer},
+    traffic::{TrafficContext, record_transfer_ref},
     xudp_registry::{XUDP_GLOBAL_REATTACH_TTL, XudpGlobalRegistry},
 };
 
@@ -575,8 +575,8 @@ pub(crate) async fn start_global_session_udp_worker(
                         .await
                     {
                         Ok(written) if written == request.payload.len() => {
-                            record_transfer(
-                                current.traffic_context.clone(),
+                            record_transfer_ref(
+                                current.traffic_context.as_ref(),
                                 written as u64,
                                 0,
                             );
@@ -768,8 +768,8 @@ async fn start_global_reverse_udp_worker(
                     ).await {
                         Ok(()) => {
                             last_target = request.target_addr;
-                            record_transfer(
-                                current.traffic_context.clone(),
+                            record_transfer_ref(
+                                current.traffic_context.as_ref(),
                                 payload_length as u64,
                                 0,
                             );

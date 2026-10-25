@@ -27,7 +27,9 @@ use crate::{
     },
     resolver::Resolver,
     runtime::DataPlaneRuntime,
-    traffic::{TrafficContext, record_transfer, register_connection},
+    traffic::{
+        TrafficContext, record_transfer, record_transfer_ref, register_connection,
+    },
 };
 
 const UDP_BUFFER_SIZE: usize = 64 * 1024;

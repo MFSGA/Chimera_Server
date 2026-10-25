@@ -23,7 +23,9 @@ use crate::{
     },
     resolver::Resolver,
     runtime::DataPlaneRuntime,
-    traffic::{TrafficContext, record_transfer, register_connection},
+    traffic::{
+        TrafficContext, record_transfer, record_transfer_ref, register_connection,
+    },
 };
 
 #[cfg(feature = "trojan")]
@@ -339,8 +341,8 @@ async fn start_trojan_targeted_udp_session(
                         );
                         break;
                     }
-                    record_transfer(
-                        traffic_context.clone(),
+                    record_transfer_ref(
+                        traffic_context.as_ref(),
                         payload.len() as u64,
                         0,
                     );
@@ -419,8 +421,8 @@ async fn start_targeted_udp_session(
                     };
                     match socket.send_to(&payload, key.target_addr).await {
                         Ok(written) if written == payload.len() => {
-                            record_transfer(
-                                traffic_context.clone(),
+                            record_transfer_ref(
+                                traffic_context.as_ref(),
                                 written as u64,
                                 0,
                             );
