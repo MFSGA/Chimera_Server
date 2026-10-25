@@ -10,7 +10,7 @@ use crate::{
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::atomic::{AtomicU64, Ordering},
 };
 use tonic::{Code, Request};
@@ -487,6 +487,114 @@ async fn stats_online_ip_list_contains_ips() {
     assert!(response.ips.contains_key(&ip1_key));
     assert!(response.ips.contains_key(&ip2_key));
     assert!(response.ips[&ip1_key] > 0);
+}
+
+#[test]
+#[ignore = "manual release-mode probe; run alone by its exact test name"]
+fn online_stats_query_scaling_probe() {
+    use std::{hint::black_box, time::Instant};
+
+    const INITIAL_CONNECTIONS: usize = 1_000;
+    const ADDITIONAL_CONNECTIONS: usize = 19_000;
+    const ITERATIONS: usize = 100;
+    const WARMUP_ITERATIONS: usize = 10;
+    const SAMPLE_RUNS: usize = 5;
+    const IPV6_PREFIX: u128 = 0x2001_0db8_0000_0000_0000_0000_0000_0000;
+
+    fn measure_samples(
+        warmup_iterations: usize,
+        sample_runs: usize,
+        iterations: usize,
+        mut operation: impl FnMut(),
+    ) -> Vec<std::time::Duration> {
+        for _ in 0..warmup_iterations {
+            operation();
+        }
+
+        (0..sample_runs)
+            .map(|_| {
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    operation();
+                }
+                started.elapsed()
+            })
+            .collect()
+    }
+
+    fn register_probe_connections(
+        guards: &mut Vec<traffic::ConnectionGuard>,
+        start: usize,
+        end: usize,
+        target_identity: &str,
+        other_identity: &str,
+    ) {
+        for index in start..end {
+            let identity = if index % 10 == 0 {
+                target_identity
+            } else {
+                other_identity
+            };
+            let context = TrafficContext::new("probe")
+                .with_inbound_tag("online-query-probe-inbound")
+                .with_identity(identity)
+                .with_client_ip(IpAddr::V6(Ipv6Addr::from(
+                    IPV6_PREFIX + index as u128,
+                )));
+            guards.push(traffic::register_connection(Some(&context)));
+        }
+    }
+
+    let mut guards =
+        Vec::with_capacity(INITIAL_CONNECTIONS + ADDITIONAL_CONNECTIONS);
+    let target_identity = unique_tag("online-query-probe-target");
+    let other_identity = unique_tag("online-query-probe-other");
+    register_probe_connections(
+        &mut guards,
+        0,
+        INITIAL_CONNECTIONS,
+        &target_identity,
+        &other_identity,
+    );
+
+    let service = StatsServiceImpl::new();
+    let online_name = format!("user>>>{target_identity}>>>online");
+    assert_eq!(
+        service.online_stats(&online_name),
+        Some((INITIAL_CONNECTIONS / 10) as i64)
+    );
+
+    let initial_query_samples =
+        measure_samples(WARMUP_ITERATIONS, SAMPLE_RUNS, ITERATIONS, || {
+            black_box(service.online_stats(&online_name));
+        });
+
+    register_probe_connections(
+        &mut guards,
+        INITIAL_CONNECTIONS,
+        INITIAL_CONNECTIONS + ADDITIONAL_CONNECTIONS,
+        &target_identity,
+        &other_identity,
+    );
+    assert_eq!(
+        service.online_stats(&online_name),
+        Some(((INITIAL_CONNECTIONS + ADDITIONAL_CONNECTIONS) / 10) as i64)
+    );
+
+    let large_query_samples =
+        measure_samples(WARMUP_ITERATIONS, SAMPLE_RUNS, ITERATIONS, || {
+            black_box(service.online_stats(&online_name));
+        });
+
+    let snapshot_samples =
+        measure_samples(WARMUP_ITERATIONS, SAMPLE_RUNS, ITERATIONS, || {
+            black_box(traffic::active_connections());
+        });
+
+    eprintln!(
+        "initial_connections={INITIAL_CONNECTIONS} total_connections={} selected_users=10% iterations={ITERATIONS} warmup_iterations={WARMUP_ITERATIONS} sample_runs={SAMPLE_RUNS} online_query_initial={initial_query_samples:?} online_query_large={large_query_samples:?} full_snapshot_large={snapshot_samples:?}",
+        INITIAL_CONNECTIONS + ADDITIONAL_CONNECTIONS
+    );
 }
 
 #[tokio::test]
