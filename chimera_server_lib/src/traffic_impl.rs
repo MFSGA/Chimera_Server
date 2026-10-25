@@ -508,15 +508,37 @@ impl TrafficRecorder {
 
         for shard in &self.shards {
             let guard = shard.read().expect("traffic stats shard poisoned");
-            for identity in &guard.known_identities {
-                if let Some(bytes) = totals.get_mut(identity) {
-                    bytes.get_or_insert((0, 0));
+            if totals.len() < guard.known_identities.len() {
+                for (identity, bytes) in &mut totals {
+                    if guard.known_identities.contains(identity) {
+                        bytes.get_or_insert((0, 0));
+                    }
+                }
+            } else {
+                for identity in &guard.known_identities {
+                    if let Some(bytes) = totals.get_mut(identity) {
+                        bytes.get_or_insert((0, 0));
+                    }
                 }
             }
             for inbound in guard.per_inbound.values() {
-                for (identity, user_totals) in &inbound.per_user {
-                    if let Some(bytes) = totals.get_mut(identity) {
-                        add_traffic_bytes(bytes.get_or_insert((0, 0)), user_totals);
+                if totals.len() < inbound.per_user.len() {
+                    for (identity, bytes) in &mut totals {
+                        if let Some(user_totals) = inbound.per_user.get(identity) {
+                            add_traffic_bytes(
+                                bytes.get_or_insert((0, 0)),
+                                user_totals,
+                            );
+                        }
+                    }
+                } else {
+                    for (identity, user_totals) in &inbound.per_user {
+                        if let Some(bytes) = totals.get_mut(identity) {
+                            add_traffic_bytes(
+                                bytes.get_or_insert((0, 0)),
+                                user_totals,
+                            );
+                        }
                     }
                 }
             }
@@ -1000,6 +1022,163 @@ mod tests {
         recorder.record(&user_only, 19, 23);
         assert_eq!(recorder.user_traffic("user-only"), Some((19, 23)));
         assert_eq!(recorder.inbound_traffic("user-only-inbound"), None);
+    }
+
+    #[test]
+    fn batch_user_traffic_matches_for_sparse_and_broad_selections() {
+        let recorder = TrafficRecorder::default();
+        recorder.register_identity("configured-only");
+        for (identity, upload, download) in [
+            ("alice", 3, 5),
+            ("bob", 7, 11),
+            ("carol", 13, 17),
+            ("dave", 19, 23),
+        ] {
+            recorder.record(
+                &TrafficContext::new("vless")
+                    .with_identity(identity)
+                    .with_inbound_tag("edge"),
+                upload,
+                download,
+            );
+        }
+
+        let sparse = HashSet::from([
+            "alice".to_string(),
+            "configured-only".to_string(),
+            "missing".to_string(),
+        ]);
+        assert_eq!(
+            recorder.user_traffic_for(&sparse),
+            HashMap::from([
+                ("alice".to_string(), (3, 5)),
+                ("configured-only".to_string(), (0, 0)),
+            ])
+        );
+
+        let broad = HashSet::from([
+            "alice".to_string(),
+            "bob".to_string(),
+            "carol".to_string(),
+            "dave".to_string(),
+            "configured-only".to_string(),
+            "missing".to_string(),
+        ]);
+        assert_eq!(
+            recorder.user_traffic_for(&broad),
+            HashMap::from([
+                ("alice".to_string(), (3, 5)),
+                ("bob".to_string(), (7, 11)),
+                ("carol".to_string(), (13, 17)),
+                ("dave".to_string(), (19, 23)),
+                ("configured-only".to_string(), (0, 0)),
+            ])
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode batch user query probe"]
+    fn batch_user_traffic_query_probe() {
+        use std::{hint::black_box, sync::Arc, time::Instant};
+
+        const INBOUND_COUNT: usize = 128;
+        const USER_COUNT: usize = 64;
+        const WRITER_COUNT: usize = 4;
+        const ITERATIONS: usize = 500;
+
+        fn legacy_user_traffic_for(
+            recorder: &TrafficRecorder,
+            identities: &HashSet<String>,
+        ) -> HashMap<String, Option<TrafficBytes>> {
+            let mut totals = identities
+                .iter()
+                .cloned()
+                .map(|identity| (identity, None))
+                .collect::<HashMap<String, Option<TrafficBytes>>>();
+
+            for shard in &recorder.shards {
+                let guard = shard.read().expect("traffic stats shard poisoned");
+                for identity in &guard.known_identities {
+                    if let Some(bytes) = totals.get_mut(identity) {
+                        bytes.get_or_insert((0, 0));
+                    }
+                }
+                for inbound in guard.per_inbound.values() {
+                    for (identity, user_totals) in &inbound.per_user {
+                        if let Some(bytes) = totals.get_mut(identity) {
+                            add_traffic_bytes(
+                                bytes.get_or_insert((0, 0)),
+                                user_totals,
+                            );
+                        }
+                    }
+                }
+            }
+
+            totals
+        }
+
+        let recorder = Arc::new(TrafficRecorder::default());
+        let writers = (0..WRITER_COUNT)
+            .map(|writer_index| {
+                let recorder = Arc::clone(&recorder);
+                std::thread::spawn(move || {
+                    let first_inbound = writer_index * INBOUND_COUNT / WRITER_COUNT;
+                    let end_inbound =
+                        (writer_index + 1) * INBOUND_COUNT / WRITER_COUNT;
+                    for inbound_index in first_inbound..end_inbound {
+                        let inbound = format!("probe-inbound-{inbound_index}");
+                        for user_index in 0..USER_COUNT {
+                            let identity = format!("probe-user-{user_index}");
+                            recorder.record(
+                                &TrafficContext::new("probe")
+                                    .with_identity(identity)
+                                    .with_inbound_tag(&inbound),
+                                1,
+                                2,
+                            );
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().expect("traffic probe writer");
+        }
+
+        for selection_size in [4, USER_COUNT] {
+            let identities = (0..selection_size)
+                .map(|index| format!("probe-user-{index}"))
+                .collect::<HashSet<_>>();
+            let expected = recorder.user_traffic_for(&identities);
+            let legacy = legacy_user_traffic_for(&recorder, &identities)
+                .into_iter()
+                .filter_map(|(identity, bytes)| bytes.map(|bytes| (identity, bytes)))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(expected, legacy);
+            assert_eq!(expected.len(), selection_size);
+            assert!(
+                expected.values().all(|bytes| *bytes
+                    == (INBOUND_COUNT as u64, (INBOUND_COUNT * 2) as u64))
+            );
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(legacy_user_traffic_for(&recorder, &identities));
+            }
+            let legacy_elapsed = started.elapsed();
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(recorder.user_traffic_for(&identities));
+            }
+            let optimized_elapsed = started.elapsed();
+            let ratio = legacy_elapsed.as_secs_f64()
+                / optimized_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+            eprintln!(
+                "inbounds={INBOUND_COUNT} users_per_inbound={USER_COUNT} writers={WRITER_COUNT} selected_users={selection_size} iterations={ITERATIONS} legacy={legacy_elapsed:?} optimized={optimized_elapsed:?} ratio={ratio:.2}x"
+            );
+        }
     }
 
     #[test]
