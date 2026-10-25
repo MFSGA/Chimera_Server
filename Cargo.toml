@@ -96,6 +96,7 @@ mime_guess = "2"
 hyper-util = { version = "0.1", features = ["full"] }
 tower = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_path_to_error = "0.1.20"
 uuid = { version = "1.23.2", features = ["v4"] }
 
 thiserror = "2"
