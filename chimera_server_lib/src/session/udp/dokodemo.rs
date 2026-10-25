@@ -18,7 +18,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-#[cfg(all(feature = "xray-tun", target_os = "linux"))]
+#[cfg(any(feature = "tun-gateway", feature = "xray-tun"))]
 use crate::config::server_config::InboundSniffingConfig;
 #[cfg(feature = "vless")]
 use crate::outbound::{VlessUdpSendOutcome, connect_vless_udp_via_outbound};
@@ -457,6 +457,7 @@ impl TunUdpForwarder {
         }
     }
 
+    #[cfg(any(feature = "tun-gateway", feature = "xray-tun"))]
     pub(crate) fn with_route_only_quic_sniffing(
         self,
         sniffing: Option<InboundSniffingConfig>,
