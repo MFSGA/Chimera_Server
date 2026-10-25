@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +21,15 @@ const MAX_UNKNOWN_TARGET_AUDIT_KEYS: usize = 4_096;
 const MAX_UNSUPPORTED_PROTOCOL_AUDIT_KEYS: usize = 128;
 const MAX_AUDIT_EVENTS: usize = 1_024;
 const MAX_AUDIT_FIELD_LENGTH: usize = 256;
+const USER_DOMAIN_STATS_SHARDS: usize = 32;
+
+static NEXT_USER_DOMAIN_STATS_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static USER_DOMAIN_STATS_SHARD: usize =
+        NEXT_USER_DOMAIN_STATS_SHARD.fetch_add(1, Ordering::Relaxed)
+            % USER_DOMAIN_STATS_SHARDS;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UserDomainAccessError {
@@ -200,6 +212,7 @@ enum DecisionReason {
 struct ActiveUserDomainAccessPublication {
     publication: Arc<UserDomainAccessPublication>,
     activation: Arc<()>,
+    stats: Arc<UserDomainAccessShardedStats>,
 }
 
 impl ActiveUserDomainAccessPublication {
@@ -207,11 +220,58 @@ impl ActiveUserDomainAccessPublication {
         Self {
             publication,
             activation: Arc::new(()),
+            stats: Arc::new(UserDomainAccessShardedStats::default()),
         }
     }
 
     fn same_activation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.activation, &other.activation)
+    }
+}
+
+#[derive(Debug)]
+struct UserDomainAccessShardedStats {
+    shards: [Mutex<UserDomainAccessDecisionStats>; USER_DOMAIN_STATS_SHARDS],
+}
+
+impl Default for UserDomainAccessShardedStats {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| {
+                Mutex::new(UserDomainAccessDecisionStats::default())
+            }),
+        }
+    }
+}
+
+impl UserDomainAccessShardedStats {
+    fn record_decision(&self, allowed: bool, reason: DecisionReason) {
+        USER_DOMAIN_STATS_SHARD.with(|shard_index| {
+            let mut shard = self.shards[*shard_index]
+                .lock()
+                .expect("user-domain access stats lock poisoned");
+            record_decision_stats(&mut shard, allowed, reason);
+        });
+    }
+
+    fn record_dns_failure(&self) {
+        USER_DOMAIN_STATS_SHARD.with(|shard_index| {
+            let mut shard = self.shards[*shard_index]
+                .lock()
+                .expect("user-domain access stats lock poisoned");
+            bump(&mut shard.dns_failures);
+        });
+    }
+
+    fn snapshot(&self) -> UserDomainAccessDecisionStats {
+        let mut snapshot = UserDomainAccessDecisionStats::default();
+        for shard in &self.shards {
+            let shard = shard
+                .lock()
+                .expect("user-domain access stats lock poisoned");
+            merge_decision_stats(&mut snapshot, &shard);
+        }
+        snapshot
     }
 }
 
@@ -305,12 +365,13 @@ impl UserDomainAccessStore {
 
     pub(crate) fn status(&self) -> UserDomainAccessStatus {
         let inner = self.inner.read().expect("user-domain access lock poisoned");
+        let active = inner.active.as_ref();
         UserDomainAccessStatus {
-            revision: inner
-                .active
-                .as_ref()
-                .map(|active| revision_of(&active.publication)),
-            stats: inner.stats.clone(),
+            revision: active.map(|active| revision_of(&active.publication)),
+            stats: active.map_or_else(
+                || inner.stats.clone(),
+                |active| active.stats.snapshot(),
+            ),
         }
     }
 
@@ -319,7 +380,11 @@ impl UserDomainAccessStore {
             .inner
             .write()
             .expect("user-domain access lock poisoned");
-        bump(&mut inner.stats.dns_failures);
+        if let Some(active) = inner.active.as_ref() {
+            active.stats.record_dns_failure();
+        } else {
+            bump(&mut inner.stats.dns_failures);
+        }
     }
 
     pub(crate) fn audit_events(
@@ -413,67 +478,75 @@ impl UserDomainAccessStore {
             identities.iter().copied(),
             target_domain,
         );
-
-        let mut inner = self
-            .inner
-            .write()
-            .expect("user-domain access lock poisoned");
-        let active_is_current = inner
-            .active
-            .as_ref()
-            .is_some_and(|current| current.same_activation(&active));
-        let should_log_unknown_target = if active_is_current {
-            record_decision_stats(&mut inner.stats, allowed, reason);
-            matches!(reason, DecisionReason::UnknownTarget)
-                && should_emit_unknown_target_audit(
-                    &mut inner,
-                    target_domain,
-                    audit_context,
-                    Instant::now(),
-                )
-        } else {
-            false
-        };
+        active.stats.record_decision(allowed, reason);
         let unsupported_protocol = audit_context.filter(|context| {
             !context.protocol.trim().is_empty()
                 && !is_user_domain_protocol_supported(context.protocol)
         });
-        let should_warn_unsupported_protocol = active_is_current
-            && unsupported_protocol.is_some_and(|context| {
-                should_emit_unsupported_protocol_audit(&mut inner, context)
-            });
-        let audit_event = should_log_unknown_target.then(|| {
-            let routing_user = audit_context
-                .map(|context| safe_routing_user_summary(context.routing_user))
-                .unwrap_or_else(|| "unavailable".to_string());
-            let event = UserDomainAccessAuditEvent {
-                observed_at_unix_ms: unix_timestamp_ms(),
-                decision: "allow".to_string(),
-                reason: "domain_not_available".to_string(),
-                inbound_tag: audit_context
-                    .map_or("", |context| context.inbound_tag)
-                    .to_string(),
-                protocol: audit_context
-                    .map_or("", |context| context.protocol)
-                    .to_string(),
-                network: audit_context
-                    .map_or("", |context| context.network)
-                    .to_string(),
-                target: audit_context
-                    .map_or(target_domain, |context| context.target)
-                    .to_string(),
-                routing_user,
-                identity_count: identities.len() as u64,
-            };
-            limit_audit_event_fields(event)
-        });
-        if let Some(event) = audit_event.as_ref() {
-            if inner.audit_events.len() >= MAX_AUDIT_EVENTS {
-                inner.audit_events.pop_front();
+        let needs_audit_lock = matches!(reason, DecisionReason::UnknownTarget)
+            || unsupported_protocol.is_some();
+        let (should_warn_unsupported_protocol, audit_event) = if needs_audit_lock {
+            let mut inner = self
+                .inner
+                .write()
+                .expect("user-domain access lock poisoned");
+            let active_is_current = inner
+                .active
+                .as_ref()
+                .is_some_and(|current| current.same_activation(&active));
+            if active_is_current {
+                let should_log_unknown_target =
+                    matches!(reason, DecisionReason::UnknownTarget)
+                        && should_emit_unknown_target_audit(
+                            &mut inner,
+                            target_domain,
+                            audit_context,
+                            Instant::now(),
+                        );
+                let should_warn_unsupported_protocol = unsupported_protocol
+                    .is_some_and(|context| {
+                        should_emit_unsupported_protocol_audit(&mut inner, context)
+                    });
+                let audit_event = should_log_unknown_target.then(|| {
+                    let routing_user = audit_context
+                        .map(|context| {
+                            safe_routing_user_summary(context.routing_user)
+                        })
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    let event = UserDomainAccessAuditEvent {
+                        observed_at_unix_ms: unix_timestamp_ms(),
+                        decision: "allow".to_string(),
+                        reason: "domain_not_available".to_string(),
+                        inbound_tag: audit_context
+                            .map_or("", |context| context.inbound_tag)
+                            .to_string(),
+                        protocol: audit_context
+                            .map_or("", |context| context.protocol)
+                            .to_string(),
+                        network: audit_context
+                            .map_or("", |context| context.network)
+                            .to_string(),
+                        target: audit_context
+                            .map_or(target_domain, |context| context.target)
+                            .to_string(),
+                        routing_user,
+                        identity_count: identities.len() as u64,
+                    };
+                    limit_audit_event_fields(event)
+                });
+                if let Some(event) = audit_event.as_ref() {
+                    if inner.audit_events.len() >= MAX_AUDIT_EVENTS {
+                        inner.audit_events.pop_front();
+                    }
+                    inner.audit_events.push_back(event.clone());
+                }
+                (should_warn_unsupported_protocol, audit_event)
+            } else {
+                (false, None)
             }
-            inner.audit_events.push_back(event.clone());
-        }
-        drop(inner);
+        } else {
+            (false, None)
+        };
 
         if let Some(event) = audit_event {
             tracing::info!(
@@ -984,11 +1057,81 @@ fn record_decision_stats(
     }
 }
 
+fn merge_decision_stats(
+    total: &mut UserDomainAccessDecisionStats,
+    shard: &UserDomainAccessDecisionStats,
+) {
+    total.evaluations = total.evaluations.saturating_add(shard.evaluations);
+    total.allowed = total.allowed.saturating_add(shard.allowed);
+    total.rejected = total.rejected.saturating_add(shard.rejected);
+    total.matched_rule = total.matched_rule.saturating_add(shard.matched_rule);
+    total.no_user_policy = total.no_user_policy.saturating_add(shard.no_user_policy);
+    total.unknown_target = total.unknown_target.saturating_add(shard.unknown_target);
+    total.allow_all_default = total
+        .allow_all_default
+        .saturating_add(shard.allow_all_default);
+    total.allowlist_miss = total.allowlist_miss.saturating_add(shard.allowlist_miss);
+    total.denylist_miss = total.denylist_miss.saturating_add(shard.denylist_miss);
+    total.dns_failures = total.dns_failures.saturating_add(shard.dns_failures);
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Barrier;
 
     use super::*;
+
+    #[test]
+    #[ignore = "manual release-mode benchmark for policy-check contention"]
+    fn policy_check_contention_probe() {
+        const ITERATIONS_PER_WORKER: u64 = 50_000;
+        const SAMPLES: usize = 5;
+        let store = UserDomainAccessStore::default();
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+
+        for workers in [1, 2, 4, 8, 16] {
+            let mut throughput_samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let barrier = Arc::new(Barrier::new(workers + 1));
+                let mut tasks = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let store = store.clone();
+                    let barrier = Arc::clone(&barrier);
+                    tasks.push(std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut allowed = 0_u64;
+                        for _ in 0..ITERATIONS_PER_WORKER {
+                            allowed += u64::from(
+                                store.allows("vless-1", "api.example.com"),
+                            );
+                        }
+                        allowed
+                    }));
+                }
+
+                barrier.wait();
+                let started = Instant::now();
+                let allowed = tasks
+                    .into_iter()
+                    .map(|task| task.join().expect("policy benchmark worker"))
+                    .sum::<u64>();
+                let elapsed = started.elapsed();
+                assert_eq!(allowed, ITERATIONS_PER_WORKER * workers as u64);
+                throughput_samples.push(
+                    ITERATIONS_PER_WORKER as f64 * workers as f64
+                        / elapsed.as_secs_f64(),
+                );
+            }
+
+            throughput_samples.sort_by(f64::total_cmp);
+            println!(
+                "policy_check_probe workers={workers} median_ops_per_second={:.0}",
+                throughput_samples[SAMPLES / 2]
+            );
+        }
+    }
 
     fn publication_json(version: u64, checksum: Option<&str>) -> String {
         let mut value = serde_json::json!({
@@ -1066,6 +1209,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn active_policy_stats_are_sharded_and_exact_under_concurrent_checks() {
+        const WORKERS: usize = 8;
+        const CHECKS_PER_WORKER: usize = 2_000;
+        let store = Arc::new(UserDomainAccessStore::default());
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(WORKERS + 1));
+        let mut tasks = Vec::with_capacity(WORKERS);
+
+        for _ in 0..WORKERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..CHECKS_PER_WORKER {
+                    assert!(store.allows("vless-1", "api.example.com"));
+                }
+            }));
+        }
+
+        barrier.wait();
+        for task in tasks {
+            task.join().expect("policy check worker");
+        }
+
+        let stats = store.status().stats;
+        let expected = (WORKERS * CHECKS_PER_WORKER) as u64;
+        assert_eq!(stats.evaluations, expected);
+        assert_eq!(stats.allowed, expected);
+        assert_eq!(stats.matched_rule, expected);
+    }
+
+    #[test]
+    fn dns_failure_stats_follow_active_policy_activation() {
+        let store = UserDomainAccessStore::default();
+        store.record_dns_failure();
+        assert_eq!(store.status().stats.dns_failures, 1);
+
+        store
+            .apply(parse_publication(&signed_publication(1)).unwrap())
+            .unwrap();
+        assert_eq!(store.status().stats.dns_failures, 0);
+
+        store.record_dns_failure();
+        store.record_dns_failure();
+        assert_eq!(store.status().stats.dns_failures, 2);
+
+        store.rollback(1).unwrap();
+        assert_eq!(store.status().stats.dns_failures, 0);
     }
 
     #[test]
@@ -1302,18 +1498,8 @@ mod tests {
         store
             .apply(parse_publication(&signed_publication(2)).unwrap())
             .unwrap();
-        let mut inner = store
-            .inner
-            .write()
-            .expect("user-domain access lock poisoned");
-        if inner
-            .active
-            .as_ref()
-            .is_some_and(|current| current.same_activation(&stale))
-        {
-            record_decision_stats(&mut inner.stats, allowed, reason);
-        }
-        assert_eq!(inner.stats.evaluations, 0);
+        stale.stats.record_decision(allowed, reason);
+        assert_eq!(store.status().stats.evaluations, 0);
     }
 
     #[test]

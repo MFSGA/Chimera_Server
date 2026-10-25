@@ -21,6 +21,8 @@ cargo test --manifest-path bench/chimera_perf/Cargo.toml
 cargo build --release --manifest-path bench/chimera_perf/Cargo.toml
 ```
 
+The ignored `user_domain::tests::policy_check_contention_probe` unit probe measures policy-decision throughput across thread counts. It is separate from this streaming TCP harness; see [the recorded results and limitations](USER_DOMAIN_POLICY_CONTENTION.md).
+
 ## Raw TCP baseline
 
 Terminal 1:
