@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -41,6 +42,11 @@ PROTECTED_PATH_PREFIXES = (
     "install",
 )
 PROTECTED_PATHS = frozenset({"AGENTS.md", "LESSONS.md"})
+ACTION_REFERENCE_LINE = re.compile(
+    r"^[\t ]*uses:[\t ]+(?P<action>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    r"(?:/[A-Za-z0-9_.-]+)*)@"
+    r"(?P<sha>[0-9a-fA-F]{40})(?:[\t ]+\#[^\r\n]*)?[\t ]*$"
+)
 
 
 class SkipAutomation(Exception):
@@ -220,17 +226,26 @@ def is_dependabot_pull_request(pull_request: dict[str, Any]) -> bool:
     return (pull_request.get("user") or {}).get("login") == "dependabot[bot]"
 
 
-def is_auto_merge_eligible(
+def is_same_repository_dependabot_pull_request(
     pull_request: dict[str, Any],
     repository: str,
 ) -> bool:
     head_repository = pull_request.get("head", {}).get("repo") or {}
     return (
         is_dependabot_pull_request(pull_request)
+        and head_repository.get("full_name") == repository
+    )
+
+
+def is_auto_merge_eligible(
+    pull_request: dict[str, Any],
+    repository: str,
+) -> bool:
+    return (
+        is_same_repository_dependabot_pull_request(pull_request, repository)
         and pull_request.get("state") == "open"
         and pull_request.get("draft") is not True
         and pull_request.get("base", {}).get("ref") == "master"
-        and head_repository.get("full_name") == repository
     )
 
 
@@ -239,24 +254,187 @@ def auto_merge_scope_allowed(
     expected_file_count: Any,
 ) -> bool:
     if (
-        not isinstance(expected_file_count, int)
+        not files
+        or not isinstance(expected_file_count, int)
         or isinstance(expected_file_count, bool)
         or expected_file_count != len(files)
     ):
         return False
 
+    if all(is_cargo_dependency_file(changed_file) for changed_file in files):
+        return True
+
+    return action_dependency_scope_allowed(files)
+
+
+def is_cargo_dependency_file(changed_file: Any) -> bool:
+    path = changed_file.get("filename") if isinstance(changed_file, dict) else None
+    if not isinstance(path, str):
+        return False
+    return (
+        path not in PROTECTED_PATHS
+        and path.rsplit("/", 1)[-1] != "CODEOWNERS"
+        and not path.startswith(PROTECTED_PATH_PREFIXES)
+        and path.rsplit("/", 1)[-1] in {"Cargo.toml", "Cargo.lock"}
+    )
+
+
+def is_action_dependency_file(path: Any) -> bool:
+    if not isinstance(path, str) or any(
+        part in {"", ".", ".."} for part in path.split("/")
+    ):
+        return False
+    parts = path.split("/")
+    if len(parts) == 3 and parts[:2] == [".github", "workflows"]:
+        return parts[-1].endswith((".yml", ".yaml"))
+    return (
+        len(parts) >= 4
+        and parts[:2] == [".github", "actions"]
+        and parts[-1] in {"action.yml", "action.yaml"}
+    )
+
+
+def action_dependency_scope_allowed(files: list[Any]) -> bool:
+    removed_actions: dict[str, dict[str, int]] = {}
+    added_actions: dict[str, dict[str, int]] = {}
+
     for changed_file in files:
         path = changed_file.get("filename") if isinstance(changed_file, dict) else None
-        if not isinstance(path, str):
-            return False
         if (
-            path in PROTECTED_PATHS
-            or path.rsplit("/", 1)[-1] == "CODEOWNERS"
-            or path.startswith(PROTECTED_PATH_PREFIXES)
-            or path.rsplit("/", 1)[-1] not in {"Cargo.toml", "Cargo.lock"}
+            not isinstance(changed_file, dict)
+            or changed_file.get("status", "modified") != "modified"
+            or not is_action_dependency_file(path)
         ):
             return False
-    return True
+        patch = changed_file.get("patch")
+        if not isinstance(patch, str):
+            return False
+
+        file_removed: dict[str, dict[str, int]] = {}
+        file_added: dict[str, dict[str, int]] = {}
+        has_change = False
+        for patch_line in patch.splitlines():
+            if patch_line.startswith(("@@", "\\")):
+                continue
+            if not patch_line or patch_line.startswith(" "):
+                continue
+            if patch_line[0] not in "+-":
+                return False
+            match = ACTION_REFERENCE_LINE.fullmatch(patch_line[1:])
+            if match is None:
+                return False
+            if any(
+                part in {".", ".."} for part in match.group("action").split("/")
+            ):
+                return False
+            target = file_added if patch_line[0] == "+" else file_removed
+            action = match.group("action").lower()
+            sha = match.group("sha").lower()
+            by_sha = target.setdefault(action, {})
+            by_sha[sha] = by_sha.get(sha, 0) + 1
+            has_change = True
+
+        if not has_change or not file_removed or not file_added:
+            return False
+        if {
+            action: sum(shas.values()) for action, shas in file_removed.items()
+        } != {
+            action: sum(shas.values()) for action, shas in file_added.items()
+        }:
+            return False
+        for action in file_removed:
+            if file_removed[action] == file_added[action]:
+                return False
+            for target, source in (
+                (removed_actions, file_removed),
+                (added_actions, file_added),
+            ):
+                destination = target.setdefault(action, {})
+                for sha, count in source[action].items():
+                    destination[sha] = destination.get(sha, 0) + count
+
+    return (
+        bool(removed_actions)
+        and removed_actions.keys() == added_actions.keys()
+        and all(
+            sum(removed_actions[action].values())
+            == sum(added_actions[action].values())
+            and removed_actions[action] != added_actions[action]
+            for action in removed_actions
+        )
+    )
+
+
+def should_update_dependabot_branch(
+    pull_request: dict[str, Any],
+    repository: str,
+) -> bool:
+    return (
+        is_auto_merge_eligible(pull_request, repository)
+        and pull_request.get("mergeable_state") == "behind"
+    )
+
+
+def refresh_open_dependabot_branches(
+    api: GitHubApi,
+    repository: str,
+    event: dict[str, Any],
+) -> None:
+    event_pr = event.get("pull_request") or {}
+    number = event_pr.get("number")
+    if event.get("action") != "closed" or event_pr.get("merged") is not True:
+        raise SkipAutomation("the Dependabot pull request was not merged")
+    if not isinstance(number, int):
+        raise SkipAutomation("the merged pull request has no number")
+
+    merged_pr = api.get(api_path(repository, f"/pulls/{number}"))
+    if (
+        merged_pr.get("state") != "closed"
+        or not merged_pr.get("merged_at")
+        or not is_same_repository_dependabot_pull_request(merged_pr, repository)
+        or merged_pr.get("base", {}).get("ref") != "master"
+    ):
+        raise SkipAutomation("the merged pull request is not an eligible Dependabot update")
+
+    merged_files = api.get_all(
+        api_path(repository, f"/pulls/{number}/files?per_page=100")
+    )
+    if not auto_merge_scope_allowed(merged_files, merged_pr.get("changed_files")):
+        raise SkipAutomation("the merged pull request was outside the dependency auto-merge scope")
+
+    open_prs = api.get_all(
+        api_path(repository, "/pulls?state=open&base=master&per_page=100")
+    )
+    for pull_request in open_prs:
+        if not is_auto_merge_eligible(pull_request, repository):
+            continue
+
+        pull_number = pull_request.get("number")
+        head_sha = pull_request.get("head", {}).get("sha")
+        if not isinstance(pull_number, int) or not isinstance(head_sha, str):
+            continue
+
+        files = api.get_all(
+            api_path(repository, f"/pulls/{pull_number}/files?per_page=100")
+        )
+        if not auto_merge_scope_allowed(files, pull_request.get("changed_files")):
+            continue
+
+        current_pr = api.get(api_path(repository, f"/pulls/{pull_number}"))
+        if (
+            current_pr.get("head", {}).get("sha") != head_sha
+            or not should_update_dependabot_branch(current_pr, repository)
+        ):
+            continue
+
+        api.put(
+            api_path(repository, f"/pulls/{pull_number}/update-branch"),
+            {"expected_head_sha": head_sha},
+        )
+        print(
+            f"Requested update of Dependabot PR #{pull_number} onto the latest master; "
+            "GitHub will run CI on the updated branch."
+        )
 
 
 def event_targets_auto_merge_branch(
@@ -621,6 +799,15 @@ def self_test() -> None:
     ordinary_pr = {**eligible_pr, "user": {"login": "human-maintainer"}}
     assert not is_dependabot_pull_request(ordinary_pr)
     assert not is_auto_merge_eligible(ordinary_pr, "MFSGA/Chimera_Server")
+    assert should_update_dependabot_branch(
+        {**eligible_pr, "mergeable_state": "behind"}, "MFSGA/Chimera_Server"
+    )
+    assert not should_update_dependabot_branch(
+        {**eligible_pr, "mergeable_state": "clean"}, "MFSGA/Chimera_Server"
+    )
+    assert not should_update_dependabot_branch(
+        {**ordinary_pr, "mergeable_state": "behind"}, "MFSGA/Chimera_Server"
+    )
     assert not is_auto_merge_eligible(
         {
             **eligible_pr,
@@ -631,6 +818,46 @@ def self_test() -> None:
     assert auto_merge_scope_allowed([{"filename": "Cargo.lock"}], 1)
     assert auto_merge_scope_allowed([{"filename": "chimera_server_lib/Cargo.toml"}], 1)
     assert not auto_merge_scope_allowed([{"filename": "README.md"}], 1)
+    old_action_sha = "02cb101ec7c40f2c49e1d9714d64511d8e1b74de"
+    new_action_sha = "683b588c487a69d01f6c6ddf40f036ff682cc2c8"
+    action_pin_update = {
+        "filename": ".github/workflows/release.yml",
+        "status": "modified",
+        "patch": (
+            "@@ -45,1 +45,1 @@\n"
+            f"-          uses: dtolnay/rust-toolchain@{old_action_sha} # stable\n"
+            f"+          uses: dtolnay/rust-toolchain@{new_action_sha} # stable"
+        ),
+    }
+    assert auto_merge_scope_allowed([action_pin_update], 1)
+    assert auto_merge_scope_allowed(
+        [
+            {
+                **action_pin_update,
+                "filename": ".github/actions/rust-ci-setup/action.yml",
+            }
+        ],
+        1,
+    )
+    for unsafe_action_update in (
+        {
+            **action_pin_update,
+            "patch": action_pin_update["patch"] + "\n+          run: echo unsafe",
+        },
+        {
+            **action_pin_update,
+            "patch": action_pin_update["patch"].replace(
+                f"{new_action_sha} # stable", "v2 # stable"
+            ),
+        },
+        {**action_pin_update, "filename": ".github/scripts/auto_merge.yml"},
+        {**action_pin_update, "patch": None},
+        {**action_pin_update, "status": "added"},
+    ):
+        assert not auto_merge_scope_allowed([unsafe_action_update], 1)
+    assert not auto_merge_scope_allowed(
+        [action_pin_update, {"filename": "Cargo.lock"}], 2
+    )
     for protected_path in (
         ".github/workflows/ci.yml",
         "docs/ai-development-governance.md",
@@ -770,6 +997,78 @@ def self_test() -> None:
             "changed_files": 1,
         }
     )
+
+    merged_dependabot_pr = {
+        **eligible_pr,
+        "state": "closed",
+        "merged_at": "2026-10-26T12:00:00Z",
+    }
+    behind_dependabot_pr = {
+        **eligible_pr,
+        "number": 43,
+        "mergeable_state": "behind",
+        "head": {
+            "sha": "behind-head-sha",
+            "repo": {"full_name": "MFSGA/Chimera_Server"},
+        },
+    }
+    current_dependabot_pr = {
+        **eligible_pr,
+        "number": 44,
+        "mergeable_state": "clean",
+        "head": {
+            "sha": "current-head-sha",
+            "repo": {"full_name": "MFSGA/Chimera_Server"},
+        },
+    }
+
+    class RefreshDependabotBranchesApiStub:
+        def __init__(self) -> None:
+            self.put_calls: list[tuple[str, dict[str, Any]]] = []
+
+        def get(self, path: str) -> dict[str, Any]:
+            if path == "/repos/MFSGA/Chimera_Server/pulls/42":
+                return merged_dependabot_pr
+            if path == "/repos/MFSGA/Chimera_Server/pulls/43":
+                return behind_dependabot_pr
+            if path == "/repos/MFSGA/Chimera_Server/pulls/44":
+                return current_dependabot_pr
+            raise AssertionError(f"unexpected API read: {path}")
+
+        def get_all(
+            self,
+            path: str,
+            *,
+            collection_key: str | None = None,
+        ) -> list[Any]:
+            assert collection_key is None
+            if path == "/repos/MFSGA/Chimera_Server/pulls?state=open&base=master&per_page=100":
+                return [behind_dependabot_pr, current_dependabot_pr]
+            if path in {
+                "/repos/MFSGA/Chimera_Server/pulls/42/files?per_page=100",
+                "/repos/MFSGA/Chimera_Server/pulls/43/files?per_page=100",
+                "/repos/MFSGA/Chimera_Server/pulls/44/files?per_page=100",
+            }:
+                return [{"filename": "Cargo.lock"}]
+            raise AssertionError(f"unexpected API list: {path}")
+
+        def put(self, path: str, payload: dict[str, Any]) -> dict[str, str]:
+            self.put_calls.append((path, payload))
+            return {"message": "Updating pull request branch."}
+
+    refresh_api = RefreshDependabotBranchesApiStub()
+    refresh_open_dependabot_branches(
+        refresh_api,
+        "MFSGA/Chimera_Server",
+        {"action": "closed", "pull_request": {"number": 42, "merged": True}},
+    )
+    assert refresh_api.put_calls == [
+        (
+            "/repos/MFSGA/Chimera_Server/pulls/43/update-branch",
+            {"expected_head_sha": "behind-head-sha"},
+        )
+    ]
+
     eligible_api = EligiblePullRequestApiStub()
     process_pull_request(
         eligible_api,
@@ -784,6 +1083,28 @@ def self_test() -> None:
             {"sha": "head-sha", "merge_method": "squash"},
         )
     ]
+
+    class EligibleActionPullRequestApiStub(EligiblePullRequestApiStub):
+        def get_all(
+            self,
+            path: str,
+            *,
+            collection_key: str | None = None,
+        ) -> list[Any]:
+            if path == "/repos/MFSGA/Chimera_Server/pulls/42/files?per_page=100":
+                assert collection_key is None
+                return [action_pin_update]
+            return super().get_all(path, collection_key=collection_key)
+
+    eligible_action_api = EligibleActionPullRequestApiStub()
+    process_pull_request(
+        eligible_action_api,
+        "MFSGA/Chimera_Server",
+        {"id": 123, "head_sha": "head-sha", "run_attempt": 1},
+        {"number": 42, "head": {"sha": "head-sha"}},
+        protection_confirmed=True,
+    )
+    assert eligible_action_api.put_calls == eligible_api.put_calls
 
     class RetargetedPullRequestApiStub(EligiblePullRequestApiStub):
         def __init__(self) -> None:
@@ -888,6 +1209,9 @@ def main() -> int:
         )
         api = GitHubApi(token)
         event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        if event_name == "pull_request_target" and event.get("action") == "closed":
+            refresh_open_dependabot_branches(api, repository, event)
+            return 0
         if event_name == "workflow_run":
             workflow_run = event.get("workflow_run", {})
             if (
