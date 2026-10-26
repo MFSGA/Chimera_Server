@@ -8,7 +8,7 @@ use crate::{Error, log::LogConfig};
 
 use super::{
     MkcpTransportConfig, Protocol, SettingObject, StreamSettings, Transport,
-    rule::RoutingConfig,
+    parse_error, rule::RoutingConfig,
 };
 
 #[derive(Deserialize, Debug)]
@@ -789,35 +789,41 @@ impl TryFrom<PathBuf> for LiteralConfig {
     fn try_from(value: PathBuf) -> Result<Self, Self::Error> {
         let content = std::fs::read_to_string(&value)?;
 
-        let config = match value.extension() {
-            Some(ext) => match ext.to_str() {
-                Some("json") => LiteralConfig::from_str(&content)?,
-                Some("json5") => json5::from_str(&content).map_err(|e| {
-                    Error::InvalidConfig(format!("Could not parse JSON5: {}", e))
-                })?,
-                Some("yaml") | Some("yml") => serde_yaml::from_str(&content)
-                    .map_err(|e| {
-                        Error::InvalidConfig(format!("Could not parse YAML: {e}"))
+        let config =
+            match value.extension() {
+                Some(ext) => match ext.to_str() {
+                    Some("json") => LiteralConfig::from_str(&content)?,
+                    Some("json5") => json5::from_str(&content).map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "Could not parse JSON5: {}",
+                            parse_error::json5(
+                                &e,
+                                parse_error::json5_field_path::<LiteralConfig>(
+                                    &content,
+                                ),
+                            )
+                        ))
                     })?,
-                Some("toml") => {
-                    return Err(Error::InvalidConfig(
-                        "TOML config format is not yet supported".into(),
-                    ));
-                }
-                _ => {
+                    Some("yaml") | Some("yml") => parse_yaml_config(&content)?,
+                    Some("toml") => {
+                        return Err(Error::InvalidConfig(
+                            "TOML config format is not yet supported".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(Error::InvalidConfig(format!(
+                            "unsupported file type: {:?}",
+                            value.extension()
+                        )));
+                    }
+                },
+                None => {
                     return Err(Error::InvalidConfig(format!(
-                        "unsupported file type: {:?}",
+                        "unknown file type {:?}",
                         value.extension()
                     )));
                 }
-            },
-            None => {
-                return Err(Error::InvalidConfig(format!(
-                    "unknown file type {:?}",
-                    value.extension()
-                )));
-            }
-        };
+            };
 
         Ok(config)
     }
@@ -829,11 +835,26 @@ impl FromStr for LiteralConfig {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_json::from_str(s).map_err(|x| {
             Error::InvalidConfig(format!(
-                "cound not parse config content {}: {}",
-                s, x
+                "Could not parse JSON: {}",
+                parse_error::json(
+                    &x,
+                    parse_error::json_field_path::<LiteralConfig>(s),
+                )
             ))
         })
     }
+}
+
+fn parse_yaml_config(content: &str) -> Result<LiteralConfig, Error> {
+    serde_yaml::from_str(content).map_err(|error| {
+        Error::InvalidConfig(format!(
+            "Could not parse YAML: {}",
+            parse_error::yaml(
+                &error,
+                parse_error::yaml_field_path::<LiteralConfig>(content),
+            )
+        ))
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1105,7 +1126,37 @@ mod tests {
     use super::{
         CompiledDnsServer, DEFAULT_SHUTDOWN_GRACE_PERIOD_SECONDS, DnsConfig,
         DnsQueryStrategy, DnsServerTransport, LiteralConfig, PolicyConfig, Protocol,
+        parse_yaml_config,
     };
+
+    #[test]
+    fn yaml_parse_error_keeps_location_without_echoing_input() {
+        let secret = "yaml-password-sentinel";
+        let error = parse_yaml_config(secret)
+            .expect_err("a scalar cannot be used as the full server config")
+            .to_string();
+
+        assert!(error.contains("YAML"));
+        assert!(error.contains("line 1"));
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn yaml_parse_error_reports_safe_field_path_without_values() {
+        let secret = "yaml-field-secret-sentinel";
+        let content = format!(
+            "inbounds:\n  - tag: {secret}\n    protocol: 7\noutbounds: []\n"
+        );
+        let error = parse_yaml_config(&content)
+            .expect_err("invalid protocol type should fail")
+            .to_string();
+
+        assert!(
+            error.contains("field path `inbounds[0].protocol`"),
+            "{error}"
+        );
+        assert!(!error.contains(secret), "{error}");
+    }
 
     #[test]
     fn policy_levels_match_xray_uint32_json_semantics() {

@@ -62,7 +62,7 @@ pub(crate) fn parse_vmess_user_id(value: &str) -> Result<[u8; 16], String> {
     let text = value.as_bytes();
     if text.len() < 32 || text.len() > 36 {
         if text.is_empty() || text.len() > 30 {
-            return Err(format!("invalid VMess UUID: {value}"));
+            return Err("invalid VMess UUID".to_string());
         }
 
         let mut hasher = Sha1::new();
@@ -87,12 +87,12 @@ pub(crate) fn parse_vmess_user_id(value: &str) -> Result<[u8; 16], String> {
         }
         let group = text
             .get(text_offset..text_offset + group_len)
-            .ok_or_else(|| format!("invalid VMess UUID: {value}"))?;
+            .ok_or_else(|| "invalid VMess UUID".to_string())?;
         for pair in group.as_chunks::<2>().0 {
             let high = vmess_hex_nibble(pair[0])
-                .ok_or_else(|| format!("invalid VMess UUID: {value}"))?;
+                .ok_or_else(|| "invalid VMess UUID".to_string())?;
             let low = vmess_hex_nibble(pair[1])
-                .ok_or_else(|| format!("invalid VMess UUID: {value}"))?;
+                .ok_or_else(|| "invalid VMess UUID".to_string())?;
             uuid[uuid_offset] = (high << 4) | low;
             uuid_offset += 1;
         }

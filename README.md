@@ -103,7 +103,7 @@ GitHub Actions 还会在 Windows 上运行测试，并检查 feature 组合及 L
 git config core.hooksPath .githooks
 ```
 
-配置格式与字段说明见 [`chimera_server_lib/src/config/README.md`](chimera_server_lib/src/config/README.md)。架构目标和实际迁移记录见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`ITERATION_GUIDE.md`](ITERATION_GUIDE.md)。
+配置格式与字段说明见 [`chimera_server_lib/src/config/README.md`](chimera_server_lib/src/config/README.md)。迭代优先级与维护流程见 [`ITERATION_GUIDE.md`](ITERATION_GUIDE.md)，架构目标和迁移状态见 [`ARCHITECTURE.md`](ARCHITECTURE.md)；VLESS Reverse 与站点到站点网关专项设计分别见 [`VLESS_REVERSE_DESIGN.md`](VLESS_REVERSE_DESIGN.md)、[`SITE_TO_SITE_DESIGN.md`](SITE_TO_SITE_DESIGN.md)。
 
 ## 参与贡献
 

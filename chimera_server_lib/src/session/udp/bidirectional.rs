@@ -195,14 +195,14 @@ async fn copy_bidirectional_vless_udp_messages(
                 if proxy.send_to(target, &client_buffer[..len]).await?
                     == VlessUdpSendOutcome::Written
                 {
-                    record_transfer(traffic_context.clone(), len as u64, 0);
+                    record_transfer_ref(traffic_context.as_ref(), len as u64, 0);
                 }
             }
             result = proxy.recv_from(&mut target_buffer) => {
                 let (_source, len) = result?;
                 write_message(stream, &target_buffer[..len]).await?;
                 flush_message(stream).await?;
-                record_transfer(traffic_context.clone(), 0, len as u64);
+                record_transfer_ref(traffic_context.as_ref(), 0, len as u64);
             }
         }
     }
@@ -224,7 +224,7 @@ async fn copy_bidirectional_reverse_udp_messages(
                         break Ok(());
                     }
                     session.send(Bytes::copy_from_slice(&client_buffer[..len]), None).await?;
-                    record_transfer(traffic_context.clone(), len as u64, 0);
+                    record_transfer_ref(traffic_context.as_ref(), len as u64, 0);
                 }
                 result = session.recv() => {
                     let (payload, _target_override) = match result? {
@@ -233,7 +233,7 @@ async fn copy_bidirectional_reverse_udp_messages(
                     };
                     write_message(stream, &payload).await?;
                     flush_message(stream).await?;
-                    record_transfer(traffic_context.clone(), 0, payload.len() as u64);
+                    record_transfer_ref(traffic_context.as_ref(), 0, payload.len() as u64);
                 }
             }
         }
@@ -256,7 +256,7 @@ async fn consume_blackholed_udp_messages(
         if len == 0 {
             return Ok(());
         }
-        record_transfer(traffic_context.clone(), len as u64, 0);
+        record_transfer_ref(traffic_context.as_ref(), len as u64, 0);
         debug!(
             "udp message to {} dropped by blackhole outbound {}",
             remote_location, outbound_tag
@@ -282,13 +282,13 @@ async fn copy_bidirectional_trojan_udp_messages(
                     return Ok(());
                 }
                 proxy.send_to(target, &client_buffer[..len]).await?;
-                record_transfer(traffic_context.clone(), len as u64, 0);
+                record_transfer_ref(traffic_context.as_ref(), len as u64, 0);
             }
             result = proxy.recv_from(&mut target_buffer) => {
                 let (_source, len) = result?;
                 write_message(stream, &target_buffer[..len]).await?;
                 flush_message(stream).await?;
-                record_transfer(traffic_context.clone(), 0, len as u64);
+                record_transfer_ref(traffic_context.as_ref(), 0, len as u64);
             }
         }
     }
@@ -316,13 +316,13 @@ async fn copy_bidirectional_udp_messages(
                         format!("udp message was truncated: wrote {written} of {len} bytes"),
                     ));
                 }
-                record_transfer(traffic_context.clone(), len as u64, 0);
+                record_transfer_ref(traffic_context.as_ref(), len as u64, 0);
             }
             result = socket.recv(&mut target_buffer) => {
                 let len = result?;
                 write_message(stream, &target_buffer[..len]).await?;
                 flush_message(stream).await?;
-                record_transfer(traffic_context.clone(), 0, len as u64);
+                record_transfer_ref(traffic_context.as_ref(), 0, len as u64);
             }
         }
     }

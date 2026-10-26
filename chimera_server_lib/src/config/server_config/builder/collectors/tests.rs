@@ -35,6 +35,10 @@ fn collect_tuic_settings_rejects_invalid_uuid() {
         matches!(err, Error::InvalidConfig(_)),
         "expected InvalidConfig"
     );
+    assert!(
+        !err.to_string().contains("not-a-uuid"),
+        "TUIC UUID must not be included in config errors: {err}"
+    );
 }
 
 #[test]

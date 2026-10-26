@@ -1,6 +1,6 @@
 use std::sync::Arc;
 #[cfg(feature = "vless")]
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use tokio::task::JoinHandle;
 
@@ -12,6 +12,8 @@ use crate::config::server_config::{ServerConfig, ServerProxyConfig};
 use crate::handler::hysteria2::connection::HysteriaUserStore;
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksUserStore;
+#[cfg(feature = "vless")]
+use crate::handler::vless_handler::{CompiledVlessUsers, parse_vless_users};
 #[cfg(feature = "wireguard")]
 use crate::wireguard::WireGuardPeerStore;
 #[cfg(feature = "trojan")]
@@ -23,27 +25,75 @@ use crate::{
 
 #[cfg(feature = "vless")]
 #[derive(Debug, Clone)]
-pub(super) struct VlessUserStore(Arc<RwLock<Vec<VlessUser>>>);
+pub(super) struct VlessUserStore {
+    state: Arc<RwLock<VlessUserState>>,
+    updates: Arc<Mutex<()>>,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Debug)]
+struct VlessUserState {
+    users: Vec<VlessUser>,
+    compiled: Arc<CompiledVlessUsers>,
+}
 
 #[cfg(feature = "vless")]
 impl VlessUserStore {
     pub(super) fn new(users: Vec<VlessUser>) -> Self {
-        Self(Arc::new(RwLock::new(users)))
+        let compiled = Arc::new(parse_vless_users(&users));
+        Self {
+            state: Arc::new(RwLock::new(VlessUserState { users, compiled })),
+            updates: Arc::new(Mutex::new(())),
+        }
     }
 
     pub(super) fn snapshot(&self) -> Vec<VlessUser> {
-        self.0
+        self.state
             .read()
             .expect("VLESS user store lock poisoned")
+            .users
             .clone()
     }
 
-    pub(super) fn update<R, E, F>(&self, update: F) -> Result<R, E>
+    pub(super) fn compiled_snapshot(&self) -> Arc<CompiledVlessUsers> {
+        Arc::clone(
+            &self
+                .state
+                .read()
+                .expect("VLESS user store lock poisoned")
+                .compiled,
+        )
+    }
+
+    pub(super) fn update<E, F>(&self, update: F) -> Result<bool, E>
     where
-        F: FnOnce(&mut Vec<VlessUser>) -> Result<R, E>,
+        F: FnOnce(&mut Vec<VlessUser>) -> Result<bool, E>,
     {
-        let mut users = self.0.write().expect("VLESS user store lock poisoned");
-        update(&mut users)
+        let _updates = self
+            .updates
+            .lock()
+            .expect("VLESS user update lock poisoned");
+        let mut users = self.snapshot();
+        let update_in_place = update(&mut users)?;
+        if update_in_place {
+            let compiled = Arc::new(parse_vless_users(&users));
+            // Compile outside the state lock so handshakes wait only for the
+            // short publication step. Serialize writers separately so
+            // concurrent updates cannot overwrite one another with snapshots
+            // based on the same old generation.
+            let (old_users, old_compiled) = {
+                let mut state =
+                    self.state.write().expect("VLESS user store lock poisoned");
+                let old_users = std::mem::replace(&mut state.users, users);
+                let old_compiled = std::mem::replace(&mut state.compiled, compiled);
+                (old_users, old_compiled)
+            };
+            // Free potentially large snapshots after releasing the state
+            // lock, keeping data-plane readers independent of drop work.
+            drop(old_users);
+            drop(old_compiled);
+        }
+        Ok(update_in_place)
     }
 }
 
@@ -528,5 +578,117 @@ fn replace_single_shadowsocks_users(
             replace_single_shadowsocks_users(&mut config.inner, users)
         }
         _ => false,
+    }
+}
+
+#[cfg(all(test, feature = "vless"))]
+mod vless_store_tests {
+    use super::*;
+
+    fn user(user_id: &str, user_label: &str) -> VlessUser {
+        VlessUser {
+            user_id: user_id.into(),
+            user_label: user_label.into(),
+            user_level: 0,
+            flow: String::new(),
+            reverse: None,
+        }
+    }
+
+    #[test]
+    fn vless_store_publishes_only_successful_compiled_updates() {
+        let store = VlessUserStore::new(vec![user(
+            "e041e73e-a0a0-49f5-9754-6401aa621fb7",
+            "initial",
+        )]);
+        let initial_snapshot = store.compiled_snapshot();
+
+        let committed = store
+            .update(|users| {
+                users.clear();
+                Ok::<_, ()>(false)
+            })
+            .expect("candidate update should be evaluated");
+        assert!(!committed);
+        assert!(Arc::ptr_eq(&initial_snapshot, &store.compiled_snapshot()));
+        assert_eq!(store.snapshot()[0].user_label, "initial");
+
+        let added_user = user("00000000-0000-4000-8000-000000000001", "added");
+        let added_id = parse_vless_users(std::slice::from_ref(&added_user))
+            .iter()
+            .next()
+            .expect("compiled test user")
+            .user_id_bytes
+            .clone();
+        let committed = store
+            .update(|users| {
+                users.push(added_user);
+                Ok::<_, ()>(true)
+            })
+            .expect("valid update should commit");
+
+        assert!(committed);
+        let updated_snapshot = store.compiled_snapshot();
+        assert!(!Arc::ptr_eq(&initial_snapshot, &updated_snapshot));
+        assert_eq!(
+            updated_snapshot
+                .find(&added_id)
+                .map(|compiled| compiled.user_label.as_str()),
+            Some("added")
+        );
+    }
+
+    #[test]
+    fn vless_store_discards_failed_update_candidates() {
+        let store = VlessUserStore::new(vec![user(
+            "e041e73e-a0a0-49f5-9754-6401aa621fb7",
+            "initial",
+        )]);
+        let initial_snapshot = store.compiled_snapshot();
+
+        let result = store.update(|users| {
+            users.clear();
+            Err::<bool, _>("reject update")
+        });
+
+        assert_eq!(result, Err("reject update"));
+        assert!(Arc::ptr_eq(&initial_snapshot, &store.compiled_snapshot()));
+        assert_eq!(store.snapshot()[0].user_label, "initial");
+    }
+
+    #[test]
+    fn vless_store_serializes_concurrent_compiled_updates() {
+        use std::sync::Barrier;
+
+        let store = VlessUserStore::new(vec![user(
+            "e041e73e-a0a0-49f5-9754-6401aa621fb7",
+            "initial",
+        )]);
+        let barrier = Arc::new(Barrier::new(3));
+
+        std::thread::scope(|scope| {
+            for (id, label) in [
+                ("00000000-0000-4000-8000-000000000001", "first"),
+                ("00000000-0000-4000-8000-000000000002", "second"),
+            ] {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .update(|users| {
+                            users.push(user(id, label));
+                            Ok::<_, ()>(true)
+                        })
+                        .expect("concurrent update should commit");
+                });
+            }
+            barrier.wait();
+        });
+
+        let users = store.snapshot();
+        assert_eq!(users.len(), 3);
+        assert!(users.iter().any(|user| user.user_label == "first"));
+        assert!(users.iter().any(|user| user.user_label == "second"));
     }
 }

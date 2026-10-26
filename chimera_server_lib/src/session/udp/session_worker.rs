@@ -509,7 +509,7 @@ async fn start_vless_session_udp_session(
                                 debug!("VLESS session UDP write to {} failed: {}", target, error);
                                 break true;
                             }
-                            record_transfer(traffic_context.clone(), payload.len() as u64, 0);
+                            record_transfer_ref(traffic_context.as_ref(), payload.len() as u64, 0);
                             idle.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         response = proxy.recv_from(&mut response_buffer) => {
@@ -601,7 +601,7 @@ fn start_reverse_session_udp_session(
                                 debug!("VLESS Reverse session UDP write failed: {}", error);
                                 break true;
                             }
-                            record_transfer(traffic_context.clone(), payload_length as u64, 0);
+                            record_transfer_ref(traffic_context.as_ref(), payload_length as u64, 0);
                             idle.as_mut().reset(Instant::now() + idle_timeout);
                         }
                         response = session.recv() => {
@@ -705,8 +705,8 @@ async fn start_local_session_udp_session(
                         .await
                     {
                         Ok(written) if written == request.payload.len() => {
-                            record_transfer(
-                                traffic_context.clone(),
+                            record_transfer_ref(
+                                traffic_context.as_ref(),
                                 written as u64,
                                 0,
                             );
@@ -852,8 +852,8 @@ async fn start_trojan_session_udp_session(
                         );
                         break true;
                     }
-                    record_transfer(
-                        traffic_context.clone(),
+                    record_transfer_ref(
+                        traffic_context.as_ref(),
                         request.payload.len() as u64,
                         0,
                     );

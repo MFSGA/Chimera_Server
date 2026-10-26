@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Error, config::def::LiteralConfig};
+use crate::{
+    Error,
+    config::{def::LiteralConfig, parse_error},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -142,15 +145,35 @@ pub(crate) fn parse_config_content(
 ) -> Result<LiteralConfig, Error> {
     match format {
         Some(ConfigFormat::Json) => serde_json::from_str(content).map_err(|err| {
-            Error::InvalidConfig(format!("could not parse JSON: {err}"))
+            Error::InvalidConfig(format!(
+                "could not parse JSON: {}",
+                parse_error::json(
+                    &err,
+                    parse_error::json_field_path::<LiteralConfig>(content),
+                )
+            ))
         }),
         Some(ConfigFormat::Json5) => json5::from_str(content).map_err(|err| {
-            Error::InvalidConfig(format!("could not parse JSON5: {err}"))
+            Error::InvalidConfig(format!(
+                "could not parse JSON5: {}",
+                parse_error::json5(
+                    &err,
+                    parse_error::json5_field_path::<LiteralConfig>(content),
+                )
+            ))
         }),
         None => serde_json::from_str(content).or_else(|json_err| {
             json5::from_str(content).map_err(|json5_err| {
                 Error::InvalidConfig(format!(
-                    "could not parse config as JSON ({json_err}) or JSON5 ({json5_err})"
+                    "could not parse config as JSON ({}) or JSON5 ({})",
+                    parse_error::json(
+                        &json_err,
+                        parse_error::json_field_path::<LiteralConfig>(content),
+                    ),
+                    parse_error::json5(
+                        &json5_err,
+                        parse_error::json5_field_path::<LiteralConfig>(content),
+                    )
                 ))
             })
         }),
@@ -341,9 +364,172 @@ fn expand_env_placeholders(input: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_chunked_body, expand_env_placeholders, is_external_config_source,
-        parse_unix_socket_target, safe_config_source_label,
+        ConfigFormat, decode_chunked_body, expand_env_placeholders,
+        is_external_config_source, parse_config_content, parse_unix_socket_target,
+        safe_config_source_label,
     };
+
+    #[test]
+    fn config_parse_errors_redact_input_and_keep_format_location() {
+        let secret = "config-password-sentinel";
+        let content = format!("\"{secret}\"");
+
+        for (format, expected_format) in [
+            (Some(ConfigFormat::Json), "JSON"),
+            (Some(ConfigFormat::Json5), "JSON5"),
+            (None, "JSON"),
+        ] {
+            let error = parse_config_content(&content, format)
+                .expect_err("a scalar cannot be used as the full server config")
+                .to_string();
+
+            assert!(error.contains(expected_format), "{error}");
+            assert!(error.contains("line 1"), "{error}");
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn config_parse_errors_report_safe_paths_without_values_or_dynamic_keys() {
+        let secret_value = "config-field-secret-sentinel";
+        let json = format!(
+            r#"{{"inbounds":[{{"tag":"{secret_value}","protocol":7}}],"outbounds":[]}}"#
+        );
+        let json_error = parse_config_content(&json, Some(ConfigFormat::Json))
+            .expect_err("invalid protocol type should fail")
+            .to_string();
+        assert!(
+            json_error.contains("field path `inbounds[0].protocol`"),
+            "{json_error}"
+        );
+        assert!(!json_error.contains(secret_value), "{json_error}");
+
+        let json5 = format!(
+            "{{inbounds: [{{tag: '{secret_value}', protocol: 7}}], outbounds: []}}"
+        );
+        let json5_error = parse_config_content(&json5, Some(ConfigFormat::Json5))
+            .expect_err("invalid protocol type should fail")
+            .to_string();
+        assert!(
+            json5_error.contains("field path `inbounds[0].protocol`"),
+            "{json5_error}"
+        );
+        assert!(!json5_error.contains(secret_value), "{json5_error}");
+
+        let secret_key = "dynamic-secret-key-sentinel";
+        let json5_dynamic_key = format!(
+            "{{inbounds: [], outbounds: [], dns: {{hosts: {{'{secret_key}': 7}}}}}}"
+        );
+        let dynamic_key_error =
+            parse_config_content(&json5_dynamic_key, Some(ConfigFormat::Json5))
+                .expect_err("invalid DNS host value should fail")
+                .to_string();
+        assert!(
+            dynamic_key_error.contains("field path `dns.hosts.<key>`"),
+            "{dynamic_key_error}"
+        );
+        assert!(
+            !dynamic_key_error.contains(secret_key),
+            "{dynamic_key_error}"
+        );
+
+        let invalid_dns_field =
+            r#"{"inbounds":[],"outbounds":[],"dns":{"serveExpiredTtl":"bad"}}"#;
+        let dns_field_error =
+            parse_config_content(invalid_dns_field, Some(ConfigFormat::Json))
+                .expect_err("invalid DNS TTL type should fail")
+                .to_string();
+        assert!(
+            dns_field_error.contains("field path `dns.serveExpiredTtl`"),
+            "{dns_field_error}"
+        );
+        assert!(!dns_field_error.contains("bad"), "{dns_field_error}");
+
+        let invalid_log_field =
+            r#"{"inbounds":[],"outbounds":[],"log":{"dnsLog":"bad"}}"#;
+        let log_field_error =
+            parse_config_content(invalid_log_field, Some(ConfigFormat::Json))
+                .expect_err("invalid log option type should fail")
+                .to_string();
+        assert!(
+            log_field_error.contains("field path `log.dnsLog`"),
+            "{log_field_error}"
+        );
+        assert!(!log_field_error.contains("bad"), "{log_field_error}");
+
+        let invalid_acronym_field = r#"{"inbounds":[{"tag":"in","protocol":"vless","settings":{},"streamSettings":{"network":"xhttp","xhttpSettings":{"noGRPCHeader":"bad"}}}],"outbounds":[]}"#;
+        let acronym_field_error =
+            parse_config_content(invalid_acronym_field, Some(ConfigFormat::Json))
+                .expect_err("invalid XHTTP option type should fail")
+                .to_string();
+        assert!(
+            acronym_field_error.contains(
+                "field path `inbounds[0].streamSettings.xhttpSettings.noGRPCHeader`"
+            ),
+            "{acronym_field_error}"
+        );
+        assert!(
+            !acronym_field_error.contains("bad"),
+            "{acronym_field_error}"
+        );
+
+        // A malformed raw settings value can fail while the parser is inside
+        // its arbitrary object. Even keys matching known config fields stay
+        // redacted once parsing has entered a Value subtree.
+        let malformed_settings = r#"{"inbounds":[{"protocol":"vless","settings":{"password": }}],"outbounds":[]}"#;
+        let settings_error =
+            parse_config_content(malformed_settings, Some(ConfigFormat::Json))
+                .expect_err("malformed settings JSON should fail")
+                .to_string();
+        assert!(
+            settings_error.contains("field path `inbounds[0].settings.<key>`"),
+            "{settings_error}"
+        );
+        assert!(!settings_error.contains("password"), "{settings_error}");
+
+        let malformed_outbound_stream = r#"{"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"out","streamSettings":{"password": }}]}"#;
+        let outbound_stream_error = parse_config_content(
+            malformed_outbound_stream,
+            Some(ConfigFormat::Json),
+        )
+        .expect_err("malformed outbound stream settings should fail")
+        .to_string();
+        assert!(
+            outbound_stream_error
+                .contains("field path `outbounds[0].streamSettings.<key>`"),
+            "{outbound_stream_error}"
+        );
+        assert!(
+            !outbound_stream_error.contains("password"),
+            "{outbound_stream_error}"
+        );
+
+        let invalid_selector_alias = r#"{"inbounds":[],"outbounds":[],"routing":{"balancers":[{"tag":"balance","selector":["selector-secret-sentinel",7]}]}}"#;
+        let selector_alias_error =
+            parse_config_content(invalid_selector_alias, Some(ConfigFormat::Json))
+                .expect_err("invalid balancer selector type should fail")
+                .to_string();
+        assert!(
+            selector_alias_error
+                .contains("field path `routing.balancers[0].selector`"),
+            "{selector_alias_error}"
+        );
+        assert!(
+            !selector_alias_error.contains("selector-secret-sentinel"),
+            "{selector_alias_error}"
+        );
+
+        let malformed_unknown_object =
+            r#"{"inbounds":[],"outbounds":[],"futureField":{"password": }}"#;
+        let unknown_object_error =
+            parse_config_content(malformed_unknown_object, Some(ConfigFormat::Json))
+                .expect_err("malformed unknown config object should fail")
+                .to_string();
+        assert!(
+            !unknown_object_error.contains("password"),
+            "{unknown_object_error}"
+        );
+    }
 
     #[test]
     fn expands_env_placeholders() {

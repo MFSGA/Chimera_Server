@@ -133,6 +133,13 @@ pub struct TransferTotals {
     pub download_bytes: u64,
 }
 
+type TrafficBytes = (u64, u64);
+
+fn add_traffic_bytes(target: &mut TrafficBytes, totals: &TransferTotals) {
+    target.0 = target.0.saturating_add(totals.upload_bytes);
+    target.1 = target.1.saturating_add(totals.download_bytes);
+}
+
 impl TransferTotals {
     fn accumulate(&mut self, upload: u64, download: u64) {
         self.connections = self.connections.saturating_add(1);
@@ -262,7 +269,11 @@ fn accumulate_inbound(
         return;
     }
 
-    let stats = totals.entry(inbound.to_owned()).or_default();
+    let stats = if let Some(stats) = totals.get_mut(inbound) {
+        stats
+    } else {
+        totals.entry(inbound.to_owned()).or_default()
+    };
     if let Some((upload, download)) = inbound_totals {
         stats.totals.accumulate(upload, download);
     }
@@ -465,6 +476,108 @@ impl TrafficRecorder {
         }
         snapshot
     }
+
+    fn user_traffic(&self, identity: &str) -> Option<TrafficBytes> {
+        let mut found = false;
+        let mut bytes = (0, 0);
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            found |= guard.known_identities.contains(identity);
+            for inbound in guard.per_inbound.values() {
+                if let Some(totals) = inbound.per_user.get(identity) {
+                    found = true;
+                    add_traffic_bytes(&mut bytes, totals);
+                }
+            }
+        }
+        found.then_some(bytes)
+    }
+
+    fn user_traffic_for(
+        &self,
+        identities: &HashSet<String>,
+    ) -> HashMap<String, TrafficBytes> {
+        let mut totals = identities
+            .iter()
+            .cloned()
+            .map(|identity| (identity, None))
+            .collect::<HashMap<String, Option<TrafficBytes>>>();
+        if totals.is_empty() {
+            return HashMap::new();
+        }
+
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            if totals.len() < guard.known_identities.len() {
+                for (identity, bytes) in &mut totals {
+                    if guard.known_identities.contains(identity) {
+                        bytes.get_or_insert((0, 0));
+                    }
+                }
+            } else {
+                for identity in &guard.known_identities {
+                    if let Some(bytes) = totals.get_mut(identity) {
+                        bytes.get_or_insert((0, 0));
+                    }
+                }
+            }
+            for inbound in guard.per_inbound.values() {
+                if totals.len() < inbound.per_user.len() {
+                    for (identity, bytes) in &mut totals {
+                        if let Some(user_totals) = inbound.per_user.get(identity) {
+                            add_traffic_bytes(
+                                bytes.get_or_insert((0, 0)),
+                                user_totals,
+                            );
+                        }
+                    }
+                } else {
+                    for (identity, user_totals) in &inbound.per_user {
+                        if let Some(bytes) = totals.get_mut(identity) {
+                            add_traffic_bytes(
+                                bytes.get_or_insert((0, 0)),
+                                user_totals,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        totals
+            .into_iter()
+            .filter_map(|(identity, bytes)| bytes.map(|bytes| (identity, bytes)))
+            .collect()
+    }
+
+    fn inbound_traffic(&self, tag: &str) -> Option<TrafficBytes> {
+        let mut found = false;
+        let mut bytes = (0, 0);
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            let Some(inbound) = guard.per_inbound.get(tag) else {
+                continue;
+            };
+            if inbound.totals.connections == 0 {
+                continue;
+            }
+            found = true;
+            add_traffic_bytes(&mut bytes, &inbound.totals);
+        }
+        found.then_some(bytes)
+    }
+
+    fn outbound_traffic(&self, tag: &str) -> Option<TrafficBytes> {
+        let mut found = false;
+        let mut bytes = (0, 0);
+        for shard in &self.shards {
+            let guard = shard.read().expect("traffic stats shard poisoned");
+            if let Some(totals) = guard.per_outbound.get(tag) {
+                found = true;
+                add_traffic_bytes(&mut bytes, totals);
+            }
+        }
+        found.then_some(bytes)
+    }
 }
 
 pub fn record_transfer(context: Option<TrafficContext>, upload: u64, download: u64) {
@@ -502,6 +615,31 @@ pub fn register_identity(identity: impl Into<String>) {
 
 pub fn snapshot() -> TrafficSnapshot {
     TrafficRecorder::global().snapshot()
+}
+
+/// Read one user's aggregate inbound traffic without materializing a full
+/// traffic snapshot. Returns `None` when the identity has never been exposed.
+pub fn user_traffic(identity: &str) -> Option<(u64, u64)> {
+    TrafficRecorder::global().user_traffic(identity)
+}
+
+/// Aggregate inbound traffic for requested identities without building a full
+/// traffic snapshot. Registered identities with no inbound totals are returned
+/// with zero bytes; identities absent from traffic stats are omitted.
+pub fn user_traffic_for(
+    identities: &HashSet<String>,
+) -> HashMap<String, (u64, u64)> {
+    TrafficRecorder::global().user_traffic_for(identities)
+}
+
+/// Read one inbound's totals without materializing a full traffic snapshot.
+pub fn inbound_traffic(tag: &str) -> Option<(u64, u64)> {
+    TrafficRecorder::global().inbound_traffic(tag)
+}
+
+/// Read one outbound's totals without materializing a full traffic snapshot.
+pub fn outbound_traffic(tag: &str) -> Option<(u64, u64)> {
+    TrafficRecorder::global().outbound_traffic(tag)
 }
 
 #[derive(Debug, Clone)]
@@ -821,6 +959,229 @@ mod tests {
     }
 
     #[test]
+    fn direct_counter_reads_match_snapshot_presence_and_aggregation() {
+        let recorder = TrafficRecorder::default();
+        recorder.register_identity("configured-only");
+        assert_eq!(recorder.user_traffic("configured-only"), Some((0, 0)));
+        assert_eq!(recorder.user_traffic("missing"), None);
+
+        for (inbound, upload, download) in [("edge-a", 13, 17), ("edge-b", 7, 11)] {
+            recorder.record(
+                &TrafficContext::new("vless")
+                    .with_identity("alice")
+                    .with_inbound_tag(inbound)
+                    .with_outbound_tag("direct"),
+                upload,
+                download,
+            );
+        }
+
+        assert_eq!(recorder.user_traffic("alice"), Some((20, 28)));
+        let selected = HashSet::from([
+            "configured-only".to_string(),
+            "alice".to_string(),
+            "hidden-user".to_string(),
+            "missing".to_string(),
+        ]);
+        assert_eq!(
+            recorder.user_traffic_for(&selected),
+            HashMap::from([
+                ("configured-only".to_string(), (0, 0)),
+                ("alice".to_string(), (20, 28)),
+            ])
+        );
+        assert_eq!(recorder.inbound_traffic("edge-a"), Some((13, 17)));
+        assert_eq!(recorder.outbound_traffic("direct"), Some((20, 28)));
+        assert_eq!(recorder.inbound_traffic("missing"), None);
+        assert_eq!(recorder.outbound_traffic("missing"), None);
+
+        recorder.record(
+            &TrafficContext::new("vless").with_identity("without-inbound"),
+            5,
+            9,
+        );
+        assert_eq!(recorder.user_traffic("without-inbound"), Some((0, 0)));
+
+        let mut hidden_user = TrafficContext::new("vless")
+            .with_identity("hidden-user")
+            .with_inbound_tag("hidden-inbound");
+        hidden_user.set_user_stats_policy(false, false, false);
+        recorder.record(&hidden_user, 2, 3);
+        assert_eq!(recorder.user_traffic("hidden-user"), None);
+        assert!(
+            !recorder
+                .user_traffic_for(&selected)
+                .contains_key("hidden-user")
+        );
+        assert_eq!(recorder.inbound_traffic("hidden-inbound"), Some((2, 3)));
+
+        let mut user_only = TrafficContext::new("vless")
+            .with_identity("user-only")
+            .with_inbound_tag("user-only-inbound");
+        user_only.set_system_stats_policy(false, false, false, false);
+        recorder.record(&user_only, 19, 23);
+        assert_eq!(recorder.user_traffic("user-only"), Some((19, 23)));
+        assert_eq!(recorder.inbound_traffic("user-only-inbound"), None);
+    }
+
+    #[test]
+    fn batch_user_traffic_matches_for_sparse_and_broad_selections() {
+        let recorder = TrafficRecorder::default();
+        recorder.register_identity("configured-only");
+        for (identity, upload, download) in [
+            ("alice", 3, 5),
+            ("bob", 7, 11),
+            ("carol", 13, 17),
+            ("dave", 19, 23),
+        ] {
+            recorder.record(
+                &TrafficContext::new("vless")
+                    .with_identity(identity)
+                    .with_inbound_tag("edge"),
+                upload,
+                download,
+            );
+        }
+
+        let sparse = HashSet::from([
+            "alice".to_string(),
+            "configured-only".to_string(),
+            "missing".to_string(),
+        ]);
+        assert_eq!(
+            recorder.user_traffic_for(&sparse),
+            HashMap::from([
+                ("alice".to_string(), (3, 5)),
+                ("configured-only".to_string(), (0, 0)),
+            ])
+        );
+
+        let broad = HashSet::from([
+            "alice".to_string(),
+            "bob".to_string(),
+            "carol".to_string(),
+            "dave".to_string(),
+            "configured-only".to_string(),
+            "missing".to_string(),
+        ]);
+        assert_eq!(
+            recorder.user_traffic_for(&broad),
+            HashMap::from([
+                ("alice".to_string(), (3, 5)),
+                ("bob".to_string(), (7, 11)),
+                ("carol".to_string(), (13, 17)),
+                ("dave".to_string(), (19, 23)),
+                ("configured-only".to_string(), (0, 0)),
+            ])
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode batch user query probe"]
+    fn batch_user_traffic_query_probe() {
+        use std::{hint::black_box, sync::Arc, time::Instant};
+
+        const INBOUND_COUNT: usize = 128;
+        const USER_COUNT: usize = 64;
+        const WRITER_COUNT: usize = 4;
+        const ITERATIONS: usize = 500;
+
+        fn legacy_user_traffic_for(
+            recorder: &TrafficRecorder,
+            identities: &HashSet<String>,
+        ) -> HashMap<String, Option<TrafficBytes>> {
+            let mut totals = identities
+                .iter()
+                .cloned()
+                .map(|identity| (identity, None))
+                .collect::<HashMap<String, Option<TrafficBytes>>>();
+
+            for shard in &recorder.shards {
+                let guard = shard.read().expect("traffic stats shard poisoned");
+                for identity in &guard.known_identities {
+                    if let Some(bytes) = totals.get_mut(identity) {
+                        bytes.get_or_insert((0, 0));
+                    }
+                }
+                for inbound in guard.per_inbound.values() {
+                    for (identity, user_totals) in &inbound.per_user {
+                        if let Some(bytes) = totals.get_mut(identity) {
+                            add_traffic_bytes(
+                                bytes.get_or_insert((0, 0)),
+                                user_totals,
+                            );
+                        }
+                    }
+                }
+            }
+
+            totals
+        }
+
+        let recorder = Arc::new(TrafficRecorder::default());
+        let writers = (0..WRITER_COUNT)
+            .map(|writer_index| {
+                let recorder = Arc::clone(&recorder);
+                std::thread::spawn(move || {
+                    let first_inbound = writer_index * INBOUND_COUNT / WRITER_COUNT;
+                    let end_inbound =
+                        (writer_index + 1) * INBOUND_COUNT / WRITER_COUNT;
+                    for inbound_index in first_inbound..end_inbound {
+                        let inbound = format!("probe-inbound-{inbound_index}");
+                        for user_index in 0..USER_COUNT {
+                            let identity = format!("probe-user-{user_index}");
+                            recorder.record(
+                                &TrafficContext::new("probe")
+                                    .with_identity(identity)
+                                    .with_inbound_tag(&inbound),
+                                1,
+                                2,
+                            );
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().expect("traffic probe writer");
+        }
+
+        for selection_size in [4, USER_COUNT] {
+            let identities = (0..selection_size)
+                .map(|index| format!("probe-user-{index}"))
+                .collect::<HashSet<_>>();
+            let expected = recorder.user_traffic_for(&identities);
+            let legacy = legacy_user_traffic_for(&recorder, &identities)
+                .into_iter()
+                .filter_map(|(identity, bytes)| bytes.map(|bytes| (identity, bytes)))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(expected, legacy);
+            assert_eq!(expected.len(), selection_size);
+            assert!(
+                expected.values().all(|bytes| *bytes
+                    == (INBOUND_COUNT as u64, (INBOUND_COUNT * 2) as u64))
+            );
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(legacy_user_traffic_for(&recorder, &identities));
+            }
+            let legacy_elapsed = started.elapsed();
+
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(recorder.user_traffic_for(&identities));
+            }
+            let optimized_elapsed = started.elapsed();
+            let ratio = legacy_elapsed.as_secs_f64()
+                / optimized_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+            eprintln!(
+                "inbounds={INBOUND_COUNT} users_per_inbound={USER_COUNT} writers={WRITER_COUNT} selected_users={selection_size} iterations={ITERATIONS} legacy={legacy_elapsed:?} optimized={optimized_elapsed:?} ratio={ratio:.2}x"
+            );
+        }
+    }
+
+    #[test]
     fn online_stats_policy_hides_identity_but_keeps_connection_metadata() {
         let started_at = SystemTime::UNIX_EPOCH;
         let mut context = TrafficContext::new("vless")
@@ -893,6 +1254,25 @@ mod tests {
             expected_records
         );
         assert!(snapshot.known_identities.contains("alice"));
+        assert_eq!(
+            recorder.user_traffic("alice"),
+            Some((expected_records * 7, expected_records * 11))
+        );
+        assert_eq!(
+            recorder.inbound_traffic("edge"),
+            Some((expected_records * 7, expected_records * 11))
+        );
+        assert_eq!(
+            recorder.outbound_traffic("direct"),
+            Some((expected_records * 7, expected_records * 11))
+        );
+        assert_eq!(
+            recorder
+                .user_traffic_for(&HashSet::from(["alice".to_string()]))
+                .get("alice")
+                .copied(),
+            Some((expected_records * 7, expected_records * 11))
+        );
     }
 
     #[test]

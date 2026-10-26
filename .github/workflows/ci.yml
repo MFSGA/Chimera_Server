@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ["master"]
+    branches: ["master", "release-candidate-*"]
   pull_request:
     branches: ["master"]
   workflow_dispatch:
@@ -42,6 +42,9 @@ jobs:
 
       - name: Auto-merge policy self-test
         run: python3 .github/scripts/auto_merge_after_ci.py --self-test
+
+      - name: Release candidate CI gate self-test
+        run: python3 .github/scripts/release_candidate_ci.py --self-test
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

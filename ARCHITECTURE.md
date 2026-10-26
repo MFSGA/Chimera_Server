@@ -1,7 +1,7 @@
 # Chimera Server 架构设计与演进规范
 
-- 文档版本：1.4
-- 更新日期：2026-10-06
+- 文档版本：1.5
+- 更新日期：2026-10-26
 - 定位：后续架构设计与渐进迁移的首要参考；不是已实现功能清单。
 - 实施状态：目标设计已形成，本文不表示代码迁移已经完成。
 - 适用范围：Chimera_Server 服务端，当前以 inbound 为主。
@@ -10,7 +10,7 @@
 
 Chimera 的最终目标是完整兼容 xray-core 的服务端行为，使现有客户端无需改变协议配置即可使用 Chimera，并使支持范围内的 Xray 服务端配置保留等价语义。在实现这一目标的同时，改善模块职责、状态所有权、生命周期、资源控制和可维护性。
 
-后续贡献者应先阅读 [AGENTS.md](AGENTS.md)、[需求、架构演进与维护手册](ITERATION_GUIDE.md) 和本文，再检查任务涉及的实际代码与参考实现。手册补充已确认优先级、迁移切片选择、故障排查和交接方法；本文仍是内部设计的首要参考。架构相关改动应说明所属模块、状态所有者、影响的兼容行为和验证方式。本文中的类型与目录名称是设计名称，迁移完成前不得假设它们已经存在。
+后续贡献者应先阅读 [AGENTS.md](AGENTS.md)、[需求、架构演进与维护手册](ITERATION_GUIDE.md) 和本文，再检查任务涉及的实际代码与参考实现。手册补充已确认优先级、迁移切片选择、故障排查和交接方法；本文仍是内部设计的首要参考。VLESS Reverse 与站点到站点网关专项范围分别见 [VLESS Reverse 设计](VLESS_REVERSE_DESIGN.md) 和 [站点到站点设计](SITE_TO_SITE_DESIGN.md)。架构相关改动应说明所属模块、状态所有者、影响的兼容行为和验证方式。本文中的类型与目录名称是设计名称，迁移完成前不得假设它们已经存在。
 
 用户当前明确指令优先；AGENTS 规定贡献流程；本文规定内部设计方向；固定版本的 Xray 源码与互通结果规定外部兼容行为。遇到分歧应明确记录：代码现状不自动推翻目标设计，目标设计也不允许未经验证改变 Xray 行为。例行局部实现不需要反复请求架构确认；重大边界调整应先更新设计理由。
 
@@ -213,8 +213,11 @@ stateDiagram-v2
 - 数据面仅持有查询/执行能力，管理面持有发布/变更能力。优先使用具体窄接口，确有替换或测试需求时再引入 trait。
 - 路由与关联数据应作为一致版本发布；现有 RoutingPublication 可逐步复用。
 - 每项用户/策略变更注明影响新握手、新请求、新消息还是既有会话。不可统一假定整条连接只读取一次，也不可按字节获取全局锁。
+- `UserDomainAccessStore` 将活动策略与本次激活的决策统计共同发布；普通已知域策略检查把计数写入分片统计，不再为每个决策获取策略管理状态的排他锁。应用新版本或回滚时创建新的统计代次；过期检查不能污染当前版本的可见计数。未知目标和未支持协议诊断仍走有界、去重的审计状态。
 - 流量在定义明确的位置计量，传输层和会话层避免重复计数；失败、回落、取消和快速路径同样验证 Xray 对应口径。
 - 继续复用 traffic、tracing 和管理 gRPC，不另设观测体系；MCP 为可选适配能力。
+
+2026-10-26 验证：用户域策略并发微基准在 Ryzen 7 5800 / rustc 1.98.0 上以 release 配置重复运行两次；16 线程从基线约 2.51 M 次/秒提升到 12.81–13.07 M 次/秒，单线程约 6.06 M 到 6.62–6.64 M 次/秒。该结果仅代表每次策略检查的用户域 CPU 微基准，不代表代理端到端吞吐或生产容量；命令、并发数据及限制见 [`bench/chimera_perf/USER_DOMAIN_POLICY_CONTENTION.md`](bench/chimera_perf/USER_DOMAIN_POLICY_CONTENTION.md)。
 
 ## 9. 关键流程
 
@@ -332,7 +335,7 @@ cargo check -p chimera_server_app --no-default-features --features minimal-vless
 
 ## 12. 渐进迁移路线与验收
 
-本文建立路线，不自动授权执行所有阶段。后续任务按当前用户范围选择一个切片；迁移与新增协议分别验收。具体选择流程与调整后的迁移阶段见 [维护手册第 15–16 节](ITERATION_GUIDE.md#15-每轮迭代如何选择任务)。优先实际责任、必要契约和 owner，不以文件行数或目录移动作为必经门槛；下方历史完成状态不因新手册建立而重置。
+本文建立路线，不自动授权执行所有阶段。后续任务按当前用户范围选择一个切片；迁移与新增协议分别验收。具体选择流程与调整后的迁移阶段见 [维护手册第 15–16 节](ITERATION_GUIDE.md#15-每轮迭代如何选择任务)。优先实际责任、必要契约和 owner，不以文件行数或目录移动作为必经门槛；下方历史完成状态不因手册更新而重置。
 
 | 阶段 | 交付 | 最小验收 |
 | --- | --- | --- |
@@ -1661,3 +1664,9 @@ The normal `XRAY_BIN=./xray` namespace smoke continues without this optional str
 ### 14.33 3x-ui `/debug/vars` metrics listener compatibility (2026-10-11)
 
 The Xray-shaped top-level `metrics.listen` now owns an HTTP listener at `/debug/vars`, started and supervised with the server. The response includes nested traffic counters, active outbound Observatory entries, and the `memstats` field names consumed by the 3x-ui sampler. `metrics.tag` with `listen` remains accepted with an explicit warning because the tagged outbound path is not implemented; tag-only configurations fail validation. Rust does not have Go heap/GC counters: Linux RSS and virtual size are exposed in the legacy `HeapAlloc`/`Sys` slots as memory-history approximations, `HeapObjects`/`NumGC`/`PauseNs` are zero, and a `chimera` marker states these values are not Go runtime equivalents. Non-Linux process-memory collection is not implemented. The process e2e using `examples/xray-compatible/3x-ui-default-api.json5` verifies HTTP JSON fields and existing gRPC Stats/Routing calls; targeted config tests, all-feature integration-target Clippy, formatting, and the actual 3x-ui template `--check` passed. This is endpoint-level Chimera evidence, not a run of the 3x-ui Go sampler or exact Xray allocator/GC parity.
+
+### 14.34 Linux TUN system-resource boundary (2026-10-26)
+
+Linux address and route netlink setup, rollback, and managed-resource removal now live in the private `tun_gateway::system` module. The parent `tun_gateway` module still owns configuration plans, device/task lifetime, packet forwarding, and the established shutdown cleanup order. This keeps OS resource transactions isolated without changing their service owner or route semantics. The shared UDP QUIC-sniffing adapter is compiled for either TUN feature, fixing the `tun-gateway` reduced build where its configuration type was previously gated only for `xray-tun`.
+
+Risk: L2, because this touches Linux network resources and feature-gated runtime code. No configuration, wire, route-selection, or cleanup-order behavior is intended to change. Verification passed: `cargo fmt --all -- --check`, `git diff --check`, `cargo test -p chimera_server_lib --lib` (1697 passed, 6 ignored), `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and both `cargo check -p chimera_server_lib --no-default-features --features tun-gateway` and the corresponding `xray-tun` check. The `tun-gateway` check also exposed and verified the feature-gate correction above; both reduced builds still report pre-existing unused/dead-code warnings. The isolated Linux namespace scripts `XRAY_BIN=./xray bash scripts/test_tun_gateway_managed_routes_netns.sh` and `XRAY_BIN=./xray bash scripts/test_xray_tun_routes_netns.sh` exited 0, covering managed route/address installation, live dual-stack forwarding, conflict rollback, and shutdown cleanup; the Xray TUN script uses the repository's pinned Xray 26.9.9 binary and established reference baseline. These runs validate this internal extraction and existing scenarios; they do not broaden the Xray compatibility claim or make `xray-tun` fully compatible.

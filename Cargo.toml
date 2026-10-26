@@ -11,7 +11,7 @@ members = [
 exclude = ["vendor/watfaq-netstack"]
 
 [workspace.package]
-version = "26.10.11"
+version = "26.10.26"
 edition = "2024"
 authors = ["chimera_rust@proton.me"]
 license = "LGPL-3.0-or-later"
@@ -96,6 +96,7 @@ mime_guess = "2"
 hyper-util = { version = "0.1", features = ["full"] }
 tower = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_path_to_error = "0.1.20"
 uuid = { version = "1.23.2", features = ["v4"] }
 
 thiserror = "2"
@@ -127,8 +128,8 @@ lru = "0.18"
 log = "0.4"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 subtle = "2"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
-md-5 = "0.10"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+md-5 = "0.11"
 blake2 = "0.10"
 blake3 = "1.8"
 aes = "0.8"
@@ -137,7 +138,7 @@ shake = "0.1"
 sha1 = "0.11"
 sha2 = "0.10"
 boringtun = { version = "0.7.1", default-features = false }
-tun = { version = "0.7.13", features = ["async", "tokio"] }
+tun = { version = "0.8.11", features = ["async", "tokio"] }
 rtnetlink = { version = "0.23.0", default-features = false, features = ["tokio_socket"] }
 
 [patch.crates-io]

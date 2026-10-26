@@ -1840,9 +1840,6 @@ async fn run_xray_client_vless_transport_case(case: VlessTransportCase) {
     let echo_addr = start_tcp_echo_server();
     let chimera_port = free_localhost_port();
     let xray_socks_port = free_localhost_port();
-    let cert_path = workspace.join("cert/cert.pem");
-    let key_path = workspace.join("cert/key.pem");
-    let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
     let chimera_config_path = work_dir.join("chimera.json");
     let xray_config_path = work_dir.join("xray-client.json");
 
@@ -1863,29 +1860,33 @@ async fn run_xray_client_vless_transport_case(case: VlessTransportCase) {
                 "wsSettings": {"host": "localhost", "path": "/vless-ws"}
             }),
         ),
-        VlessTransportCase::WebSocketTls => (
-            json!({
-                "network": "ws",
-                "security": "tls",
-                "wsSettings": {"host": "localhost", "path": "/vless-wss"},
-                "tlsSettings": {
-                    "serverName": "localhost",
-                    "certificates": [{
-                        "certificateFile": cert_path,
-                        "keyFile": key_path
-                    }]
-                }
-            }),
-            json!({
-                "network": "ws",
-                "security": "tls",
-                "wsSettings": {"host": "localhost", "path": "/vless-wss"},
-                "tlsSettings": {
-                    "serverName": "localhost",
-                    "pinnedPeerCertSha256": pinned_peer_cert_sha256
-                }
-            }),
-        ),
+        VlessTransportCase::WebSocketTls => {
+            let (cert_path, key_path) = generate_test_certificate(&work_dir);
+            let pinned_peer_cert_sha256 = first_cert_sha256_hex(&cert_path);
+            (
+                json!({
+                    "network": "ws",
+                    "security": "tls",
+                    "wsSettings": {"host": "localhost", "path": "/vless-wss"},
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "certificates": [{
+                            "certificateFile": cert_path,
+                            "keyFile": key_path
+                        }]
+                    }
+                }),
+                json!({
+                    "network": "ws",
+                    "security": "tls",
+                    "wsSettings": {"host": "localhost", "path": "/vless-wss"},
+                    "tlsSettings": {
+                        "serverName": "localhost",
+                        "pinnedPeerCertSha256": pinned_peer_cert_sha256
+                    }
+                }),
+            )
+        }
     };
 
     write_json(
@@ -1902,7 +1903,18 @@ async fn run_xray_client_vless_transport_case(case: VlessTransportCase) {
                 },
                 "streamSettings": chimera_stream
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    }]
+                }
+            }]
         }),
     );
     write_json(
@@ -4283,7 +4295,15 @@ async fn xray_client_can_proxy_tcp_through_chimera_grpc() {
             }],
             "outbounds": [{
                 "tag": "direct",
-                "protocol": "freedom"
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    }]
+                }
             }]
         }),
     );
@@ -4370,7 +4390,15 @@ async fn xray_client_can_proxy_tcp_through_chimera_httpupgrade() {
             }],
             "outbounds": [{
                 "tag": "direct",
-                "protocol": "freedom"
+                "protocol": "freedom",
+                "settings": {
+                    "finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    }]
+                }
             }]
         }),
     );

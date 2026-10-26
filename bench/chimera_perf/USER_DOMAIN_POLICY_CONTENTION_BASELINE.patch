@@ -1,0 +1,63 @@
+--- a/chimera_server_lib/src/user_domain.rs
++++ b/chimera_server_lib/src/user_domain.rs
+@@ -990,6 +990,58 @@
+-
++
+     use super::*;
+-
++
++    #[test]
++    #[ignore = "manual release-mode benchmark for policy-check contention"]
++    fn policy_check_contention_probe() {
++        const ITERATIONS_PER_WORKER: u64 = 50_000;
++        const SAMPLES: usize = 5;
++        let store = UserDomainAccessStore::default();
++        store
++            .apply(parse_publication(&signed_publication(1)).unwrap())
++            .unwrap();
++
++        for workers in [1, 2, 4, 8, 16] {
++            let mut throughput_samples = Vec::with_capacity(SAMPLES);
++            for _ in 0..SAMPLES {
++                let barrier = Arc::new(Barrier::new(workers + 1));
++                let mut tasks = Vec::with_capacity(workers);
++                for _ in 0..workers {
++                    let store = store.clone();
++                    let barrier = Arc::clone(&barrier);
++                    tasks.push(std::thread::spawn(move || {
++                        barrier.wait();
++                        let mut allowed = 0_u64;
++                        for _ in 0..ITERATIONS_PER_WORKER {
++                            allowed += u64::from(
++                                store.allows("vless-1", "api.example.com"),
++                            );
++                        }
++                        allowed
++                    }));
++                }
++
++                barrier.wait();
++                let started = Instant::now();
++                let allowed = tasks
++                    .into_iter()
++                    .map(|task| task.join().expect("policy benchmark worker"))
++                    .sum::<u64>();
++                let elapsed = started.elapsed();
++                assert_eq!(allowed, ITERATIONS_PER_WORKER * workers as u64);
++                throughput_samples.push(
++                    ITERATIONS_PER_WORKER as f64 * workers as f64
++                        / elapsed.as_secs_f64(),
++                );
++            }
++
++            throughput_samples.sort_by(f64::total_cmp);
++            println!(
++                "policy_check_probe workers={workers} median_ops_per_second={:.0}",
++                throughput_samples[SAMPLES / 2]
++            );
++        }
++    }
++
+     fn publication_json(version: u64, checksum: Option<&str>) -> String {
+         let mut value = serde_json::json!({
+             "version": version,

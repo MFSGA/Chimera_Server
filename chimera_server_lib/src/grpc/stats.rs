@@ -35,6 +35,40 @@ impl StatsReset {
         value.saturating_sub(base)
     }
 }
+
+#[derive(Clone, Copy)]
+enum TrafficCounter<'a> {
+    User { identity: &'a str, upload: bool },
+    Inbound { tag: &'a str, upload: bool },
+    Outbound { tag: &'a str, upload: bool },
+}
+
+fn parse_traffic_counter(name: &str) -> Option<TrafficCounter<'_>> {
+    let (scope, rest) = if let Some(rest) = name.strip_prefix("user>>>") {
+        ("user", rest)
+    } else if let Some(rest) = name.strip_prefix("inbound>>>") {
+        ("inbound", rest)
+    } else {
+        ("outbound", name.strip_prefix("outbound>>>")?)
+    };
+
+    let (key, upload) = if let Some(key) = rest.strip_suffix(">>>traffic>>>uplink") {
+        (key, true)
+    } else {
+        (rest.strip_suffix(">>>traffic>>>downlink")?, false)
+    };
+
+    match scope {
+        "user" => Some(TrafficCounter::User {
+            identity: key,
+            upload,
+        }),
+        "inbound" => Some(TrafficCounter::Inbound { tag: key, upload }),
+        "outbound" => Some(TrafficCounter::Outbound { tag: key, upload }),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct StatsServiceImpl {
     start_time: Instant,
@@ -113,8 +147,18 @@ impl StatsServiceImpl {
     }
 
     fn get_stat_value(&self, name: &str, reset: bool) -> Option<i64> {
-        let current_stats = self.current_stats();
-        let value = current_stats.get(name).copied()?;
+        let (bytes, upload) = match parse_traffic_counter(name)? {
+            TrafficCounter::User { identity, upload } => {
+                (traffic::user_traffic(identity)?, upload)
+            }
+            TrafficCounter::Inbound { tag, upload } => {
+                (traffic::inbound_traffic(tag)?, upload)
+            }
+            TrafficCounter::Outbound { tag, upload } => {
+                (traffic::outbound_traffic(tag)?, upload)
+            }
+        };
+        let value = (if upload { bytes.0 } else { bytes.1 }) as i64;
         if reset {
             Some(self.reset.reset(name, value))
         } else {
@@ -223,21 +267,25 @@ impl StatsServiceImpl {
 
     fn user_traffic_value(
         &self,
-        current_stats: &HashMap<String, i64>,
+        user_totals: &HashMap<String, (u64, u64)>,
         email: &str,
-        direction: &str,
+        upload: bool,
         reset: bool,
     ) -> i64 {
+        let Some((uplink, downlink)) = user_totals.get(email).copied() else {
+            return 0;
+        };
+        let (direction, value) = if upload {
+            ("uplink", uplink)
+        } else {
+            ("downlink", downlink)
+        };
         let name = format!("user>>>{email}>>>traffic>>>{direction}");
-        match current_stats.get(&name).copied() {
-            Some(value) => {
-                if reset {
-                    self.reset.reset(&name, value)
-                } else {
-                    value.saturating_sub(self.reset.read(&name))
-                }
-            }
-            None => 0,
+        let value = value as i64;
+        if reset {
+            self.reset.reset(&name, value)
+        } else {
+            value.saturating_sub(self.reset.read(&name))
         }
     }
 
@@ -438,8 +486,11 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
         Status,
     > {
         let request = request.into_inner();
-        let current_stats = self.current_stats();
         let mut users = self.collect_user_stats();
+        let traffic_by_user = request.include_traffic.then(|| {
+            let identities = users.keys().cloned().collect::<HashSet<_>>();
+            traffic::user_traffic_for(&identities)
+        });
         let mut response_users = Vec::with_capacity(users.len());
 
         for (email, mut user) in users.drain() {
@@ -456,26 +507,24 @@ impl proto::xray::app::stats::command::stats_service_server::StatsService
                     .then(left.last_seen.cmp(&right.last_seen))
             });
 
-            let traffic = if request.include_traffic {
+            let traffic = traffic_by_user.as_ref().map(|user_totals| {
                 let uplink = self.user_traffic_value(
-                    &current_stats,
+                    user_totals,
                     &email,
-                    "uplink",
+                    true,
                     request.reset,
                 );
                 let downlink = self.user_traffic_value(
-                    &current_stats,
+                    user_totals,
                     &email,
-                    "downlink",
+                    false,
                     request.reset,
                 );
-                Some(proto::xray::app::stats::command::TrafficUserStat {
+                proto::xray::app::stats::command::TrafficUserStat {
                     uplink,
                     downlink,
-                })
-            } else {
-                None
-            };
+                }
+            });
 
             response_users.push(proto::xray::app::stats::command::UserStat {
                 email: user.email,

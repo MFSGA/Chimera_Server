@@ -1,5 +1,6 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use tracing::warn;
 
 #[cfg(any(feature = "tls", feature = "reality"))]
 use crate::config::server_config::VlessFallback;
@@ -35,22 +36,20 @@ use super::tls_vision::{RustlsVisionSession, VisionRecordIo};
 use super::udp_stream::VlessUdpStream;
 use super::vision_stream::VisionServerStream;
 use super::{
-    authorize_reverse_command, encode_hex, parse_hex,
-    reverse_portal_runtime_unavailable,
+    CompiledVlessUsers, ParsedVlessUser, authorize_reverse_command,
+    parse_vless_users, reverse_portal_runtime_unavailable,
 };
-
-pub(crate) type ParsedVisionUser = (Box<[u8]>, String, String, u32, bool);
 
 #[derive(Debug)]
 pub struct VisionVlessTcpHandler {
-    users: Vec<ParsedVisionUser>,
+    users: Arc<CompiledVlessUsers>,
     inbound_tag: String,
 }
 
 impl VisionVlessTcpHandler {
     pub fn new(users: &[VlessUser], inbound_tag: &str) -> Self {
         Self {
-            users: parse_vision_users(users),
+            users: Arc::new(parse_vless_users(users)),
             inbound_tag: inbound_tag.to_string(),
         }
     }
@@ -59,18 +58,14 @@ impl VisionVlessTcpHandler {
 #[cfg(feature = "reality")]
 pub async fn setup_reality_mixed_vless_server_stream(
     mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
-    users: &[VlessUser],
+    users: &CompiledVlessUsers,
     fallbacks: &[VlessFallback],
     inbound_tag: &str,
 ) -> std::io::Result<TcpServerSetupResult> {
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
-        let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|user| {
-                let parsed = parse_hex(&user.user_id);
-                parsed.len() == 16 && parsed.as_ref() == candidate.as_slice()
-            })
-        });
+        let authenticated = candidate
+            .is_some_and(|candidate| users.find(candidate.as_slice()).is_some());
         if !authenticated {
             extend_prefix_for_path(&mut tls_stream, &mut prefix, fallbacks).await;
             let fallback = select_vless_fallback(fallbacks, "", "", &prefix)
@@ -102,7 +97,7 @@ pub async fn setup_reality_mixed_vless_server_stream(
     } = header;
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
-    authorize_reverse_command(user.reverse.is_some(), command)?;
+    authorize_reverse_command(user.reverse_tag.is_some(), command)?;
     let traffic_context = Some(
         TrafficContext::new("vless")
             .with_identity(user.user_label.clone())
@@ -114,11 +109,9 @@ pub async fn setup_reality_mixed_vless_server_stream(
     if command == COMMAND_RVS {
         return Ok(TcpServerSetupResult::ReversePortal {
             reverse_tag: user
-                .reverse
-                .as_ref()
-                .expect("authorized Reverse command requires a reverse tag")
-                .tag
-                .clone(),
+                .reverse_tag
+                .clone()
+                .expect("authorized Reverse command requires a reverse tag"),
             stream: Box::new(tls_stream),
             connection_success_response: Some(
                 SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
@@ -212,7 +205,7 @@ pub async fn setup_tls_mixed_vless_server_stream(
     mut tls_stream: tokio_rustls::server::TlsStream<
         VisionRecordIo<Box<dyn AsyncStream>>,
     >,
-    users: &[VlessUser],
+    users: &CompiledVlessUsers,
     fallbacks: &[VlessFallback],
     inbound_tag: &str,
 ) -> std::io::Result<TcpServerSetupResult> {
@@ -228,13 +221,8 @@ pub async fn setup_tls_mixed_vless_server_stream(
     };
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
-        let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|user| {
-                let stored_user_id = parse_hex(&user.user_id);
-                stored_user_id.len() == 16
-                    && stored_user_id.as_ref() == candidate.as_slice()
-            })
-        });
+        let authenticated = candidate
+            .is_some_and(|candidate| users.find(candidate.as_slice()).is_some());
         if !authenticated {
             extend_prefix_for_path(&mut tls_stream, &mut prefix, fallbacks).await;
             let fallback = select_vless_fallback(
@@ -271,7 +259,7 @@ pub async fn setup_tls_mixed_vless_server_stream(
     } = header;
 
     let user = find_matching_vless_user(users, &user_id, inbound_tag)?;
-    authorize_reverse_command(user.reverse.is_some(), command)?;
+    authorize_reverse_command(user.reverse_tag.is_some(), command)?;
     let user_label = user.user_label.clone();
     let user_level = user.user_level;
     let traffic_context = Some(
@@ -285,11 +273,9 @@ pub async fn setup_tls_mixed_vless_server_stream(
     if command == COMMAND_RVS {
         return Ok(TcpServerSetupResult::ReversePortal {
             reverse_tag: user
-                .reverse
-                .as_ref()
-                .expect("authorized Reverse command requires a reverse tag")
-                .tag
-                .clone(),
+                .reverse_tag
+                .clone()
+                .expect("authorized Reverse command requires a reverse tag"),
             stream: Box::new(tls_stream),
             connection_success_response: Some(
                 SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
@@ -380,18 +366,14 @@ pub async fn setup_tls_mixed_vless_server_stream(
 #[allow(dead_code)] // Kept as the REALITY Vision entrypoint for the listener integration slice.
 pub async fn setup_reality_vision_server_stream(
     mut tls_stream: RealityTlsStream<Box<dyn AsyncStream>, RealityServerConnection>,
-    users: &[ParsedVisionUser],
+    users: &CompiledVlessUsers,
     fallbacks: &[VlessFallback],
     inbound_tag: &str,
 ) -> std::io::Result<TcpServerSetupResult> {
     let header = if !fallbacks.is_empty() {
         let (mut prefix, candidate) = read_vless_auth_prefix(&mut tls_stream).await;
-        let authenticated = candidate.is_some_and(|candidate| {
-            users.iter().any(|(stored_user_id, _, _, _, _)| {
-                stored_user_id.len() == 16
-                    && stored_user_id.as_ref() == candidate.as_slice()
-            })
-        });
+        let authenticated = candidate
+            .is_some_and(|candidate| users.find(candidate.as_slice()).is_some());
         if !authenticated {
             extend_prefix_for_path(&mut tls_stream, &mut prefix, fallbacks).await;
             let fallback = select_vless_fallback(fallbacks, "", "", &prefix)
@@ -422,9 +404,8 @@ pub async fn setup_reality_vision_server_stream(
         remote_location,
     } = header;
 
-    let (policy_identity, user_label, user_level, reverse_only) =
-        find_matching_user_label(users, &user_id, inbound_tag)?;
-    authorize_reverse_command(reverse_only, command)?;
+    let user = find_matching_user_label(users, &user_id, inbound_tag)?;
+    authorize_reverse_command(user.reverse_tag.is_some(), command)?;
     if command == COMMAND_RVS {
         return Err(reverse_portal_runtime_unavailable());
     }
@@ -448,10 +429,10 @@ pub async fn setup_reality_vision_server_stream(
         connection_success_response: None,
         traffic_context: Some(
             TrafficContext::new("vless")
-                .with_identity(user_label)
-                .with_policy_identity(policy_identity)
+                .with_identity(user.user_label.clone())
+                .with_policy_identity(user.user_id.clone())
                 .with_inbound_tag(inbound_tag.to_string())
-                .with_user_level(user_level),
+                .with_user_level(user.user_level),
         ),
     })
 }
@@ -459,7 +440,7 @@ pub async fn setup_reality_vision_server_stream(
 impl VisionVlessTcpHandler {
     async fn setup_server_stream_with_users(
         &self,
-        users: &[ParsedVisionUser],
+        users: &CompiledVlessUsers,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedVlessHeader {
@@ -469,10 +450,9 @@ impl VisionVlessTcpHandler {
             remote_location,
         } = read_request_header(&mut server_stream).await?;
 
-        let (policy_identity, user_label, user_level, reverse_only) =
-            find_matching_user_label(users, &user_id, &self.inbound_tag)?;
+        let user = find_matching_user_label(users, &user_id, &self.inbound_tag)?;
 
-        authorize_reverse_command(reverse_only, command)?;
+        authorize_reverse_command(user.reverse_tag.is_some(), command)?;
         if command == COMMAND_RVS {
             return Err(reverse_portal_runtime_unavailable());
         }
@@ -485,10 +465,10 @@ impl VisionVlessTcpHandler {
             connection_success_response: None,
             traffic_context: Some(
                 TrafficContext::new("vless")
-                    .with_identity(user_label)
-                    .with_policy_identity(policy_identity)
+                    .with_identity(user.user_label.clone())
+                    .with_policy_identity(user.user_id.clone())
                     .with_inbound_tag(self.inbound_tag.clone())
-                    .with_user_level(user_level),
+                    .with_user_level(user.user_level),
             ),
         })
     }
@@ -512,100 +492,28 @@ impl TcpServerHandler for VisionVlessTcpHandler {
         let dynamic_users = context
             .inbound_handshake_runtime()
             .as_ref()
-            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag))
-            .map(|users| parse_vision_users(&users));
-        let users = dynamic_users.as_deref().unwrap_or(&self.users);
+            .and_then(|runtime| runtime.vless_users_snapshot(&self.inbound_tag));
+        let users = dynamic_users.as_deref().unwrap_or(self.users.as_ref());
         self.setup_server_stream_with_users(users, server_stream)
             .await
     }
 }
 
-pub(crate) fn parse_vision_users(users: &[VlessUser]) -> Vec<ParsedVisionUser> {
-    users
-        .iter()
-        .map(|user| {
-            (
-                parse_hex(&user.user_id),
-                user.user_id.clone(),
-                user.user_label.clone(),
-                user.user_level,
-                user.reverse.is_some(),
-            )
-        })
-        .collect()
-}
-
 #[cfg(any(feature = "tls", feature = "reality"))]
 fn find_matching_vless_user<'a>(
-    users: &'a [VlessUser],
+    users: &'a CompiledVlessUsers,
     user_id: &[u8; 16],
     inbound_tag: &str,
-) -> std::io::Result<&'a VlessUser> {
-    let matched_user = users.iter().find(|user| {
-        let stored_user_id = parse_hex(&user.user_id);
-        stored_user_id.len() == 16 && stored_user_id.as_ref() == user_id.as_slice()
-    });
-
-    let Some(user) = matched_user else {
-        let expected = users
-            .iter()
-            .map(|user| encode_hex(parse_hex(&user.user_id).as_ref()))
-            .collect::<Vec<_>>()
-            .join(",");
-        let got = encode_hex(user_id);
-        warn!(
-            inbound_tag = %inbound_tag,
-            expected = %expected,
-            got = %got,
-            "VLESS inbound rejected request with mismatched user id"
-        );
-
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("invalid VLESS user id: {got}"),
-        ));
-    };
-
-    Ok(user)
+) -> std::io::Result<&'a ParsedVlessUser> {
+    super::find_vless_user(users, user_id, inbound_tag, "vision")
 }
 
-fn find_matching_user_label(
-    users: &[ParsedVisionUser],
+fn find_matching_user_label<'a>(
+    users: &'a CompiledVlessUsers,
     user_id: &[u8; 16],
     inbound_tag: &str,
-) -> std::io::Result<(String, String, u32, bool)> {
-    let matched_user = users.iter().find(|(stored_user_id, _, _, _, _)| {
-        stored_user_id.len() == 16 && stored_user_id.as_ref() == user_id.as_slice()
-    });
-
-    let Some((_, policy_identity, user_label, user_level, reverse_only)) =
-        matched_user
-    else {
-        let expected = users
-            .iter()
-            .map(|(user_id, _, _, _, _)| encode_hex(user_id.as_ref()))
-            .collect::<Vec<_>>()
-            .join(",");
-        let got = encode_hex(user_id);
-        warn!(
-            inbound_tag = %inbound_tag,
-            expected = %expected,
-            got = %got,
-            "Vision VLESS inbound rejected request with mismatched user id"
-        );
-
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("invalid VLESS user id: {got}"),
-        ));
-    };
-
-    Ok((
-        policy_identity.clone(),
-        user_label.clone(),
-        *user_level,
-        *reverse_only,
-    ))
+) -> std::io::Result<&'a ParsedVlessUser> {
+    super::find_vless_user(users, user_id, inbound_tag, "vision")
 }
 
 fn validate_vision_request_flow(
@@ -631,8 +539,34 @@ fn validate_vision_request_flow(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_vision_request_flow;
+    #[cfg(any(feature = "tls", feature = "reality"))]
+    use super::find_matching_vless_user;
+    use super::{find_matching_user_label, validate_vision_request_flow};
+    use crate::handler::vless_handler::CompiledVlessUsers;
     use crate::handler::vless_handler::protocol::XTLS_VISION_FLOW;
+
+    #[test]
+    fn unmatched_vision_user_errors_do_not_echo_the_user_id() {
+        let users = CompiledVlessUsers::default();
+        let user_id = [0x42; 16];
+        let user_id_hex: String =
+            user_id.iter().map(|byte| format!("{byte:02x}")).collect();
+
+        let error = find_matching_user_label(&users, &user_id, "vision-test")
+            .expect_err("unknown user must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "invalid VLESS user id");
+        assert!(!error.to_string().contains(&user_id_hex));
+
+        #[cfg(any(feature = "tls", feature = "reality"))]
+        {
+            let error = find_matching_vless_user(&users, &user_id, "vision-test")
+                .expect_err("unknown Vision user must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "invalid VLESS user id");
+            assert!(!error.to_string().contains(&user_id_hex));
+        }
+    }
 
     #[cfg(feature = "vless-reverse")]
     use tokio::io::{AsyncWriteExt, duplex};

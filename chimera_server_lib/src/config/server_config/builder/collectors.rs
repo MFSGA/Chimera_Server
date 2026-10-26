@@ -603,7 +603,7 @@ pub(super) fn collect_tuic_settings(
     }
 
     uuid::Uuid::parse_str(raw.uuid.trim()).map_err(|e| {
-        Error::InvalidConfig(format!("invalid tuic uuid {}: {e}", raw.uuid))
+        Error::InvalidConfig(format!("invalid tuic settings.uuid: {e}"))
     })?;
 
     Ok(TuicServerConfig {

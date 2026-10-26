@@ -1,18 +1,19 @@
 # GitHub Actions layout
 
-The repository uses five entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
+The repository uses six entry-point workflows and two shared local actions. Keep each workflow focused on one responsibility instead of copying setup and release logic between files.
 
 ## Workflows
 
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
-| `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
-| `auto-merge.yml` | Successful `CI` completion and Dependabot PR state/review updates | Auto-merges only same-repository Dependabot Cargo dependency PRs targeting `master`, after required gates pass |
+| `ci.yml` | `master` and `release-candidate-*` pushes, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
+| `auto-merge.yml` | Successful `CI` completion, Dependabot PR/review updates, merged Dependabot PRs | Auto-merges eligible Cargo and GitHub Actions dependency PRs after required checks pass, then updates other eligible dependency PR branches so CI reruns on the new `master` |
+| `xray-compatibility.yml` | Manual only | Runs a small real-client smoke suite against the checksum-verified pinned Xray binary |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
 
-Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag.
+Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag. The release preparation job checks out with `GITHUB_TOKEN` but sets `persist-credentials: false`, so that read-only credential cannot be reused by later Git commands. It pushes its temporary candidate branch with the repository `ADMIN_PAT` secret so the `push` event starts ordinary CI; `release.yml` waits for the unique successful `Required checks` job on that exact candidate SHA. The same repository-scoped secret is used by a separate, narrowly scoped Dependabot refresh step; its required permissions and restrictions are documented below. The final `master` and tag push still uses `GITHUB_TOKEN` and remains subject to branch protection.
 
 ## AI-assisted development governance
 
@@ -28,11 +29,11 @@ an autonomous coding or AI review GitHub Action has already been installed.
   AI feedback is additive and cannot replace format, Clippy, Windows/Linux tests,
   feature-matrix checks or release candidate validation.
 - The auto-merge workflow is limited to same-repository Dependabot Cargo
-  dependency PRs targeting `master`. It merges only after every required CI job
-  succeeds and GitHub reports all merge gates satisfied. Ordinary PRs, other
-  bots, GitHub Actions dependency updates under `.github/**`, and other L3
-  changes remain manual. Confirmed branch protections must be enabled for it
-  to activate; fork PRs are excluded, and labels do not grant authorization.
+  dependency PRs and GitHub Actions pin-only PRs targeting `master`. It merges
+  only after every required CI job succeeds and GitHub reports all remaining
+  merge gates satisfied. Other `.github/**` and L3 changes remain manual. `master` requires CI but does not require a
+  GitHub approval; repository review policy still applies to human-authored and
+  out-of-scope PRs. Fork PRs are excluded, and labels do not grant authorization.
 - AI review workflows must not run untrusted PR code with writable credentials
   or invoke privileged tooling on untrusted Issue/PR content.
 - Stable releases remain **manual** via `release.yml`. Do not attach release
@@ -65,19 +66,47 @@ required-checks stable aggregate over every required CI job
 
 Jobs run in parallel. A formatting failure should not hide a Windows compile failure, and one target failure should not cancel the other matrix entries.
 
-`auto-merge.yml` checks successful PR CI completions and Dependabot PR state/review events. The live PR must be authored by `dependabot[bot]`, come from this repository, target `master`, be open and ready for review. The changed files must be Cargo manifests or lockfiles only. Ordinary PRs and other bots are skipped without changing their merge state. Dependabot PRs touching `.github/**`, `docs/ai-*`, `ref/**`, `vendor/**`, release/install paths, `AGENTS.md`, `LESSONS.md`, `CODEOWNERS`, or any non-Cargo file stay manual. Events are serialized per PR. The workflow checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. It re-reads the PR, base, head and complete file list immediately before merging, and only proceeds when all of the following hold:
+## Xray compatibility smoke contract
+
+`xray-compatibility.yml` is a manual smoke workflow and is not a required check. Select `master`
+when dispatching it; a runtime check fails fast if another ref was selected. This check prevents
+accidental ref selection but is not a security boundary: GitHub runs the workflow definition from
+the selected ref. The job has read-only repository permissions, uses no secrets, and downloads Xray
+through the existing checksum-verifying `setup-pinned-xray` action. It then runs exact ignored
+real-client tests for VLESS over TCP, gRPC, and HTTPUpgrade against local TCP echo targets. The
+workflow records the client version and Xray source-reference commit and uploads each test log for
+30 days. A missing or unmatched test is treated as a failure rather than a successful empty run.
+
+The client binary version comes from `bench/.xray-version` (currently `v26.7.28`) and its checksum
+from `bench/.xray-linux-64.sha256`. This published client build is distinct from the checked-out
+Xray source reference (`ref/xray-core` v26.10.10, commit
+`701af60772cda123492f86e383e1fdba066614a9`); the workflow reports both and does not claim that the
+older client binary is the reference source build. This smoke suite does not certify TLS/REALITY,
+UDP, the full compatibility matrix, or Xray TUN/system-namespace behavior. Those checks still need
+their explicitly recorded client versions and prerequisites.
+
+Dependabot checks both Cargo and GitHub Actions dependencies daily. Updates are opened as separate PRs rather than grouped together, so independent updates can run CI in parallel. Repository administrators can also start a version-update check from **Insights → Dependency graph → Dependabot → Recent update jobs → Check for updates**.
+
+`auto-merge.yml` checks successful PR CI completions and Dependabot PR/review state events. The live PR must be authored by `dependabot[bot]`, come from this repository, target `master`, be open and ready for review. Eligible changes are either Cargo manifests/lockfiles only, or GitHub Actions workflow/local-action YAML files whose complete diff only replaces immutable `uses: owner/action[/path]@<40-character SHA>` references with a different SHA for the same action. The Actions exception does not permit changes to `run`, permissions, triggers, expressions, local action logic, or any other workflow content. Ordinary PRs and other bots are skipped without changing their merge state. Dependabot PRs touching other `.github/**` paths, `docs/ai-*`, `ref/**`, `vendor/**`, release/install paths, `AGENTS.md`, `LESSONS.md`, `CODEOWNERS`, or any other file stay manual. Merge events are serialized per PR. The workflow checks every expected CI job on the matching head SHA and never checks out pull-request code or consumes its artifacts. It re-reads the PR, base, head and complete file list immediately before merging, and only proceeds when all of the following hold:
 
 - The PR author is `dependabot[bot]`; it comes from this repository, targets `master`, is open, is not a draft, and its head has not changed since the successful CI run.
-- The complete changed-file list is available and every changed path is a `Cargo.toml` or `Cargo.lock`; this excludes `.github/**` workflow dependency updates and other L3 paths.
+- The complete changed-file list is available and matches one allowed scope: Cargo manifests/lockfiles only, or immutable GitHub Actions reference replacements only. Other `.github/**` workflow edits and L3 paths are excluded.
+- Required CI does not dispatch manual-only workflows such as release, compatibility-smoke, or performance workflows; an Actions pin update there receives the standard required PR CI, not a run of that manually dispatched workflow.
+- The workflow does not classify dependency update versions; major Cargo or Actions updates are included if they satisfy the same diff, CI, and merge gates.
 - Every expected CI job succeeded on that exact head SHA and run attempt.
-- `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` is set. An administrator uses that variable to confirm that `CI / Required checks`, required approvals and stale-approval dismissal apply to the workflow token, with no merge queue configured. The configured administrator exception may remain; the Actions token must not be granted a bypass.
-- GitHub reports the PR as clean and mergeable; the workflow immediately uses the pull-request merge API pinned to the verified head SHA. If gates are still pending, it skips and retries on the next CI completion or review event. It does not create a persistent GitHub Auto-merge request. The job needs `contents: write` for the merge API call and executes only this trusted script from the default branch.
+- If the Jobs API has not exposed all expected jobs yet, the script re-reads it up to five times, two seconds apart. It fails closed with the remaining job names if the list is still incomplete; completed failed or duplicate jobs are not retried.
+- `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` is set. An administrator uses that variable to confirm that `CI / Required checks` still applies to the workflow token, no approval count is required on `master`, and no merge queue is configured. The configured administrator exception may remain; the Actions token must not be granted a bypass.
+- GitHub reports the PR as clean and mergeable; the workflow immediately uses the pull-request merge API pinned to the verified head SHA. If gates are still pending, it skips and retries on the next CI completion or PR event. It does not create a persistent GitHub Auto-merge request. The job uses `actions: read`, `contents: write`, and `pull-requests: write`, and executes only this trusted script from the default branch.
+
+After an eligible Cargo or GitHub Actions Dependabot PR merges, the `workflow_run` refresh job waits for the merge job to finish, then checks the PR's live merged state and updates each remaining eligible Dependabot PR that is behind `master`. This handles the merge and refresh in the same workflow run; it does not rely on a `pull_request.closed` event that a `GITHUB_TOKEN` merge would suppress. The refresh step uses `ADMIN_PAT` only for the branch-update API so GitHub emits a normal `synchronize` event and starts CI on each new PR head. The job never merges those PRs; each must pass full required CI and merge checks on its updated head first. GitHub's strict required-check rule also blocks a PR that has not caught up with `master`.
+
+The refresh job also handles a Dependabot PR merged manually through the normal pull-request event. There is no manual refresh entry point in this privileged workflow; after a missed refresh, a maintainer can update each eligible branch from its GitHub PR page or wait for the next successful eligible merge to refresh them. The script fetches the merged PR from GitHub and verifies it is a same-repository Dependabot PR targeting `master` with an allowed dependency-only diff before changing any other branch. The repository `ADMIN_PAT` must have `Contents: write` for release-candidate pushes and `Pull requests: write` for branch refresh; it must have no administration or bypass permission. The secret is exposed only to the narrowly scoped push and refresh steps. A missing or insufficient token permission makes the refresh job fail visibly without merging any additional PR.
 
 The synchronous merge API does not support merge queues. The final live PR read and head-SHA pin also cannot atomically pin the base branch; if someone retargets a PR in the small interval before the merge request, GitHub may evaluate the then-current base. The workflow compares the base SHA and rechecks the file list immediately before merging to narrow this race.
 
-The workflow skips when a prerequisite is absent. GitHub Actions `GITHUB_TOKEN` cannot read repository administration settings, so the workflow does not inspect branch protection or rulesets itself; setting the confirmation variable without those protections would allow an unsafe immediate merge. An administrator must verify the protections and set the confirmation variable before this automation can activate. GitHub's repository Auto-merge setting is not needed because the workflow uses only the synchronous merge API. The current read-only account could not verify those administrator settings through the API.
+The workflow skips when a prerequisite is absent. GitHub Actions `GITHUB_TOKEN` cannot read repository administration settings, so the workflow does not inspect branch protection or rulesets itself; setting the confirmation variable without required CI would allow an unsafe immediate merge. An administrator must verify the protections and set the confirmation variable before this automation can activate. GitHub's repository Auto-merge setting is not needed because the workflow uses only the synchronous merge API. The `master` protection was checked through the repository API; it keeps strict `Required checks` and has no approval requirement after this change.
 
-Required CI, up-to-date branch and review protections remain enforced by GitHub when the workflow requests or completes an eligible Dependabot merge. All human-authored PRs and Dependabot PRs touching protected L3 paths remain manual-merge decisions. The administrator exception permits administrators to bypass those protections for their own actions; the workflow token is not an administrator and must not be added as a bypass actor.
+Required CI and up-to-date branch protections remain enforced by GitHub when the workflow requests or completes an eligible Dependabot merge. GitHub no longer enforces an approval count for any PR on `master`; repository policy still expects human-authored PRs and Dependabot PRs outside the two narrow auto-merge scopes to be reviewed and merged manually. The administrator exception permits administrators to bypass the remaining protections for their own actions; the workflow token is not an administrator and must not be added as a bypass actor.
 
 Build/reference rules:
 
@@ -100,19 +129,17 @@ read current UTC date
             |
  create temporary candidate commit/branch
             |
-        +---+----------------+------------------+
-        |                    |                  |
- Linux/Windows tests   feature matrix    repository release gates
-        |                    |                  |
-        +-----------+--------+------------------+
-                    |
-          +---------+---------+
-          |                   |
-     Linux artifacts      Windows artifacts
-          |                   |
-          +---------+---------+
-                    |
-      verify artifacts + checksums
+        +---------------------+-----------------------------+
+        |                                                   |
+        v                                                   v
+ platform preflight + feature matrix + release gates   push candidate branch; CI starts
+        |                                                   |
+        v                                                   v
+ Linux + Windows artifacts                         Required checks success
+        |                                                   |
+        +----------------------------+----------------------+
+                                     |
+                         verify artifacts + checksums
                     |
  re-check that origin/master did not move
                     |
@@ -126,12 +153,23 @@ read current UTC date
 The release candidate is a direct child of the `master` commit captured when the workflow starts. It is first pushed to a temporary `release-candidate-*` branch so all operating-system tests and release artifacts can validate the exact version-bump commit without modifying `master`. If validation fails, `master` and stable tags remain unchanged and cleanup removes the temporary branch.
 
 The candidate release also runs the ordinary CI feature compatibility matrix, release-version
-helper check, and locked builds on that exact commit. Its platform tests and release artifacts cover
-the same Windows, Linux GNU, and Linux musl targets as normal CI before the tag can be published.
+helper check, and locked builds on that exact commit. `ci.yml` listens for pushes to
+`release-candidate-*`; the release preparation job uses the `ADMIN_PAT` repository secret only
+for that candidate branch push, because a push made with `GITHUB_TOKEN` does not trigger another
+workflow. Its checkout must keep `persist-credentials: false` so the read-only checkout token is
+not retained as an HTTP auth header that could override the candidate-push credential. The candidate
+CI job polls the Actions API and requires the unique `push` run for the
+exact branch and full candidate SHA to complete successfully with one successful `Required checks`
+job. This event supplies the check context GitHub accepts for protected branch updates; a
+`workflow_dispatch` run is not a substitute. Keep the token repository-scoped with Contents write
+and no administration/bypass permission. Its platform tests and release artifacts cover the same
+Windows, Linux GNU, and Linux musl targets as normal CI before the tag can be published. If the
+push, required check, or API verification fails or times out, publication is blocked and the
+existing cleanup job removes the temporary candidate branch.
 
 Before publication, the workflow verifies that remote `master` is still the original base commit. It then uses one atomic Git push for both the fast-forward of `master` and creation of the annotated stable tag. A concurrent change to `master` therefore fails closed and requires a fresh release dispatch.
 
-Repository permissions default to `contents: read`. Only the prepare, publish, and cleanup jobs receive `contents: write`, and each uses it for a narrowly defined release mutation. No stable tag or `master` version bump may become visible until both platform artifact jobs have succeeded and all expected checksums are present and verified.
+Repository workflow permissions default to `contents: read`. The prepare job's `GITHUB_TOKEN` is read-only; `ADMIN_PAT` is exposed only to the candidate-push and Dependabot branch-refresh steps. Limit it to this repository, the required Contents and Pull requests write permissions, and no administration or bypass access. Candidate CI only reads Actions run data. The publish and cleanup jobs use `GITHUB_TOKEN` with `contents: write` for their narrowly defined release mutations. No stable tag or `master` version bump may become visible until candidate `Required checks`, both platform artifact jobs, and all expected checksum verifications have succeeded.
 
 Release pages use the `Chimera Server vYY.M.D` title and a concise English release highlight,
 platform downloads, compatibility link, and full changelog comparison. Release

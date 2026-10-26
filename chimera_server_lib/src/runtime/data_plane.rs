@@ -8,14 +8,14 @@ use std::{
 
 use tokio::sync::broadcast;
 
-#[cfg(feature = "vless")]
-use crate::config::server_config::VlessUser;
 #[cfg(feature = "hysteria")]
 use crate::handler::hysteria2::connection::HysteriaUserStore;
 #[cfg(feature = "shadowsocks")]
 use crate::handler::shadowsocks::ShadowsocksUserStore;
 #[cfg(feature = "trojan")]
 use crate::handler::trojan::TrojanUserStore;
+#[cfg(feature = "vless")]
+use crate::handler::vless_handler::CompiledVlessUsers;
 #[cfg(feature = "vmess")]
 use crate::handler::vmess::vmess_handler::VmessUserStore;
 #[cfg(feature = "wireguard")]
@@ -59,7 +59,10 @@ impl InboundHandshakeRuntime {
     }
 
     #[cfg(feature = "vless")]
-    pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
+    pub(crate) fn vless_users_snapshot(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<CompiledVlessUsers>> {
         self.inbound_manager.vless_users_snapshot(tag)
     }
 
@@ -460,7 +463,10 @@ impl DataPlaneRuntime {
     }
 
     #[cfg(feature = "vless")]
-    pub(crate) fn vless_users_snapshot(&self, tag: &str) -> Option<Vec<VlessUser>> {
+    pub(crate) fn vless_users_snapshot(
+        &self,
+        tag: &str,
+    ) -> Option<Arc<CompiledVlessUsers>> {
         self.0.inbound_manager.vless_users_snapshot(tag)
     }
 
