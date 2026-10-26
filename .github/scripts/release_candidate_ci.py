@@ -60,18 +60,12 @@ class GitHubApi:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             raise CandidateCiError("GitHub Actions API request failed") from None
 
-    def dispatch_ci(self, candidate_branch: str) -> None:
-        self.request(
-            f"/actions/workflows/ci.yml/dispatches",
-            {"ref": candidate_branch},
-        )
-
     def list_ci_runs(self, candidate_sha: str, candidate_branch: str) -> list[Any]:
         query = urllib.parse.urlencode(
             {
                 "head_sha": candidate_sha,
                 "branch": candidate_branch,
-                "event": "workflow_dispatch",
+                "event": "push",
                 "per_page": 100,
             }
         )
@@ -106,7 +100,7 @@ def is_candidate_ci_run(
         isinstance(run, dict)
         and run.get("name") == "CI"
         and run.get("path") == CI_WORKFLOW_PATH
-        and run.get("event") == "workflow_dispatch"
+        and run.get("event") == "push"
         and run.get("head_sha") == candidate_sha
         and run.get("head_branch") == candidate_branch
     )
@@ -123,29 +117,16 @@ def wait_for_candidate_ci(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     if not candidate_branch.startswith("release-candidate-"):
-        raise CandidateCiError("refusing to dispatch CI outside a release-candidate branch")
+        raise CandidateCiError("refusing to wait outside a release-candidate branch")
     if not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
         raise CandidateCiError("candidate SHA must be a full lowercase Git commit SHA")
     if timeout_seconds <= 0 or poll_interval_seconds <= 0:
         raise ValueError("CI wait timeout and polling interval must be positive")
 
-    previous_runs = [
-        run
-        for run in api.list_ci_runs(candidate_sha, candidate_branch)
-        if is_candidate_ci_run(run, candidate_sha, candidate_branch)
-    ]
-    previous_run_ids: set[int] = set()
-    for run in previous_runs:
-        run_id = run.get("id")
-        if not isinstance(run_id, int) or isinstance(run_id, bool):
-            raise CandidateCiError("existing candidate CI run has an invalid ID")
-        previous_run_ids.add(run_id)
-
-    api.dispatch_ci(candidate_branch)
     deadline = monotonic() + timeout_seconds
     run_id: int | None = None
     last_status: str | None = None
-    print(f"Dispatched CI for release candidate {candidate_sha}.")
+    print(f"Waiting for push-triggered CI on release candidate {candidate_sha}.")
 
     while True:
         if run_id is None:
@@ -153,7 +134,6 @@ def wait_for_candidate_ci(
                 run
                 for run in api.list_ci_runs(candidate_sha, candidate_branch)
                 if is_candidate_ci_run(run, candidate_sha, candidate_branch)
-                and run.get("id") not in previous_run_ids
             ]
             if len(matching_runs) > 1:
                 raise CandidateCiError(
@@ -236,12 +216,13 @@ def self_test() -> None:
         status: str = "completed",
         conclusion: str = "success",
         sha: str = candidate_sha,
+        event: str = "push",
     ) -> dict[str, Any]:
         return {
             "id": run_id,
             "name": "CI",
             "path": CI_WORKFLOW_PATH,
-            "event": "workflow_dispatch",
+            "event": event,
             "head_sha": sha,
             "head_branch": candidate_branch,
             "run_attempt": 1,
@@ -266,12 +247,8 @@ def self_test() -> None:
             self.run_responses = list(runs)
             self.run = run
             self.jobs = jobs
-            self.dispatched_branches: list[str] = []
             self.list_calls = 0
             self.job_calls = 0
-
-        def dispatch_ci(self, branch: str) -> None:
-            self.dispatched_branches.append(branch)
 
         def list_ci_runs(self, sha: str, branch: str) -> list[dict[str, Any]]:
             assert sha == candidate_sha
@@ -289,7 +266,10 @@ def self_test() -> None:
             return self.jobs
 
     delays: list[float] = []
-    eventual_api = ApiStub([[], [], [workflow_run()]], workflow_run(), [required_job])
+    old_dispatch = workflow_run(event="workflow_dispatch")
+    eventual_api = ApiStub(
+        [[old_dispatch], [], [workflow_run()]], workflow_run(), [required_job]
+    )
     assert wait_for_candidate_ci(
         eventual_api,
         candidate_branch,
@@ -299,29 +279,27 @@ def self_test() -> None:
         sleep=delays.append,
         monotonic=lambda: 0,
     ) == 123
-    assert eventual_api.dispatched_branches == [candidate_branch]
     assert eventual_api.list_calls == 3
     assert eventual_api.job_calls == 1
-    assert delays == [2]
+    assert delays == [2, 2]
 
-    rerun_api = ApiStub(
-        [
-            [workflow_run(run_id=122)],
-            [workflow_run(run_id=122), workflow_run()],
-        ],
-        workflow_run(),
-        [required_job],
+    duplicate_runs_api = ApiStub(
+        [[workflow_run(run_id=122), workflow_run()]], workflow_run(), [required_job]
     )
-    assert wait_for_candidate_ci(
-        rerun_api,
-        candidate_branch,
-        candidate_sha,
-        timeout_seconds=10,
-        poll_interval_seconds=2,
-        sleep=lambda _: None,
-        monotonic=lambda: 0,
-    ) == 123
-    assert rerun_api.list_calls == 2
+    try:
+        wait_for_candidate_ci(
+            duplicate_runs_api,
+            candidate_branch,
+            candidate_sha,
+            timeout_seconds=10,
+            poll_interval_seconds=2,
+            sleep=lambda _: None,
+            monotonic=lambda: 0,
+        )
+    except CandidateCiError as error:
+        assert "multiple CI workflow runs" in str(error)
+    else:
+        raise AssertionError("duplicate candidate CI runs were accepted")
 
     job_without_attempt_metadata = {
         "name": REQUIRED_CHECK_NAME,
@@ -434,7 +412,7 @@ def self_test() -> None:
     except CandidateCiError as error:
         assert "outside a release-candidate branch" in str(error)
     else:
-        raise AssertionError("CI dispatch outside a candidate branch was accepted")
+        raise AssertionError("CI check outside a candidate branch was accepted")
 
     print("Release candidate CI gate self-test passed.")
 

@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
     outputs:
       base_commit: ${{ steps.prepare.outputs.base_commit }}
       candidate_commit: ${{ steps.prepare.outputs.candidate_commit }}
@@ -119,7 +119,6 @@ jobs:
 
           candidate_commit=$(git rev-parse HEAD)
           candidate_branch="release-candidate-${tag}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          git push origin "HEAD:refs/heads/$candidate_branch"
 
           echo "base_commit=$base_commit" >> "$GITHUB_OUTPUT"
           echo "candidate_commit=$candidate_commit" >> "$GITHUB_OUTPUT"
@@ -127,20 +126,57 @@ jobs:
           echo "release_goal=$RELEASE_GOAL" >> "$GITHUB_OUTPUT"
           echo "Prepared $tag from $base_commit as $candidate_commit"
 
+      - name: Push release candidate to trigger required CI
+        env:
+          RELEASE_CANDIDATE_TOKEN: ${{ secrets.ADMIN_PAT }}
+          CANDIDATE_BRANCH: ${{ steps.prepare.outputs.candidate_branch }}
+          CANDIDATE_SHA: ${{ steps.prepare.outputs.candidate_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_BRANCH" == release-candidate-* ]] || {
+            echo "refusing to push outside a release-candidate branch" >&2
+            exit 1
+          }
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "candidate SHA is invalid" >&2
+            exit 1
+          }
+          [[ -n "$RELEASE_CANDIDATE_TOKEN" ]] || {
+            echo "the ADMIN_PAT Actions secret is required to trigger push CI" >&2
+            exit 1
+          }
+
+          # Stop using the read-only checkout token for this push; the token below is
+          # scoped to this single candidate-branch operation.
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          umask 077
+          askpass=$(mktemp)
+          trap 'rm -f "$askpass"' EXIT
+          cat > "$askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "x-access-token" ;;
+            *) printf '%s\n' "$RELEASE_CANDIDATE_TOKEN" ;;
+          esac
+          ASKPASS
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git push origin "$CANDIDATE_SHA:refs/heads/$CANDIDATE_BRANCH"
+
   candidate-ci:
     name: Candidate required CI
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 50
     permissions:
-      actions: write
+      actions: read
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.candidate_commit }}
 
-      - name: Dispatch and verify CI on the release candidate
+      - name: Verify push-triggered CI on the release candidate
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_BRANCH: ${{ needs.prepare.outputs.candidate_branch }}
