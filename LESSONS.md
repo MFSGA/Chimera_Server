@@ -13,6 +13,7 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
+| LESSON-20261026-005 | 2026-10-26 | Workflow | 非必需检查失败阻止必需 CI 全绿的依赖 PR 自动合并 | Fix committed locally; remote verification pending | [PR #57 CI run 40345667598](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667598), [Proxy throughput run 40345667471](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667471), [auto-merge run 40347223455](https://github.com/MFSGA/Chimera_Server/actions/runs/40347223455) |
 | LESSON-20261026-004 | 2026-10-26 | Workflow | 合法的 `- uses: owner/action@SHA` 行未通过 Actions 依赖范围检查 | Fix committed locally; remote verification pending | [PR #57 required CI run 40338987847](https://github.com/MFSGA/Chimera_Server/actions/runs/40338987847), [auto-merge skipped run 40340988665](https://github.com/MFSGA/Chimera_Server/actions/runs/40340988665) |
 | LESSON-20261026-003 | 2026-10-26 | Workflow | Dependabot PR 合并后，其余 PR 分支没有刷新 | Fix committed locally; remote verification pending | [Merged PR #56](https://github.com/MFSGA/Chimera_Server/pull/56), [refresh job skipped on workflow_run #40319763484](https://github.com/MFSGA/Chimera_Server/actions/runs/40319763484), [open PR #55](https://github.com/MFSGA/Chimera_Server/pull/55), [open PR #57](https://github.com/MFSGA/Chimera_Server/pull/57) |
 | LESSON-20261026-001 | 2026-10-26 | Release/Workflow | 发布候选没有生成 master 分支保护要求的 Required checks | Push path verified; `ADMIN_PAT` scope pending | [Failed release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545), [candidate CI run 40275048242](https://github.com/MFSGA/Chimera_Server/actions/runs/40275048242) |
@@ -43,6 +44,21 @@
 ```
 
 ## 已确认经验
+
+### LESSON-20261026-005: 非必需检查失败阻止必需 CI 全绿的依赖 PR 自动合并
+- 发现日期（UTC）：2026-10-26
+- 分类：Workflow
+- 严重度：Medium
+- 状态：本地修复；远端重新验证待完成
+- 证据：PR #57 head `84562bc12f18325347700d5e74b357b287f73a78` 的 [CI run 40345667598](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667598) 所有 job 均通过；非必需的 [Proxy throughput run 40345667471](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667471) 在 VLESS 数据传输时因 `ConnectionResetError` 失败。GitHub 将 PR 标记为 `UNSTABLE`；[auto-merge run 40347223455](https://github.com/MFSGA/Chimera_Server/actions/runs/40347223455) 因此跳过。读取 `master` 分支保护设置确认唯一 required status check 是 CI 的 `Required checks`。
+- 影响范围：全部符合范围且必需 CI 全绿、但存在失败的非必需检查的 Dependabot PR。
+- 观察到的失败：有效 Required checks 成功后，符合范围的 #57 仍未合并。
+- 根本原因：合并预检只接受 `mergeable_state == clean`；GitHub 的 `UNSTABLE` 状态包含失败的非必需 check，即使 PR 无冲突且唯一必需状态检查已成功。
+- 修复措施：对无冲突的 `unstable` PR 也使用固定 head SHA 调用 GitHub 同步合并 API；由 API 执行当前分支保护检查。HTTP 405/409 按未就绪安全跳过，不绕过保护。
+- 预防措施：策略自测覆盖 clean 合并、mergeable unstable 合并、存在冲突时不调用 API，以及 GitHub 拒绝合并时安全跳过。
+- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check`；最终修复后的远端 CI 与 #57 合并结果待验证。
+- 重复事件：与 LESSON-20261026-004 的 YAML 列表项解析故障独立。
+- 是否提议升级为强制规则：否；通过固定 SHA 的 GitHub 合并 API 和显式拒绝测试维持保护边界。
 
 ### LESSON-20261026-004: 合法的 Actions 列表项未通过依赖范围检查
 - 发现日期（UTC）：2026-10-26
