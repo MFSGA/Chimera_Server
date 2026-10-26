@@ -8,12 +8,6 @@ on:
     types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft, closed]
   pull_request_review:
     types: [dismissed, edited, submitted]
-  workflow_dispatch:
-    inputs:
-      merged_pr_number:
-        description: Refresh eligible Dependabot PR branches after this merged PR
-        required: true
-        type: number
 
 permissions:
   contents: read
@@ -74,9 +68,7 @@ jobs:
         github.event.workflow_run.path == '.github/workflows/ci.yml' &&
         github.event.workflow_run.event == 'pull_request' &&
         github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_repository.full_name == github.repository) ||
-        (github.event_name == 'workflow_dispatch' &&
-        inputs.merged_pr_number > 0)
+        github.event.workflow_run.head_repository.full_name == github.repository)
       )
     runs-on: ubuntu-latest
     timeout-minutes: 5

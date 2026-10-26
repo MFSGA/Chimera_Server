@@ -52,11 +52,11 @@
 - 影响范围：一个依赖 PR 合并后，其他同批 Dependabot PR 保持旧基线，不能按新主分支重新运行 required CI。
 - 观察到的失败：PR #55 与 #57 的原始 required CI 成功，但它们仍落后于最新 `master`；后续 merge preflight 因基线过期无法继续。
 - 根本原因：刷新逻辑仅依赖 PR 关闭事件。由自动合并工作流使用 `GITHUB_TOKEN` 合并时，GitHub 不会再触发依赖的关闭事件工作流，因此没有分支刷新请求。
-- 修复措施：刷新 job 在成功的 CI `workflow_run` 中等待合并 job 完成，然后从 GitHub 读取相关 PR 的最新状态；确认它确已合并且属于允许的 Dependabot 依赖范围后，用 `ADMIN_PAT` 更新落后 PR 分支。另提供人工补刷入口；该入口同样验证已合并 PR 和改动范围。实际分支更新需要仓库 PAT 拥有 `Pull requests: write`，自动合并仍使用受保护的 `GITHUB_TOKEN`。
-- 预防措施：测试关闭事件、成功 CI 完成事件及人工补刷事件的来源校验；让更新分支使用能触发正常 `synchronize` CI 的 token；要求更新 API 的目标 head SHA 与预读值匹配。
+- 修复措施：刷新 job 在成功的 CI `workflow_run` 中等待合并 job 完成，然后从 GitHub 读取相关 PR 的最新状态；确认它确已合并且属于允许的 Dependabot 依赖范围后，用 `ADMIN_PAT` 更新落后 PR 分支。人工合并仍由正常的 pull-request closed 事件处理；特权刷新工作流不提供手动 dispatch 入口。实际分支更新需要仓库 PAT 拥有 `Pull requests: write`，自动合并仍使用受保护的 `GITHUB_TOKEN`。
+- 预防措施：测试关闭事件和成功 CI 完成事件的来源校验；拒绝其他事件作为刷新来源；让更新分支使用能触发正常 `synchronize` CI 的 token；要求更新 API 的目标 head SHA 与预读值匹配。
 - 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`/tmp/chimera-actionlint/actionlint .github/workflows/auto-merge.yml`、`git diff --check` 均通过。提交推送后的真实 branch update、PAT 权限以及新 PR head 上的 CI 尚待验证。
 - 重复事件：无已知关联事件。
-- 是否提议升级为强制规则：否；这是现有自动化触发链路缺陷，修复已包含受限人工恢复入口。
+- 是否提议升级为强制规则：否；这是现有自动化触发链路缺陷，修复由默认分支上的受信 workflow event 驱动。
 
 ### LESSON-20261026-001: 发布候选没有生成 master 分支保护要求的 Required checks
 - 发现日期（UTC）：2026-10-26

@@ -394,10 +394,6 @@ def merged_pr_number_from_event(event_name: str, event: dict[str, Any]) -> int:
         if len(pull_requests) != 1:
             raise SkipAutomation("the CI run has no unique associated pull request")
         number = pull_requests[0].get("number")
-    elif event_name == "workflow_dispatch":
-        number = (event.get("inputs") or {}).get("merged_pr_number")
-        if isinstance(number, str) and number.isdecimal():
-            number = int(number)
     else:
         raise SkipAutomation("this workflow event cannot refresh Dependabot branches")
 
@@ -863,14 +859,10 @@ def self_test() -> None:
             }
         },
     ) == 43
-    assert merged_pr_number_from_event(
-        "workflow_dispatch", {"inputs": {"merged_pr_number": "44"}}
-    ) == 44
     for invalid_refresh_event in (
         ("pull_request_target", {"action": "closed", "pull_request": {"merged": False}}),
         ("workflow_run", {"workflow_run": {"event": "push", "pull_requests": []}}),
-        ("workflow_dispatch", {"inputs": {"merged_pr_number": "not-a-number"}}),
-        ("workflow_dispatch", {"inputs": {"merged_pr_number": 0}}),
+        ("workflow_dispatch", {"inputs": {"merged_pr_number": "42"}}),
     ):
         try:
             merged_pr_number_from_event(*invalid_refresh_event)
