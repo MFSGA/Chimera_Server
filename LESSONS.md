@@ -13,6 +13,7 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
+| LESSON-20261026-001 | 2026-10-26 | Release/Workflow | 发布候选没有生成 master 分支保护要求的 Required checks | Mitigated locally; remote verification pending | [Failed release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545) |
 | LESSON-20261023-001 | 2026-10-23 | Workflow | 自动合并首次预检未重试暂时不完整的 CI job 列表 | Verified | [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938), [auto-merge run 39917597051, attempts 1–2](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051), [merged PR #31](https://github.com/MFSGA/Chimera_Server/pull/31), [fix CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) |
 | LESSON-20261017-001 | 2026-10-17 | Test/Workflow | Xray smoke test 依赖被忽略的本地证书 | Verified | [Failed run 39077494361](https://github.com/MFSGA/Chimera_Server/actions/runs/39077494361), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
 | LESSON-20261017-002 | 2026-10-17 | Test/Workflow | Xray smoke 的 loopback echo 目标被 Freedom 私网默认规则拒绝 | Verified | [Local reproduction log](/tmp/chimera-xray-client-vless-tcp-none-149849-1792278770553/chimera.stderr.log), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
@@ -39,6 +40,21 @@
 ```
 
 ## 已确认经验
+
+### LESSON-20261026-001: 发布候选没有生成 master 分支保护要求的 Required checks
+- 发现日期（UTC）：2026-10-26
+- 分类：Release / Workflow
+- 严重度：High
+- 状态：Mitigated locally; remote verification pending
+- 证据：[失败的 Build and Release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545) 中，候选 SHA `81514397e5a85d1f8084c8d16d8dcb597680b885` 的平台预检、功能矩阵、release gates 和制品作业通过；原子更新 `master` 与标签时，GitHub 因 required status check `Required checks` 为 expected 而拒绝推送。该候选 SHA 的检查列表没有 CI run；基线 SHA `38359faa364215b3b67d35f8c59f1137ab53d8b0` 有成功的 `Required checks`。当时的 `ci.yml` 只在 `master` push、面向 `master` 的 PR 和手动 dispatch 时触发。
+- 影响范围：稳定发布；候选版本的所有发布作业可通过，但 `master` 与标签的原子推送因严格分支保护失败。
+- 观察到的失败：发布 run 的其他验证和构建步骤成功；最终 Git push 失败，且原子操作未留下 `master` 版本更新或稳定标签。
+- 根本原因：发布准备 job 用 `GITHUB_TOKEN` 将临时 release candidate 分支推送到远端。由 `GITHUB_TOKEN` 触发的普通 `push` 不会启动新的 Actions workflow，因此候选提交没有 branch protection 所需的 `Required checks` 检查上下文。发布 workflow 自己的其他成功 job 不能替代该受保护检查。
+- 修复措施：新增候选 CI 验证脚本；release workflow 用有界等待显式 dispatch 普通 CI 到候选分支，校验 workflow、事件、分支和完整候选 SHA，并要求该次 CI run 的 `Required checks` 汇总 job 唯一且成功后才允许 `Publish`。没有放宽分支保护或跳过 required check。
+- 预防措施：CI 加入脚本模拟自测，覆盖迟到 run、同一候选分支上的历史 run、失败 CI、缺失/重复 required job、错误 SHA 和非候选分支；发布流程文档说明显式 dispatch 及严格门禁。
+- 回归验证：`python3 .github/scripts/release_candidate_ci.py --self-test`、`python3 -m py_compile .github/scripts/release_candidate_ci.py`、`python3 .github/scripts/release_version.py --self-test`、`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`git diff --check` 均通过。`actionlint` 不在当前环境中，尚未执行；当前尚未重跑真实 release dispatch，因此还没有远端证据证明 GitHub 分支保护已接受候选检查。
+- 重复事件：无已知关联事件。
+- 是否提议升级为强制规则：否；现有保护规则保持不变，补齐 candidate SHA 的 required CI 即可。
 
 ### LESSON-20261023-001: 自动合并预检没有重试暂时不完整的 CI job 列表
 - 发现日期（UTC）：2026-10-23

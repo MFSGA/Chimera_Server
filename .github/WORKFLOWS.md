@@ -6,14 +6,14 @@ The repository uses six entry-point workflows and two shared local actions. Keep
 
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
-| `ci.yml` | `master` push, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
+| `ci.yml` | `master` push, pull request, manual; release-candidate dispatch from `release.yml` | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
 | `auto-merge.yml` | Successful `CI` completion and Dependabot PR/review state updates | Auto-merges only same-repository Dependabot Cargo dependency PRs targeting `master`, after required CI and other merge gates pass |
 | `xray-compatibility.yml` | Manual only | Runs a small real-client smoke suite against the checksum-verified pinned Xray binary |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
 
-Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag.
+Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag. Since candidate branches are pushed with `GITHUB_TOKEN` and that push does not start another workflow, `release.yml` explicitly dispatches `ci.yml` on the candidate branch and waits for the unique successful `Required checks` job on the exact candidate SHA.
 
 ## AI-assisted development governance
 
@@ -123,19 +123,17 @@ read current UTC date
             |
  create temporary candidate commit/branch
             |
-        +---+----------------+------------------+
-        |                    |                  |
- Linux/Windows tests   feature matrix    repository release gates
-        |                    |                  |
-        +-----------+--------+------------------+
-                    |
-          +---------+---------+
-          |                   |
-     Linux artifacts      Windows artifacts
-          |                   |
-          +---------+---------+
-                    |
-      verify artifacts + checksums
+        +---------------------+-----------------------------+
+        |                                                   |
+        v                                                   v
+ platform preflight + feature matrix + release gates   dispatch CI at candidate SHA
+        |                                                   |
+        v                                                   v
+ Linux + Windows artifacts                         Required checks success
+        |                                                   |
+        +----------------------------+----------------------+
+                                     |
+                         verify artifacts + checksums
                     |
  re-check that origin/master did not move
                     |
@@ -149,8 +147,13 @@ read current UTC date
 The release candidate is a direct child of the `master` commit captured when the workflow starts. It is first pushed to a temporary `release-candidate-*` branch so all operating-system tests and release artifacts can validate the exact version-bump commit without modifying `master`. If validation fails, `master` and stable tags remain unchanged and cleanup removes the temporary branch.
 
 The candidate release also runs the ordinary CI feature compatibility matrix, release-version
-helper check, and locked builds on that exact commit. Its platform tests and release artifacts cover
-the same Windows, Linux GNU, and Linux musl targets as normal CI before the tag can be published.
+helper check, and locked builds on that exact commit. The release workflow explicitly dispatches
+`ci.yml` on the candidate branch and waits for the exact candidate SHA's unique successful
+`Required checks` job. This check is required because the candidate branch push uses `GITHUB_TOKEN`,
+which does not trigger a follow-on `push` workflow. Its platform tests and release artifacts cover the
+same Windows, Linux GNU, and Linux musl targets as normal CI before the tag can be published. If the
+workflow dispatch, required check, or API verification fails or times out, publication is blocked
+and the existing cleanup job removes the temporary candidate branch.
 
 Before publication, the workflow verifies that remote `master` is still the original base commit. It then uses one atomic Git push for both the fast-forward of `master` and creation of the annotated stable tag. A concurrent change to `master` therefore fails closed and requires a fresh release dispatch.
 

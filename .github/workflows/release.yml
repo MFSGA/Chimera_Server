@@ -127,6 +127,26 @@ jobs:
           echo "release_goal=$RELEASE_GOAL" >> "$GITHUB_OUTPUT"
           echo "Prepared $tag from $base_commit as $candidate_commit"
 
+  candidate-ci:
+    name: Candidate required CI
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_commit }}
+
+      - name: Dispatch and verify CI on the release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_BRANCH: ${{ needs.prepare.outputs.candidate_branch }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_commit }}
+        run: python3 .github/scripts/release_candidate_ci.py
+
   preflight:
     name: Preflight (${{ matrix.os }})
     needs: prepare
@@ -339,7 +359,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [prepare, linux-artifacts, windows-artifacts]
+    needs: [prepare, candidate-ci, linux-artifacts, windows-artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -495,7 +515,7 @@ jobs:
   cleanup:
     name: Cleanup candidate branch
     if: always() && needs.prepare.result == 'success'
-    needs: [prepare, preflight, feature-preflight, gates, linux-artifacts, windows-artifacts, publish]
+    needs: [prepare, candidate-ci, preflight, feature-preflight, gates, linux-artifacts, windows-artifacts, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
