@@ -7,13 +7,13 @@ The repository uses six entry-point workflows and two shared local actions. Keep
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
 | `ci.yml` | `master` and `release-candidate-*` pushes, pull request, manual | Fast correctness gate: format, clippy, cross-platform tests, release-target builds |
-| `auto-merge.yml` | Successful `CI` completion, Dependabot PR/review updates, and merged Dependabot PRs | Auto-merges eligible Cargo and GitHub Actions dependency PRs after required checks pass, then updates other eligible dependency PR branches so CI reruns on the new `master` |
+| `auto-merge.yml` | Successful `CI` completion, Dependabot PR/review updates, merged Dependabot PRs | Auto-merges eligible Cargo and GitHub Actions dependency PRs after required checks pass, then updates other eligible dependency PR branches so CI reruns on the new `master` |
 | `xray-compatibility.yml` | Manual only | Runs a small real-client smoke suite against the checksum-verified pinned Xray binary |
 | `proxy-throughput.yml` | Relevant pull requests, manual | End-to-end proxy throughput benchmark against the pinned Xray binary |
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
 
-Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag. The release preparation job checks out with `GITHUB_TOKEN` but sets `persist-credentials: false`, so that read-only credential cannot be reused by later Git commands. It pushes its temporary candidate branch with the repository `ADMIN_PAT` secret so the `push` event starts ordinary CI; `release.yml` waits for the unique successful `Required checks` job on that exact candidate SHA. Keep this secret repository-scoped and limited to Contents write; the workflow uses it only for the candidate-branch push. The final `master` and tag push still uses `GITHUB_TOKEN` and remains subject to branch protection.
+Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag. The release preparation job checks out with `GITHUB_TOKEN` but sets `persist-credentials: false`, so that read-only credential cannot be reused by later Git commands. It pushes its temporary candidate branch with the repository `ADMIN_PAT` secret so the `push` event starts ordinary CI; `release.yml` waits for the unique successful `Required checks` job on that exact candidate SHA. The same repository-scoped secret is used by a separate, narrowly scoped Dependabot refresh step; its required permissions and restrictions are documented below. The final `master` and tag push still uses `GITHUB_TOKEN` and remains subject to branch protection.
 
 ## AI-assisted development governance
 
@@ -98,7 +98,9 @@ Dependabot checks both Cargo and GitHub Actions dependencies daily. Updates are 
 - `CHIMERA_AUTOMERGE_PROTECTION_CONFIRMED=true` is set. An administrator uses that variable to confirm that `CI / Required checks` still applies to the workflow token, no approval count is required on `master`, and no merge queue is configured. The configured administrator exception may remain; the Actions token must not be granted a bypass.
 - GitHub reports the PR as clean and mergeable; the workflow immediately uses the pull-request merge API pinned to the verified head SHA. If gates are still pending, it skips and retries on the next CI completion or PR event. It does not create a persistent GitHub Auto-merge request. The job uses `actions: read`, `contents: write`, and `pull-requests: write`, and executes only this trusted script from the default branch.
 
-After an eligible Cargo or GitHub Actions Dependabot PR merges, a separate job asks GitHub to update each remaining eligible Dependabot PR that is behind `master`. GitHub merges the latest base into that PR branch, which changes its head and starts CI again. The refresh job never merges those PRs; each must pass the full required CI and merge checks on its updated head first. GitHub's strict required-check rule also blocks a PR that has not caught up with `master`.
+After an eligible Cargo or GitHub Actions Dependabot PR merges, the `workflow_run` refresh job waits for the merge job to finish, then checks the PR's live merged state and updates each remaining eligible Dependabot PR that is behind `master`. This handles the merge and refresh in the same workflow run; it does not rely on a `pull_request.closed` event that a `GITHUB_TOKEN` merge would suppress. The refresh step uses `ADMIN_PAT` only for the branch-update API so GitHub emits a normal `synchronize` event and starts CI on each new PR head. The job never merges those PRs; each must pass full required CI and merge checks on its updated head first. GitHub's strict required-check rule also blocks a PR that has not caught up with `master`.
+
+The refresh job also handles a Dependabot PR merged manually through the normal pull-request event. There is no manual refresh entry point in this privileged workflow; after a missed refresh, a maintainer can update each eligible branch from its GitHub PR page or wait for the next successful eligible merge to refresh them. The script fetches the merged PR from GitHub and verifies it is a same-repository Dependabot PR targeting `master` with an allowed dependency-only diff before changing any other branch. The repository `ADMIN_PAT` must have `Contents: write` for release-candidate pushes and `Pull requests: write` for branch refresh; it must have no administration or bypass permission. The secret is exposed only to the narrowly scoped push and refresh steps. A missing or insufficient token permission makes the refresh job fail visibly without merging any additional PR.
 
 The synchronous merge API does not support merge queues. The final live PR read and head-SHA pin also cannot atomically pin the base branch; if someone retargets a PR in the small interval before the merge request, GitHub may evaluate the then-current base. The workflow compares the base SHA and rechecks the file list immediately before merging to narrow this race.
 
@@ -152,8 +154,8 @@ The release candidate is a direct child of the `master` commit captured when the
 
 The candidate release also runs the ordinary CI feature compatibility matrix, release-version
 helper check, and locked builds on that exact commit. `ci.yml` listens for pushes to
-`release-candidate-*`; the release preparation job uses the `ADMIN_PAT` repository secret for only
-that candidate branch push, because a push made with `GITHUB_TOKEN` does not trigger another
+`release-candidate-*`; the release preparation job uses the `ADMIN_PAT` repository secret only
+for that candidate branch push, because a push made with `GITHUB_TOKEN` does not trigger another
 workflow. Its checkout must keep `persist-credentials: false` so the read-only checkout token is
 not retained as an HTTP auth header that could override the candidate-push credential. The candidate
 CI job polls the Actions API and requires the unique `push` run for the
@@ -167,7 +169,7 @@ existing cleanup job removes the temporary candidate branch.
 
 Before publication, the workflow verifies that remote `master` is still the original base commit. It then uses one atomic Git push for both the fast-forward of `master` and creation of the annotated stable tag. A concurrent change to `master` therefore fails closed and requires a fresh release dispatch.
 
-Repository workflow permissions default to `contents: read`. The prepare job's `GITHUB_TOKEN` is read-only; the configured `ADMIN_PAT` is exposed only to the candidate-push step and should be restricted to repository Contents write without administration or bypass access. Candidate CI only reads Actions run data. The publish and cleanup jobs use `GITHUB_TOKEN` with `contents: write` for their narrowly defined release mutations. No stable tag or `master` version bump may become visible until candidate `Required checks`, both platform artifact jobs, and all expected checksum verifications have succeeded.
+Repository workflow permissions default to `contents: read`. The prepare job's `GITHUB_TOKEN` is read-only; `ADMIN_PAT` is exposed only to the candidate-push and Dependabot branch-refresh steps. Limit it to this repository, the required Contents and Pull requests write permissions, and no administration or bypass access. Candidate CI only reads Actions run data. The publish and cleanup jobs use `GITHUB_TOKEN` with `contents: write` for their narrowly defined release mutations. No stable tag or `master` version bump may become visible until candidate `Required checks`, both platform artifact jobs, and all expected checksum verifications have succeeded.
 
 Release pages use the `Chimera Server vYY.M.D` title and a concise English release highlight,
 platform downloads, compatibility link, and full changelog comparison. Release
