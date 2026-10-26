@@ -53,8 +53,8 @@
 - 影响范围：仅 GitHub Actions 固定 SHA 更新 PR；Cargo 依赖更新不受影响。
 - 观察到的失败：CI 全绿的 #57 没有合并，自动化把 action 固定 SHA 行误判为不允许的 workflow 改动。
 - 根本原因：`ACTION_REFERENCE_LINE` 只识别缩进后直接出现的 `uses:`，未识别 YAML 步骤列表中的 `- uses:`。
-- 修复措施：解析 action 引用前允许可选的 YAML 列表短横线，同时仍要求改动行只包含相同 action 名和新的 40 位 SHA。
-- 预防措施：自测同时覆盖普通 `uses:` 属性和 `- uses:` 列表项；保留拒绝 `run`、标签引用、文件新增和其他 workflow 内容的断言。
+- 修复措施：解析 action 引用时记录缩进与 YAML 列表标记；只允许移除行与新增行的结构完全一致且 action 名相同的 40 位 SHA 替换。
+- 预防措施：自测覆盖普通 `uses:` 属性、`- uses:` 列表项，并拒绝在替换时改变列表标记或缩进；保留拒绝 `run`、标签引用、文件新增和其他 workflow 内容的断言。
 - 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check` 通过；最终修订提交后的远端 CI 与 PR 自动合并待验证。
 - 重复事件：与 LESSON-20261026-003 同属 Dependabot 自动化，但根因独立。
 - 是否提议升级为强制规则：否；补齐针对两种合法 YAML 写法的测试即可。
