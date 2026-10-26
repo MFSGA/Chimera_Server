@@ -13,9 +13,10 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| LESSON-20261026-005 | 2026-10-26 | Workflow | 非必需检查失败阻止必需 CI 全绿的依赖 PR 自动合并 | Fix committed locally; remote verification pending | [PR #57 CI run 40345667598](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667598), [Proxy throughput run 40345667471](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667471), [auto-merge run 40347223455](https://github.com/MFSGA/Chimera_Server/actions/runs/40347223455) |
-| LESSON-20261026-004 | 2026-10-26 | Workflow | 合法的 `- uses: owner/action@SHA` 行未通过 Actions 依赖范围检查 | Fix committed locally; remote verification pending | [PR #57 required CI run 40338987847](https://github.com/MFSGA/Chimera_Server/actions/runs/40338987847), [auto-merge skipped run 40340988665](https://github.com/MFSGA/Chimera_Server/actions/runs/40340988665) |
-| LESSON-20261026-003 | 2026-10-26 | Workflow | Dependabot PR 合并后，其余 PR 分支没有刷新 | Fix committed locally; remote verification pending | [Merged PR #56](https://github.com/MFSGA/Chimera_Server/pull/56), [refresh job skipped on workflow_run #40319763484](https://github.com/MFSGA/Chimera_Server/actions/runs/40319763484), [open PR #55](https://github.com/MFSGA/Chimera_Server/pull/55), [open PR #57](https://github.com/MFSGA/Chimera_Server/pull/57) |
+| LESSON-20261026-006 | 2026-10-26 | Workflow | 分支刷新用 PR 列表中不存在的 `changed_files` 字段，导致静默跳过 | Local fix; remote verification pending | [refresh workflow run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054), [open PR #55](https://github.com/MFSGA/Chimera_Server/pull/55) |
+| LESSON-20261026-005 | 2026-10-26 | Workflow | 非必需检查失败阻止必需 CI 全绿的依赖 PR 自动合并 | Verified | [PR #57 CI run 40350145110](https://github.com/MFSGA/Chimera_Server/actions/runs/40350145110), [auto-merge run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054), [merged PR #57](https://github.com/MFSGA/Chimera_Server/pull/57) |
+| LESSON-20261026-004 | 2026-10-26 | Workflow | 合法的 `- uses: owner/action@SHA` 行未通过 Actions 依赖范围检查 | Verified | [PR #57 CI run 40350145110](https://github.com/MFSGA/Chimera_Server/actions/runs/40350145110), [auto-merge run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054), [merged PR #57](https://github.com/MFSGA/Chimera_Server/pull/57) |
+| LESSON-20261026-003 | 2026-10-26 | Workflow | Dependabot PR 合并后，其余 PR 分支没有刷新 | Trigger fix verified; actual branch updates pending LESSON-20261026-006 | [Merged PR #57](https://github.com/MFSGA/Chimera_Server/pull/57), [refresh workflow run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054), [open PR #55](https://github.com/MFSGA/Chimera_Server/pull/55) |
 | LESSON-20261026-001 | 2026-10-26 | Release/Workflow | 发布候选没有生成 master 分支保护要求的 Required checks | Push path verified; `ADMIN_PAT` scope pending | [Failed release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545), [candidate CI run 40275048242](https://github.com/MFSGA/Chimera_Server/actions/runs/40275048242) |
 | LESSON-20261026-002 | 2026-10-26 | Release/Workflow | 发布候选推送仍使用只读 checkout 凭据 | Local fix and static checks passed; remote push pending | [Failed release run 40286277675](https://github.com/MFSGA/Chimera_Server/actions/runs/40286277675) |
 | LESSON-20261023-001 | 2026-10-23 | Workflow | 自动合并首次预检未重试暂时不完整的 CI job 列表 | Verified | [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938), [auto-merge run 39917597051, attempts 1–2](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051), [merged PR #31](https://github.com/MFSGA/Chimera_Server/pull/31), [fix CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) |
@@ -45,18 +46,33 @@
 
 ## 已确认经验
 
+### LESSON-20261026-006: 分支刷新使用 PR 列表中不存在的 `changed_files` 字段
+- 发现日期（UTC）：2026-10-26
+- 分类：Workflow
+- 严重度：Medium
+- 状态：本地修复；远端验证待完成
+- 证据：PR #57 已由 [auto-merge run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054) 合并，但同一运行的刷新 job 没有发出 branch update 请求；之后 PR #55 的 head `0edda13` 仍基于 `7d82093`，而 `master` 已前进到合并提交 `dbd661d`。GitHub REST API 的 `/pulls?state=open&base=master` 列表项不含 `changed_files`；单个 `/pulls/{number}` 详情包含该字段。
+- 影响范围：成功合并后需要更新的开放 Dependabot PR。刷新 job 表面成功，但分支仍落后，CI 没有基于新 master 重跑。
+- 观察到的失败：`refresh_open_dependabot_branches` 用列表响应的 `pull_request.get("changed_files")` 做变更文件数量校验，得到 `None` 后静默跳过 PR。
+- 根本原因：GitHub 的列表与单 PR 详情响应字段不同；代码错误地将 `changed_files` 视为列表响应必有字段。
+- 修复措施：先读取单 PR 详情并复核 head SHA/落后状态，再使用详情中的 `changed_files` 校验完整文件列表后请求更新分支。
+- 预防措施：刷新自测中的列表 PR 对象刻意省略 `changed_files`，详情对象保留字段；断言落后 PR 仍发出带 `expected_head_sha` 的更新请求。
+- 回归验证：策略自测、`py_compile`、完整候选 CI、合并后真实 branch update 与新 head CI 均待完成。
+- 重复事件：与 LESSON-20261026-003 所记刷新触发遗漏独立；003 的触发修复已在 #57 成功合并后运行，但此处字段缺失导致更新未发生。
+- 是否提议升级为强制规则：否；为列表/详情 API 字段差异补充准确回归测试即可。
+
 ### LESSON-20261026-005: 非必需检查失败阻止必需 CI 全绿的依赖 PR 自动合并
 - 发现日期（UTC）：2026-10-26
 - 分类：Workflow
 - 严重度：Medium
-- 状态：本地修复；远端重新验证待完成
-- 证据：PR #57 head `84562bc12f18325347700d5e74b357b287f73a78` 的 [CI run 40345667598](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667598) 所有 job 均通过；非必需的 [Proxy throughput run 40345667471](https://github.com/MFSGA/Chimera_Server/actions/runs/40345667471) 在 VLESS 数据传输时因 `ConnectionResetError` 失败。GitHub 将 PR 标记为 `UNSTABLE`；[auto-merge run 40347223455](https://github.com/MFSGA/Chimera_Server/actions/runs/40347223455) 因此跳过。读取 `master` 分支保护设置确认唯一 required status check 是 CI 的 `Required checks`。
+- 状态：已验证
+- 证据：PR #57 修复后 head `3e07860918c6568848e61e83ee7a5dc80dedf8ce` 的 [CI run 40350145110](https://github.com/MFSGA/Chimera_Server/actions/runs/40350145110) 所有 job 均通过；[auto-merge run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054) 通过 GitHub 合并 API 合并 PR #57，合并提交为 `dbd661d613706339131625f2188e6f51e0155075`。此前可选吞吐检查失败使 GitHub 将 PR 标记为 `UNSTABLE`；修复允许无冲突且 `mergeable=true` 的 unstable PR 由 GitHub API 最终裁决。
 - 影响范围：全部符合范围且必需 CI 全绿、但存在失败的非必需检查的 Dependabot PR。
 - 观察到的失败：有效 Required checks 成功后，符合范围的 #57 仍未合并。
 - 根本原因：合并预检只接受 `mergeable_state == clean`；GitHub 的 `UNSTABLE` 状态包含失败的非必需 check，即使 PR 无冲突且唯一必需状态检查已成功。
 - 修复措施：对无冲突的 `unstable` PR 也使用固定 head SHA 调用 GitHub 同步合并 API；由 API 执行当前分支保护检查。HTTP 405/409 按未就绪安全跳过，不绕过保护。
 - 预防措施：策略自测覆盖 clean 合并、mergeable unstable 合并、存在冲突时不调用 API，以及 GitHub 拒绝合并时安全跳过。
-- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check`；最终修复后的远端 CI 与 #57 合并结果待验证。
+- 回归验证：PR #57 修复后 head `3e07860918c6568848e61e83ee7a5dc80dedf8ce` 通过所有 required CI；[auto-merge run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054) 成功自动合并。另一处刷新缺陷由 LESSON-20261026-006 追踪。
 - 重复事件：与 LESSON-20261026-004 的 YAML 列表项解析故障独立。
 - 是否提议升级为强制规则：否；通过固定 SHA 的 GitHub 合并 API 和显式拒绝测试维持保护边界。
 
@@ -64,14 +80,14 @@
 - 发现日期（UTC）：2026-10-26
 - 分类：Workflow
 - 严重度：Medium
-- 状态：本地修复；远端重新验证待完成
+- 状态：已验证
 - 证据：PR #57 的 [required CI run 40338987847](https://github.com/MFSGA/Chimera_Server/actions/runs/40338987847) 全部通过；其 [auto-merge run 40340988665](https://github.com/MFSGA/Chimera_Server/actions/runs/40340988665) 却报告改动受保护路径或文件清单不完整。PR 只替换 `.github/workflows/proxy-throughput.yml` 和 `.github/workflows/release.yml` 中同一 action 的固定 SHA；后者使用 `- uses: ...@SHA` 这种标准列表语法。
 - 影响范围：仅 GitHub Actions 固定 SHA 更新 PR；Cargo 依赖更新不受影响。
 - 观察到的失败：CI 全绿的 #57 没有合并，自动化把 action 固定 SHA 行误判为不允许的 workflow 改动。
 - 根本原因：`ACTION_REFERENCE_LINE` 只识别缩进后直接出现的 `uses:`，未识别 YAML 步骤列表中的 `- uses:`。
 - 修复措施：解析 action 引用时记录缩进与 YAML 列表标记；只允许移除行与新增行的结构完全一致且 action 名相同的 40 位 SHA 替换。
 - 预防措施：自测覆盖普通 `uses:` 属性、`- uses:` 列表项，并拒绝在替换时改变列表标记或缩进；保留拒绝 `run`、标签引用、文件新增和其他 workflow 内容的断言。
-- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check` 通过；最终修订提交后的远端 CI 与 PR 自动合并待验证。
+- 回归验证：修复后的 PR #57 head `3e07860918c6568848e61e83ee7a5dc80dedf8ce` 通过全部 required CI，随后在 [auto-merge run 40351798054](https://github.com/MFSGA/Chimera_Server/actions/runs/40351798054) 成功自动合并。另一处刷新缺陷由 LESSON-20261026-006 追踪。
 - 重复事件：与 LESSON-20261026-003 同属 Dependabot 自动化，但根因独立。
 - 是否提议升级为强制规则：否；补齐针对两种合法 YAML 写法的测试即可。
 
@@ -79,7 +95,7 @@
 - 发现日期（UTC）：2026-10-26
 - 分类：Workflow
 - 严重度：Medium
-- 状态：修复已提交；远端权限与实际分支刷新仍待验证
+- 状态：触发修复已验证；实际分支刷新由 LESSON-20261026-006 跟踪
 - 证据：PR #56 于 2026-10-26 合并后，`master` 前进到 `2cb1aea`，但打开的 GitHub Actions Dependabot PR #55、#57、#44、#38 仍以 `b0aa752` 为 base。关联的 [Auto-merge workflow_run #40319763484](https://github.com/MFSGA/Chimera_Server/actions/runs/40319763484) 中刷新 job 被跳过，因为原 job 只监听 `pull_request_target.closed`。GitHub 文档说明 `GITHUB_TOKEN` 触发的事件默认不会启动后续 workflow；例外是 `workflow_dispatch` 与 `repository_dispatch`，而自动触发 PR synchronize 检查应使用 GitHub App 或 PAT 令牌：[triggering a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)。
 - 影响范围：一个依赖 PR 合并后，其他同批 Dependabot PR 保持旧基线，不能按新主分支重新运行 required CI。
 - 观察到的失败：PR #55 与 #57 的原始 required CI 成功，但它们仍落后于最新 `master`；后续 merge preflight 因基线过期无法继续。

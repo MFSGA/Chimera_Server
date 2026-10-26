@@ -489,14 +489,15 @@ def refresh_open_dependabot_branches(
         files = api.get_all(
             api_path(repository, f"/pulls/{pull_number}/files?per_page=100")
         )
-        if not auto_merge_scope_allowed(files, pull_request.get("changed_files")):
-            continue
-
         current_pr = api.get(api_path(repository, f"/pulls/{pull_number}"))
         if (
             current_pr.get("head", {}).get("sha") != head_sha
             or not should_update_dependabot_branch(current_pr, repository)
         ):
+            continue
+        # The paginated pull-request list endpoint does not include changed_files.
+        # Read the count from the single-PR response before validating the file list.
+        if not auto_merge_scope_allowed(files, current_pr.get("changed_files")):
             continue
 
         try:
@@ -1236,6 +1237,16 @@ def self_test() -> None:
             "repo": {"full_name": "MFSGA/Chimera_Server"},
         },
     }
+    behind_dependabot_list_item = {
+        key: value
+        for key, value in behind_dependabot_pr.items()
+        if key != "changed_files"
+    }
+    current_dependabot_list_item = {
+        key: value
+        for key, value in current_dependabot_pr.items()
+        if key != "changed_files"
+    }
 
     class RefreshDependabotBranchesApiStub:
         def __init__(self) -> None:
@@ -1258,7 +1269,7 @@ def self_test() -> None:
         ) -> list[Any]:
             assert collection_key is None
             if path == "/repos/MFSGA/Chimera_Server/pulls?state=open&base=master&per_page=100":
-                return [behind_dependabot_pr, current_dependabot_pr]
+                return [behind_dependabot_list_item, current_dependabot_list_item]
             if path in {
                 "/repos/MFSGA/Chimera_Server/pulls/42/files?per_page=100",
                 "/repos/MFSGA/Chimera_Server/pulls/43/files?per_page=100",
