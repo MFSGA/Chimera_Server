@@ -43,7 +43,8 @@ PROTECTED_PATH_PREFIXES = (
 )
 PROTECTED_PATHS = frozenset({"AGENTS.md", "LESSONS.md"})
 ACTION_REFERENCE_LINE = re.compile(
-    r"^[\t ]*(?:-[\t ]+)?uses:[\t ]+(?P<action>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    r"^(?P<indent>[\t ]*)(?P<sequence>-[\t ]+)?uses:[\t ]+"
+    r"(?P<action>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"(?:/[A-Za-z0-9_.-]+)*)@"
     r"(?P<sha>[0-9a-fA-F]{40})(?:[\t ]+\#[^\r\n]*)?[\t ]*$"
 )
@@ -312,11 +313,32 @@ def action_dependency_scope_allowed(files: list[Any]) -> bool:
 
         file_removed: dict[str, dict[str, int]] = {}
         file_added: dict[str, dict[str, int]] = {}
+        removed_block: list[tuple[str, str, tuple[str, str, bool]]] = []
+        added_block: list[tuple[str, str, tuple[str, str, bool]]] = []
         has_change = False
+
+        def finish_change_block() -> bool:
+            if len(removed_block) != len(added_block):
+                return False
+            for removed, added in zip(removed_block, added_block, strict=True):
+                if removed[0] != added[0] or removed[2] != added[2]:
+                    return False
+                if removed[1] == added[1]:
+                    return False
+            removed_block.clear()
+            added_block.clear()
+            return True
+
         for patch_line in patch.splitlines():
-            if patch_line.startswith(("@@", "\\")):
+            if patch_line.startswith("@@"):
+                if not finish_change_block():
+                    return False
+                continue
+            if patch_line.startswith("\\"):
                 continue
             if not patch_line or patch_line.startswith(" "):
+                if not finish_change_block():
+                    return False
                 continue
             if patch_line[0] not in "+-":
                 return False
@@ -332,8 +354,17 @@ def action_dependency_scope_allowed(files: list[Any]) -> bool:
             sha = match.group("sha").lower()
             by_sha = target.setdefault(action, {})
             by_sha[sha] = by_sha.get(sha, 0) + 1
+            structure = (
+                action,
+                match.group("indent"),
+                match.group("sequence") is not None,
+            )
+            change = (action, sha, structure)
+            (added_block if patch_line[0] == "+" else removed_block).append(change)
             has_change = True
 
+        if not finish_change_block():
+            return False
         if not has_change or not file_removed or not file_added:
             return False
         if {
@@ -882,6 +913,7 @@ def self_test() -> None:
     assert not auto_merge_scope_allowed([{"filename": "README.md"}], 1)
     old_action_sha = "02cb101ec7c40f2c49e1d9714d64511d8e1b74de"
     new_action_sha = "683b588c487a69d01f6c6ddf40f036ff682cc2c8"
+    another_action_sha = "a" * 40
     action_pin_update = {
         "filename": ".github/workflows/release.yml",
         "status": "modified",
@@ -897,6 +929,50 @@ def self_test() -> None:
         "patch": action_pin_update["patch"].replace("uses:", "- uses:"),
     }
     assert auto_merge_scope_allowed([list_action_pin_update], 1)
+    assert not auto_merge_scope_allowed(
+        [
+            {
+                **action_pin_update,
+                "patch": action_pin_update["patch"].replace(
+                    "+          uses:", "+          - uses:"
+                ),
+            }
+        ],
+        1,
+    )
+    mixed_structure_pair_swap = {
+        **action_pin_update,
+        "patch": (
+            "@@ -10,2 +10,2 @@\n"
+            f"-          uses: example/action@{old_action_sha}\n"
+            f"-          - uses: example/action@{new_action_sha}\n"
+            f"+          - uses: example/action@{another_action_sha}\n"
+            f"+          uses: example/action@{new_action_sha}"
+        ),
+    }
+    assert not auto_merge_scope_allowed([mixed_structure_pair_swap], 1)
+    unchanged_structure_pair = {
+        **action_pin_update,
+        "patch": (
+            "@@ -10,2 +10,2 @@\n"
+            f"-          uses: example/action@{old_action_sha}\n"
+            f"-          uses: example/action@{new_action_sha}\n"
+            f"+          uses: example/action@{new_action_sha}\n"
+            f"+          uses: example/action@{another_action_sha}"
+        ),
+    }
+    assert auto_merge_scope_allowed([unchanged_structure_pair], 1)
+    assert not auto_merge_scope_allowed(
+        [
+            {
+                **action_pin_update,
+                "patch": action_pin_update["patch"].replace(
+                    "+          uses:", "+            uses:"
+                ),
+            }
+        ],
+        1,
+    )
     assert auto_merge_scope_allowed(
         [
             {
