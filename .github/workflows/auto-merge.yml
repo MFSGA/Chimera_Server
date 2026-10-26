@@ -8,6 +8,12 @@ on:
     types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft, closed]
   pull_request_review:
     types: [dismissed, edited, submitted]
+  workflow_dispatch:
+    inputs:
+      merged_pr_number:
+        description: Refresh eligible Dependabot PR branches after this merged PR
+        required: true
+        type: number
 
 permissions:
   contents: read
@@ -52,18 +58,31 @@ jobs:
         run: python3 .github/scripts/auto_merge_after_ci.py
 
   refresh-open-dependabot-prs:
+    needs: [merge-dependabot-pr]
     if: >-
-      github.event_name == 'pull_request_target' &&
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.base.ref == 'master'
+      always() &&
+      (
+        (github.event_name == 'pull_request_target' &&
+        github.event.action == 'closed' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.user.login == 'dependabot[bot]' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.base.ref == 'master') ||
+        (github.event_name == 'workflow_run' &&
+        needs.merge-dependabot-pr.result == 'success' &&
+        github.event.workflow_run.name == 'CI' &&
+        github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository) ||
+        (github.event_name == 'workflow_dispatch' &&
+        inputs.merged_pr_number > 0)
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,8 +90,9 @@ jobs:
 
       - name: Update remaining Dependabot PR branches
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.ADMIN_PAT }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          AUTOMERGE_MODE: refresh
         run: python3 .github/scripts/auto_merge_after_ci.py

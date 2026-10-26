@@ -375,17 +375,44 @@ def should_update_dependabot_branch(
     )
 
 
+def merged_pr_number_from_event(event_name: str, event: dict[str, Any]) -> int:
+    if event_name == "pull_request_target":
+        event_pr = event.get("pull_request") or {}
+        if event.get("action") != "closed" or event_pr.get("merged") is not True:
+            raise SkipAutomation("the Dependabot pull request was not merged")
+        number = event_pr.get("number")
+    elif event_name == "workflow_run":
+        workflow_run = event.get("workflow_run") or {}
+        if (
+            workflow_run.get("name") != "CI"
+            or workflow_run.get("path") != ".github/workflows/ci.yml"
+            or workflow_run.get("event") != "pull_request"
+            or workflow_run.get("conclusion") != "success"
+        ):
+            raise SkipAutomation("the completed workflow is not a successful PR CI run")
+        pull_requests = workflow_run.get("pull_requests") or []
+        if len(pull_requests) != 1:
+            raise SkipAutomation("the CI run has no unique associated pull request")
+        number = pull_requests[0].get("number")
+    elif event_name == "workflow_dispatch":
+        number = (event.get("inputs") or {}).get("merged_pr_number")
+        if isinstance(number, str) and number.isdecimal():
+            number = int(number)
+    else:
+        raise SkipAutomation("this workflow event cannot refresh Dependabot branches")
+
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise SkipAutomation("the merged pull request has no valid number")
+    return number
+
+
 def refresh_open_dependabot_branches(
     api: GitHubApi,
     repository: str,
+    event_name: str,
     event: dict[str, Any],
 ) -> None:
-    event_pr = event.get("pull_request") or {}
-    number = event_pr.get("number")
-    if event.get("action") != "closed" or event_pr.get("merged") is not True:
-        raise SkipAutomation("the Dependabot pull request was not merged")
-    if not isinstance(number, int):
-        raise SkipAutomation("the merged pull request has no number")
+    number = merged_pr_number_from_event(event_name, event)
 
     merged_pr = api.get(api_path(repository, f"/pulls/{number}"))
     if (
@@ -427,13 +454,25 @@ def refresh_open_dependabot_branches(
         ):
             continue
 
-        api.put(
-            api_path(repository, f"/pulls/{pull_number}/update-branch"),
-            {"expected_head_sha": head_sha},
-        )
+        try:
+            api.put(
+                api_path(repository, f"/pulls/{pull_number}/update-branch"),
+                {"expected_head_sha": head_sha},
+            )
+        except GitHubApiError as error:
+            if "HTTP 403" in str(error):
+                raise GitHubApiError(
+                    "branch update was denied; ADMIN_PAT must have repository "
+                    "Pull requests: write permission"
+                ) from None
+            print(
+                f"Could not update Dependabot PR #{pull_number}; it may have "
+                "changed concurrently or have a merge conflict."
+            )
+            continue
         print(
             f"Requested update of Dependabot PR #{pull_number} onto the latest master; "
-            "GitHub will run CI on the updated branch."
+            "the token-authored branch update will start CI on the new head."
         )
 
 
@@ -808,6 +847,37 @@ def self_test() -> None:
     assert not should_update_dependabot_branch(
         {**ordinary_pr, "mergeable_state": "behind"}, "MFSGA/Chimera_Server"
     )
+    assert merged_pr_number_from_event(
+        "pull_request_target",
+        {"action": "closed", "pull_request": {"number": 42, "merged": True}},
+    ) == 42
+    assert merged_pr_number_from_event(
+        "workflow_run",
+        {
+            "workflow_run": {
+                "name": "CI",
+                "path": ".github/workflows/ci.yml",
+                "event": "pull_request",
+                "conclusion": "success",
+                "pull_requests": [{"number": 43}],
+            }
+        },
+    ) == 43
+    assert merged_pr_number_from_event(
+        "workflow_dispatch", {"inputs": {"merged_pr_number": "44"}}
+    ) == 44
+    for invalid_refresh_event in (
+        ("pull_request_target", {"action": "closed", "pull_request": {"merged": False}}),
+        ("workflow_run", {"workflow_run": {"event": "push", "pull_requests": []}}),
+        ("workflow_dispatch", {"inputs": {"merged_pr_number": "not-a-number"}}),
+        ("workflow_dispatch", {"inputs": {"merged_pr_number": 0}}),
+    ):
+        try:
+            merged_pr_number_from_event(*invalid_refresh_event)
+        except SkipAutomation:
+            pass
+        else:
+            raise AssertionError("invalid branch-refresh event was accepted")
     assert not is_auto_merge_eligible(
         {
             **eligible_pr,
@@ -1060,6 +1130,7 @@ def self_test() -> None:
     refresh_open_dependabot_branches(
         refresh_api,
         "MFSGA/Chimera_Server",
+        "pull_request_target",
         {"action": "closed", "pull_request": {"number": 42, "merged": True}},
     )
     assert refresh_api.put_calls == [
@@ -1209,8 +1280,11 @@ def main() -> int:
         )
         api = GitHubApi(token)
         event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        if os.environ.get("AUTOMERGE_MODE") == "refresh":
+            refresh_open_dependabot_branches(api, repository, event_name, event)
+            return 0
         if event_name == "pull_request_target" and event.get("action") == "closed":
-            refresh_open_dependabot_branches(api, repository, event)
+            refresh_open_dependabot_branches(api, repository, event_name, event)
             return 0
         if event_name == "workflow_run":
             workflow_run = event.get("workflow_run", {})

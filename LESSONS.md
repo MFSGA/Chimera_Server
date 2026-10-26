@@ -13,6 +13,7 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
+| LESSON-20261026-003 | 2026-10-26 | Workflow | Dependabot PR 合并后，其余 PR 分支没有刷新 | Fix committed locally; remote verification pending | [Merged PR #56](https://github.com/MFSGA/Chimera_Server/pull/56), [refresh job skipped on workflow_run #40319763484](https://github.com/MFSGA/Chimera_Server/actions/runs/40319763484), [open PR #55](https://github.com/MFSGA/Chimera_Server/pull/55), [open PR #57](https://github.com/MFSGA/Chimera_Server/pull/57) |
 | LESSON-20261026-001 | 2026-10-26 | Release/Workflow | 发布候选没有生成 master 分支保护要求的 Required checks | Push path verified; `ADMIN_PAT` scope pending | [Failed release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545), [candidate CI run 40275048242](https://github.com/MFSGA/Chimera_Server/actions/runs/40275048242) |
 | LESSON-20261026-002 | 2026-10-26 | Release/Workflow | 发布候选推送仍使用只读 checkout 凭据 | Local fix and static checks passed; remote push pending | [Failed release run 40286277675](https://github.com/MFSGA/Chimera_Server/actions/runs/40286277675) |
 | LESSON-20261023-001 | 2026-10-23 | Workflow | 自动合并首次预检未重试暂时不完整的 CI job 列表 | Verified | [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938), [auto-merge run 39917597051, attempts 1–2](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051), [merged PR #31](https://github.com/MFSGA/Chimera_Server/pull/31), [fix CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) |
@@ -41,6 +42,21 @@
 ```
 
 ## 已确认经验
+
+### LESSON-20261026-003: Dependabot PR 合并后，其余 PR 分支没有刷新
+- 发现日期（UTC）：2026-10-26
+- 分类：Workflow
+- 严重度：Medium
+- 状态：修复已提交；远端权限与实际分支刷新仍待验证
+- 证据：PR #56 于 2026-10-26 合并后，`master` 前进到 `2cb1aea`，但打开的 GitHub Actions Dependabot PR #55、#57、#44、#38 仍以 `b0aa752` 为 base。关联的 [Auto-merge workflow_run #40319763484](https://github.com/MFSGA/Chimera_Server/actions/runs/40319763484) 中刷新 job 被跳过，因为原 job 只监听 `pull_request_target.closed`。GitHub 文档说明 `GITHUB_TOKEN` 触发的事件默认不会启动后续 workflow；例外是 `workflow_dispatch` 与 `repository_dispatch`，而自动触发 PR synchronize 检查应使用 GitHub App 或 PAT 令牌：[triggering a workflow](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)。
+- 影响范围：一个依赖 PR 合并后，其他同批 Dependabot PR 保持旧基线，不能按新主分支重新运行 required CI。
+- 观察到的失败：PR #55 与 #57 的原始 required CI 成功，但它们仍落后于最新 `master`；后续 merge preflight 因基线过期无法继续。
+- 根本原因：刷新逻辑仅依赖 PR 关闭事件。由自动合并工作流使用 `GITHUB_TOKEN` 合并时，GitHub 不会再触发依赖的关闭事件工作流，因此没有分支刷新请求。
+- 修复措施：刷新 job 在成功的 CI `workflow_run` 中等待合并 job 完成，然后从 GitHub 读取相关 PR 的最新状态；确认它确已合并且属于允许的 Dependabot 依赖范围后，用 `ADMIN_PAT` 更新落后 PR 分支。另提供人工补刷入口；该入口同样验证已合并 PR 和改动范围。实际分支更新需要仓库 PAT 拥有 `Pull requests: write`，自动合并仍使用受保护的 `GITHUB_TOKEN`。
+- 预防措施：测试关闭事件、成功 CI 完成事件及人工补刷事件的来源校验；让更新分支使用能触发正常 `synchronize` CI 的 token；要求更新 API 的目标 head SHA 与预读值匹配。
+- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`/tmp/chimera-actionlint/actionlint .github/workflows/auto-merge.yml`、`git diff --check` 均通过。提交推送后的真实 branch update、PAT 权限以及新 PR head 上的 CI 尚待验证。
+- 重复事件：无已知关联事件。
+- 是否提议升级为强制规则：否；这是现有自动化触发链路缺陷，修复已包含受限人工恢复入口。
 
 ### LESSON-20261026-001: 发布候选没有生成 master 分支保护要求的 Required checks
 - 发现日期（UTC）：2026-10-26
