@@ -204,10 +204,21 @@ def merge_pull_request(
     pull_request: dict[str, Any],
     expected_head_sha: str,
 ) -> None:
-    result = api.put(
-        api_path(repository, f"/pulls/{pull_request['number']}/merge"),
-        {"sha": expected_head_sha, "merge_method": "squash"},
-    )
+    try:
+        result = api.put(
+            api_path(repository, f"/pulls/{pull_request['number']}/merge"),
+            {"sha": expected_head_sha, "merge_method": "squash"},
+        )
+    except GitHubApiError as error:
+        if str(error) in {
+            "GitHub API returned HTTP 405",
+            "GitHub API returned HTTP 409",
+        }:
+            raise SkipAutomation(
+                "GitHub refused the merge because required checks or head synchronization "
+                "are not satisfied"
+            ) from None
+        raise
     if result.get("merged") is not True:
         raise GitHubApiError("GitHub did not confirm the pull request merge")
 
@@ -218,9 +229,16 @@ def merge_when_ready(
     pull_request: dict[str, Any],
     expected_head_sha: str,
 ) -> None:
-    if pull_request.get("mergeable_state") != "clean":
-        raise SkipAutomation("GitHub has not satisfied the PR merge gates yet")
-    merge_pull_request(api, repository, pull_request, expected_head_sha)
+    mergeable_state = pull_request.get("mergeable_state")
+    if mergeable_state == "clean":
+        merge_pull_request(api, repository, pull_request, expected_head_sha)
+        return
+    if mergeable_state == "unstable" and pull_request.get("mergeable") is True:
+        # Optional failing checks can make a conflict-free PR unstable. GitHub's
+        # merge endpoint remains authoritative for required branch protections.
+        merge_pull_request(api, repository, pull_request, expected_head_sha)
+        return
+    raise SkipAutomation("GitHub has not satisfied the PR merge gates yet")
 
 
 def is_dependabot_pull_request(pull_request: dict[str, Any]) -> bool:
@@ -826,6 +844,47 @@ def self_test() -> None:
             {"sha": "head-sha", "merge_method": "squash"},
         )
     ]
+    unstable_merge_api = MergeFlowApiStub()
+    merge_when_ready(
+        unstable_merge_api,
+        "MFSGA/Chimera_Server",
+        {"number": 43, "mergeable_state": "unstable", "mergeable": True},
+        "head-sha-unstable",
+    )
+    assert unstable_merge_api.put_calls == [
+        (
+            "/repos/MFSGA/Chimera_Server/pulls/43/merge",
+            {"sha": "head-sha-unstable", "merge_method": "squash"},
+        )
+    ]
+    class RefusedMergeApiStub(MergeFlowApiStub):
+        def __init__(self, status_code: int) -> None:
+            super().__init__()
+            self.status_code = status_code
+
+        def put(self, path: str, payload: dict[str, Any]) -> dict[str, bool]:
+            self.put_calls.append((path, payload))
+            raise GitHubApiError(f"GitHub API returned HTTP {self.status_code}")
+
+    for status_code in (405, 409):
+        refused_merge_api = RefusedMergeApiStub(status_code)
+        try:
+            merge_when_ready(
+                refused_merge_api,
+                "MFSGA/Chimera_Server",
+                {"number": 44, "mergeable_state": "unstable", "mergeable": True},
+                "head-sha-refused",
+            )
+        except SkipAutomation as skip:
+            assert "required checks" in str(skip)
+        else:
+            raise AssertionError("GitHub merge refusal was not treated as a safe skip")
+        assert refused_merge_api.put_calls == [
+            (
+                "/repos/MFSGA/Chimera_Server/pulls/44/merge",
+                {"sha": "head-sha-refused", "merge_method": "squash"},
+            )
+        ]
     blocked_merge_api = MergeFlowApiStub()
     try:
         merge_when_ready(
@@ -839,6 +898,19 @@ def self_test() -> None:
     else:
         raise AssertionError("PR with unsatisfied merge gates was merged")
     assert not blocked_merge_api.put_calls
+    non_mergeable_api = MergeFlowApiStub()
+    try:
+        merge_when_ready(
+            non_mergeable_api,
+            "MFSGA/Chimera_Server",
+            {"number": 45, "mergeable_state": "unstable", "mergeable": False},
+            "head-sha-conflict",
+        )
+    except SkipAutomation as skip:
+        assert "merge gates" in str(skip)
+    else:
+        raise AssertionError("unstable PR with merge conflicts was passed to GitHub")
+    assert not non_mergeable_api.put_calls
 
     eligible_pr = {
         "state": "open",
