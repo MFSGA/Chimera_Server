@@ -43,7 +43,7 @@ PROTECTED_PATH_PREFIXES = (
 )
 PROTECTED_PATHS = frozenset({"AGENTS.md", "LESSONS.md"})
 ACTION_REFERENCE_LINE = re.compile(
-    r"^[\t ]*uses:[\t ]+(?P<action>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    r"^[\t ]*(?:-[\t ]+)?uses:[\t ]+(?P<action>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"(?:/[A-Za-z0-9_.-]+)*)@"
     r"(?P<sha>[0-9a-fA-F]{40})(?:[\t ]+\#[^\r\n]*)?[\t ]*$"
 )
@@ -892,6 +892,11 @@ def self_test() -> None:
         ),
     }
     assert auto_merge_scope_allowed([action_pin_update], 1)
+    list_action_pin_update = {
+        **action_pin_update,
+        "patch": action_pin_update["patch"].replace("uses:", "- uses:"),
+    }
+    assert auto_merge_scope_allowed([list_action_pin_update], 1)
     assert auto_merge_scope_allowed(
         [
             {

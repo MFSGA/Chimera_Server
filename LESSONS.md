@@ -13,6 +13,7 @@
 
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
+| LESSON-20261026-004 | 2026-10-26 | Workflow | 合法的 `- uses: owner/action@SHA` 行未通过 Actions 依赖范围检查 | Fix committed locally; remote verification pending | [PR #57 required CI run 40338987847](https://github.com/MFSGA/Chimera_Server/actions/runs/40338987847), [auto-merge skipped run 40340988665](https://github.com/MFSGA/Chimera_Server/actions/runs/40340988665) |
 | LESSON-20261026-003 | 2026-10-26 | Workflow | Dependabot PR 合并后，其余 PR 分支没有刷新 | Fix committed locally; remote verification pending | [Merged PR #56](https://github.com/MFSGA/Chimera_Server/pull/56), [refresh job skipped on workflow_run #40319763484](https://github.com/MFSGA/Chimera_Server/actions/runs/40319763484), [open PR #55](https://github.com/MFSGA/Chimera_Server/pull/55), [open PR #57](https://github.com/MFSGA/Chimera_Server/pull/57) |
 | LESSON-20261026-001 | 2026-10-26 | Release/Workflow | 发布候选没有生成 master 分支保护要求的 Required checks | Push path verified; `ADMIN_PAT` scope pending | [Failed release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545), [candidate CI run 40275048242](https://github.com/MFSGA/Chimera_Server/actions/runs/40275048242) |
 | LESSON-20261026-002 | 2026-10-26 | Release/Workflow | 发布候选推送仍使用只读 checkout 凭据 | Local fix and static checks passed; remote push pending | [Failed release run 40286277675](https://github.com/MFSGA/Chimera_Server/actions/runs/40286277675) |
@@ -42,6 +43,21 @@
 ```
 
 ## 已确认经验
+
+### LESSON-20261026-004: 合法的 Actions 列表项未通过依赖范围检查
+- 发现日期（UTC）：2026-10-26
+- 分类：Workflow
+- 严重度：Medium
+- 状态：本地修复；远端重新验证待完成
+- 证据：PR #57 的 [required CI run 40338987847](https://github.com/MFSGA/Chimera_Server/actions/runs/40338987847) 全部通过；其 [auto-merge run 40340988665](https://github.com/MFSGA/Chimera_Server/actions/runs/40340988665) 却报告改动受保护路径或文件清单不完整。PR 只替换 `.github/workflows/proxy-throughput.yml` 和 `.github/workflows/release.yml` 中同一 action 的固定 SHA；后者使用 `- uses: ...@SHA` 这种标准列表语法。
+- 影响范围：仅 GitHub Actions 固定 SHA 更新 PR；Cargo 依赖更新不受影响。
+- 观察到的失败：CI 全绿的 #57 没有合并，自动化把 action 固定 SHA 行误判为不允许的 workflow 改动。
+- 根本原因：`ACTION_REFERENCE_LINE` 只识别缩进后直接出现的 `uses:`，未识别 YAML 步骤列表中的 `- uses:`。
+- 修复措施：解析 action 引用前允许可选的 YAML 列表短横线，同时仍要求改动行只包含相同 action 名和新的 40 位 SHA。
+- 预防措施：自测同时覆盖普通 `uses:` 属性和 `- uses:` 列表项；保留拒绝 `run`、标签引用、文件新增和其他 workflow 内容的断言。
+- 回归验证：`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`python3 -m py_compile .github/scripts/auto_merge_after_ci.py`、`git diff --check` 通过；最终修订提交后的远端 CI 与 PR 自动合并待验证。
+- 重复事件：与 LESSON-20261026-003 同属 Dependabot 自动化，但根因独立。
+- 是否提议升级为强制规则：否；补齐针对两种合法 YAML 写法的测试即可。
 
 ### LESSON-20261026-003: Dependabot PR 合并后，其余 PR 分支没有刷新
 - 发现日期（UTC）：2026-10-26
