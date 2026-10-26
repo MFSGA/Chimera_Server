@@ -14,6 +14,7 @@
 | ID | 日期 | 模块 | 问题 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
 | LESSON-20261026-001 | 2026-10-26 | Release/Workflow | 发布候选没有生成 master 分支保护要求的 Required checks | Push path verified; `ADMIN_PAT` scope pending | [Failed release run 40269089545](https://github.com/MFSGA/Chimera_Server/actions/runs/40269089545), [candidate CI run 40275048242](https://github.com/MFSGA/Chimera_Server/actions/runs/40275048242) |
+| LESSON-20261026-002 | 2026-10-26 | Release/Workflow | 发布候选推送仍使用只读 checkout 凭据 | Local fix and static checks passed; remote push pending | [Failed release run 40286277675](https://github.com/MFSGA/Chimera_Server/actions/runs/40286277675) |
 | LESSON-20261023-001 | 2026-10-23 | Workflow | 自动合并首次预检未重试暂时不完整的 CI job 列表 | Verified | [CI run 39916929938](https://github.com/MFSGA/Chimera_Server/actions/runs/39916929938), [auto-merge run 39917597051, attempts 1–2](https://github.com/MFSGA/Chimera_Server/actions/runs/39917597051), [merged PR #31](https://github.com/MFSGA/Chimera_Server/pull/31), [fix CI run 39919191799](https://github.com/MFSGA/Chimera_Server/actions/runs/39919191799) |
 | LESSON-20261017-001 | 2026-10-17 | Test/Workflow | Xray smoke test 依赖被忽略的本地证书 | Verified | [Failed run 39077494361](https://github.com/MFSGA/Chimera_Server/actions/runs/39077494361), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
 | LESSON-20261017-002 | 2026-10-17 | Test/Workflow | Xray smoke 的 loopback echo 目标被 Freedom 私网默认规则拒绝 | Verified | [Local reproduction log](/tmp/chimera-xray-client-vless-tcp-none-149849-1792278770553/chimera.stderr.log), [passing rerun 39078597338](https://github.com/MFSGA/Chimera_Server/actions/runs/39078597338) |
@@ -55,6 +56,21 @@
 - 回归验证：`python3 .github/scripts/release_candidate_ci.py --self-test`、`python3 -m py_compile .github/scripts/release_candidate_ci.py`、`python3 .github/scripts/release_version.py --self-test`、`python3 .github/scripts/auto_merge_after_ci.py --self-test`、`git diff --check` 均通过；`/tmp/chimera-actionlint/actionlint .github/workflows/release.yml .github/workflows/ci.yml`（actionlint 1.7.12）通过。真实 candidate `push` 事件的 CI、Required checks 来源、严格保护下向 `master` 快进推送，以及该 SHA 的 master CI 均通过。没有运行完整发布工作流，因为它会创建稳定 tag 和 GitHub Release。仓库 secret `ADMIN_PAT` 的权限范围无法从 GitHub Secret 元数据读取；真实 release 工作流中的令牌推送仍未执行。维护者需确认其为仅限本仓库 Contents write 且没有 administration/bypass 权限的令牌。
 - 重复事件：无已知关联事件。
 - 是否提议升级为强制规则：否；现有保护规则保持不变，补齐 candidate SHA 的 required CI 即可。
+
+### LESSON-20261026-002: 发布候选推送仍使用只读 checkout 凭据
+- 发现日期（UTC）：2026-10-26
+- 分类：Release / Workflow
+- 严重度：High
+- 状态：本地修复与静态检查通过；真实候选推送和 `ADMIN_PAT` 权限范围待远端验证
+- 证据：[失败的 Build and Release run 40286277675](https://github.com/MFSGA/Chimera_Server/actions/runs/40286277675) 在候选推送步骤返回 HTTP 403 `Permission to MFSGA/Chimera_Server.git denied to github-actions[bot]`。工作流已在 runner 上生成候选版本 `v26.10.26`、提交 `e308fc6a9a8d725d48c56caeab5b1fa4b0ee0a1f`，但候选分支没有推送到远端；后续 CI、发布门禁和 Publish 均跳过，也没有创建标签或 Release。
+- 影响范围：稳定发布在任何候选 CI 或发布门禁启动前失败。
+- 观察到的失败：准备 job 的 `Push release candidate to trigger required CI` 步骤以 `github-actions[bot]` 身份被拒绝；该 job 的 checkout 使用只有 `contents: read` 权限的 `GITHUB_TOKEN`。Actions 日志显示 checkout 将其凭据放在临时配置文件并通过 `includeIf` 引入；推送脚本中的 `git config --local --unset-all http.https://github.com/.extraheader` 没有移除被 include 的值。
+- 根本原因：脚本使用 `GIT_ASKPASS` 提供 `ADMIN_PAT`，但 checkout 持久化的 `GITHUB_TOKEN` HTTP extraheader 仍然生效，Git push 因而使用只读 bot 凭据。隔离配置复现确认，对仓库本地配置执行 `--unset-all` 不会删除由另一个 `includeIf` 配置文件提供的同名值。远端日志不能证明 `ADMIN_PAT` 自身的权限范围；它可能未被用作有效凭据。
+- 修复措施：prepare job 的 checkout 设置 `persist-credentials: false`。checkout 仍使用 `GITHUB_TOKEN` 读取代码，但不会把它留给后续 Git 命令；候选分支推送只通过 `ADMIN_PAT` 的 `GIT_ASKPASS` 认证。Required checks、分支保护、候选分支范围与最终发布权限均不变。
+- 预防措施：保持候选 checkout 凭据不持久化；远端验证时确认 `ADMIN_PAT` 是有效且仅限本仓库 Contents 写入的凭据，不授予 administration 或绕过保护权限。未确认该令牌前，不得据本地静态检查宣称真实发布已验证。
+- 回归验证：`/tmp/chimera-actionlint/actionlint .github/workflows/release.yml`（通过）、`git diff --check`（通过）；隔离 Git 配置复现验证了 include 配置下本地 `--unset-all` 的局限。尚未运行完整发布工作流；修复后的远端候选 push 和密钥授权范围仍未验证。
+- 重复事件：与 LESSON-20261026-001 的 Required checks 来源问题不同；该候选在 `Required checks` 之前便因身份权限被拒绝。
+- 是否提议升级为强制规则：否；针对 checkout 凭据生命周期的显式设置与真实候选 push 验证可覆盖。
 
 ### LESSON-20261023-001: 自动合并预检没有重试暂时不完整的 CI job 列表
 - 发现日期（UTC）：2026-10-23

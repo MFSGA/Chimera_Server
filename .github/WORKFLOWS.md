@@ -13,7 +13,7 @@ The repository uses six entry-point workflows and two shared local actions. Keep
 | `hysteria2-performance.yml` | Hysteria2-relevant pull requests, manual | RTT/loss/congestion benchmark under Linux netem |
 | `release.yml` | Manual only | Generate an Xray-style UTC calendar version, validate/build a temporary release commit, then atomically advance `master` with the tag and publish |
 
-Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag. The release preparation job pushes its temporary candidate branch with the repository `ADMIN_PAT` secret so the `push` event starts ordinary CI; `release.yml` waits for the unique successful `Required checks` job on that exact candidate SHA. Keep this secret repository-scoped and limited to Contents write; the workflow uses it only for the candidate-branch push. The final `master` and tag push still uses `GITHUB_TOKEN` and remains subject to branch protection.
+Tag pushes do not run the ordinary CI workflow. A release already runs its own exact-SHA gates before creating the tag. The release preparation job checks out with `GITHUB_TOKEN` but sets `persist-credentials: false`, so that read-only credential cannot be reused by later Git commands. It pushes its temporary candidate branch with the repository `ADMIN_PAT` secret so the `push` event starts ordinary CI; `release.yml` waits for the unique successful `Required checks` job on that exact candidate SHA. Keep this secret repository-scoped and limited to Contents write; the workflow uses it only for the candidate-branch push. The final `master` and tag push still uses `GITHUB_TOKEN` and remains subject to branch protection.
 
 ## AI-assisted development governance
 
@@ -150,7 +150,9 @@ The candidate release also runs the ordinary CI feature compatibility matrix, re
 helper check, and locked builds on that exact commit. `ci.yml` listens for pushes to
 `release-candidate-*`; the release preparation job uses the `ADMIN_PAT` repository secret for only
 that candidate branch push, because a push made with `GITHUB_TOKEN` does not trigger another
-workflow. The candidate CI job polls the Actions API and requires the unique `push` run for the
+workflow. Its checkout must keep `persist-credentials: false` so the read-only checkout token is
+not retained as an HTTP auth header that could override the candidate-push credential. The candidate
+CI job polls the Actions API and requires the unique `push` run for the
 exact branch and full candidate SHA to complete successfully with one successful `Required checks`
 job. This event supplies the check context GitHub accepts for protected branch updates; a
 `workflow_dispatch` run is not a substitute. Keep the token repository-scoped with Contents write
