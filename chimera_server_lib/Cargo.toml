@@ -92,7 +92,7 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
-etherparse = "0.20.3"
+etherparse = "0.21.0"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
