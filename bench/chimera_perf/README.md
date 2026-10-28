@@ -950,6 +950,80 @@ The decomposition now shows that the large syscall win requires coordinated
 uplink and downlink batching, so a supposedly "small" production patch would
 not retain most of the measured benefit.
 
+## Global XUDP retry payload ownership probe
+
+`udp_retry_payload_probe` isolates the extra payload retained by
+`SessionUdpSender::Global` until its worker acknowledges a send. It compares
+the former full `Vec<u8>` clone, a shared `Bytes` clone for every packet, and
+the production threshold policy (keep `Vec` through 1199 bytes; share `Bytes`
+from 1200 bytes). Each iteration allocates the source `Vec` in every mode,
+retains the retry value until completion, and observes the worker-side payload
+slice. The `ownership` model measures only the buffer strategy. The
+`channel-ack` model also sends one request through a bounded Tokio channel and
+waits for a per-packet oneshot acknowledgement before dropping the retry value,
+matching the current sender/worker synchronization shape. It runs both tasks on
+a current-thread Tokio runtime so the reported thread CPU includes producer
+and worker work. The benchmark pins `bytes` to 1.11.1, matching the root
+lockfile.
+
+Build and run on Linux with a pinned CPU:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin udp_retry_payload_probe
+taskset -c 1 bench/chimera_perf/target/release/udp_retry_payload_probe \
+  --packets 1000000 --warmup 2 --runs 10 \
+  --sizes 64,512,1200,4096 --shared-threshold 1200
+
+taskset -c 1 bench/chimera_perf/target/release/udp_retry_payload_probe \
+  --model channel-ack --packets 1000000 --warmup 2 --runs 10 \
+  --sizes 64,512,1200,4096 --shared-threshold 1200
+```
+
+On the 2026-10-28 run at commit `fe709d5` (Linux 6.18.35, x86_64, AMD Ryzen
+7 5800, Rust 1.98.0), all reported rate CVs were at most **0.95%** and CPU CVs
+at most **2.62%**. The threshold policy compared with `Vec` cloning as follows:
+
+| Payload | `Vec` records/s | Threshold records/s | Rate change | `Vec` CPU s/Mpkt | Threshold CPU s/Mpkt |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 B | 55.46 M | 51.59 M | -7.0% | 0.018 | 0.020 |
+| 512 B | 47.49 M | 43.93 M | -7.5% | 0.021 | 0.023 |
+| 1200 B | 14.36 M | 21.33 M | +48.6% | 0.070 | 0.047 |
+| 4096 B | 11.15 M | 17.27 M | +55.0% | 0.090 | 0.058 |
+
+The all-`Bytes` variant was slower for both small sizes, and sharing at 1024
+bytes also regressed in a focused crossover run. The conservative 1200-byte
+cutoff avoids that copy strategy below the measured positive range. The
+threshold path still has a small-payload dispatch cost in the ownership-only
+probe.
+
+The channel-and-ack model ran on the same host with 1,000,000 packets per
+sample, two warmups and ten measured runs. Compared with the old `Vec` clone,
+the production threshold policy measured:
+
+| Payload | Old packets/s | Threshold packets/s | Rate change | Old CPU s/Mpkt | Threshold CPU s/Mpkt |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 B | 1.652 M | 1.619 M | -2.0% | 0.605 | 0.616 |
+| 512 B | 1.600 M | 1.581 M | -1.2% | 0.624 | 0.632 |
+| 1200 B | 1.474 M | 1.519 M | +3.1% | 0.677 | 0.656 |
+| 4096 B | 1.358 M | 1.452 M | +6.9% | 0.734 | 0.687 |
+
+The 64 B and 512 B result was repeated with 500,000 packets, three warmups
+and fifteen measured runs; rate changes were -1.8% and -1.4%, with all rate
+and CPU CVs below 0.7%. In the 1,000,000-packet run, the 512 B CV was higher
+(5.90% for threshold throughput), so treat its roughly 1% regression as small
+and workload-sensitive. The large-packet result is directionally consistent
+with the ownership-only probe, but the channel/ack model narrows the measured
+gain to 3.1%-6.9%.
+
+This synthetic model excludes UDP socket syscalls, routing, traffic accounting,
+the production worker's select loop, shared-session contention, packet-size
+distribution and end-to-end client throughput. It therefore does not predict
+whole-server throughput. It shows a small per-packet cost for sub-1200-byte
+traffic and a measured CPU/throughput benefit for larger packets in this
+channel/ack path; the aggregate production effect depends on the deployment's
+packet-size mix and still needs an end-to-end workload measurement.
+
 ## UDP shared response socket probe
 
 `udp_shared_socket_probe` closes the largest remaining topology gap. It creates

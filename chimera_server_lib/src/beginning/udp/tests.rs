@@ -551,6 +551,59 @@ fn global_udp_payload_plan_distinguishes_detached_stale_and_current() {
     }
 }
 
+#[tokio::test]
+async fn global_udp_sender_preserves_payload_for_retry_after_failed_completion() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let global_sender = SessionUdpSender::Global {
+        sender,
+        attachment_token: 7,
+    };
+    let target_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 53));
+    let expected = vec![0x5a; 1200];
+    let send_task = tokio::spawn(async move {
+        global_sender.send_to(expected.clone(), target_addr).await
+    });
+
+    let request = receiver.recv().await.expect("global UDP request");
+    assert_eq!(request.attachment_token, 7);
+    assert_eq!(request.target_addr, target_addr);
+    assert!(matches!(
+        &request.payload,
+        GlobalUdpPayloadBuffer::Shared(_)
+    ));
+    assert_eq!(&*request.payload, &[0x5a; 1200]);
+    request
+        .completion
+        .send(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "test completion failure",
+        )))
+        .expect("send completion error");
+
+    assert_eq!(
+        send_task.await.expect("global UDP send task"),
+        Err(vec![0x5a; 1200]),
+    );
+}
+
+#[tokio::test]
+async fn global_udp_sender_returns_payload_when_channel_is_closed() {
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let global_sender = SessionUdpSender::Global {
+        sender,
+        attachment_token: 8,
+    };
+    let payload = vec![0xa5; 64];
+
+    assert_eq!(
+        global_sender
+            .send_to(payload.clone(), SocketAddr::from((Ipv4Addr::LOCALHOST, 53)))
+            .await,
+        Err(payload),
+    );
+}
+
 #[test]
 fn global_udp_receive_pauses_only_for_full_detached_buffer() {
     assert!(!should_pause_global_udp_receive(true, 64, 64));

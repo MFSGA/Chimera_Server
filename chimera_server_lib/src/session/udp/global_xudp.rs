@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
+
 use tokio::{
     net::UdpSocket,
     sync::{Mutex, Notify, RwLock, mpsc, oneshot},
@@ -30,6 +32,9 @@ use super::{
     SessionUdpEvent, SessionUdpResponse, SessionUdpSender, SessionUdpWorker,
     TargetedUdpSessionKey, UDP_BUFFER_SIZE, UDP_SESSION_CHANNEL_CAPACITY,
 };
+
+// The release probe finds Vec cloning cheaper through 1024 bytes and shared Bytes cheaper at 1200.
+pub(crate) const GLOBAL_UDP_SHARED_PAYLOAD_THRESHOLD: usize = 1200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GlobalUdpWorkerKey {
@@ -105,10 +110,43 @@ pub(crate) struct GlobalUdpAttachment {
     pub(crate) traffic_context: Option<TrafficContext>,
 }
 
+pub(crate) enum GlobalUdpPayloadBuffer {
+    Owned(Vec<u8>),
+    Shared(Bytes),
+}
+
+impl GlobalUdpPayloadBuffer {
+    #[cfg(feature = "vless-reverse")]
+    pub(crate) fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Owned(payload) => Bytes::from(payload),
+            Self::Shared(payload) => payload,
+        }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(payload) => payload,
+            Self::Shared(payload) => payload.to_vec(),
+        }
+    }
+}
+
+impl std::ops::Deref for GlobalUdpPayloadBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(payload) => payload,
+            Self::Shared(payload) => payload,
+        }
+    }
+}
+
 pub(crate) struct GlobalUdpPayload {
     pub(crate) attachment_token: u64,
     pub(crate) target_addr: SocketAddr,
-    pub(crate) payload: Vec<u8>,
+    pub(crate) payload: GlobalUdpPayloadBuffer,
     pub(crate) completion: oneshot::Sender<std::io::Result<()>>,
 }
 
@@ -760,7 +798,7 @@ async fn start_global_reverse_udp_worker(
                     );
                     let payload_length = request.payload.len();
                     match session.send(
-                        bytes::Bytes::from(request.payload),
+                        request.payload.into_bytes(),
                         Some(Destination {
                             network: TargetNetwork::Udp,
                             location: target,
