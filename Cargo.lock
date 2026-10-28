@@ -463,7 +463,7 @@ name = "chimera_cli"
 version = "26.10.26"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "rand 0.10.3",
  "x25519-dalek 3.0.0",
@@ -501,7 +501,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake2",
  "blake3",
  "boringtun",
