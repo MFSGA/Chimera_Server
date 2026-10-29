@@ -1,4 +1,3 @@
-#[cfg(feature = "vless-reverse")]
 use bytes::Bytes;
 use tokio::task::JoinHandle;
 
@@ -70,20 +69,36 @@ impl SessionUdpSender {
                 sender,
                 attachment_token,
             } => {
-                let retry_payload = payload.clone();
+                let (payload, retry_payload) =
+                    if payload.len() >= GLOBAL_UDP_SHARED_PAYLOAD_THRESHOLD {
+                        let shared_payload = Bytes::from(payload);
+                        let retry_payload =
+                            GlobalUdpPayloadBuffer::Shared(shared_payload.clone());
+                        (
+                            GlobalUdpPayloadBuffer::Shared(shared_payload),
+                            retry_payload,
+                        )
+                    } else {
+                        let retry_payload = payload.clone();
+                        (
+                            GlobalUdpPayloadBuffer::Owned(payload),
+                            GlobalUdpPayloadBuffer::Owned(retry_payload),
+                        )
+                    };
                 let (completion, completed) = oneshot::channel();
-                sender
-                    .send(GlobalUdpPayload {
-                        attachment_token: *attachment_token,
-                        target_addr,
-                        payload,
-                        completion,
-                    })
-                    .await
-                    .map_err(|error| error.0.payload)?;
+                let request = GlobalUdpPayload {
+                    attachment_token: *attachment_token,
+                    target_addr,
+                    payload,
+                    completion,
+                };
+                if let Err(error) = sender.send(request).await {
+                    drop(error);
+                    return Err(retry_payload.into_vec());
+                }
                 match completed.await {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(retry_payload),
+                    Ok(Err(_)) | Err(_) => Err(retry_payload.into_vec()),
                 }
             }
         }
