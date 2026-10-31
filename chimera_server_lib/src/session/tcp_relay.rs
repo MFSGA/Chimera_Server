@@ -1,14 +1,20 @@
 use std::{
     io,
     sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    sync::watch,
+};
 use tracing::{info, warn};
 
-use crate::async_stream::AsyncStream;
+use crate::{
+    async_stream::AsyncStream,
+    traffic::{TrafficContext, record_transfer},
+};
 
 #[cfg(target_os = "linux")]
 mod linux_splice;
@@ -177,6 +183,184 @@ pub(crate) struct TcpRelayResult {
     fallback_reason: Option<RelayFallbackReason>,
 }
 
+pub(crate) struct RelayTrafficAccounting {
+    context: Option<TrafficContext>,
+    left_to_right_bypassed: AtomicU64,
+    right_to_left_bypassed: AtomicU64,
+}
+
+impl RelayTrafficAccounting {
+    pub(crate) fn new(context: Option<TrafficContext>) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            left_to_right_bypassed: AtomicU64::new(0),
+            right_to_left_bypassed: AtomicU64::new(0),
+        })
+    }
+
+    fn record_bypassed(&self, direction: RelayDirection, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let counter = match direction {
+            RelayDirection::LeftToRight => &self.left_to_right_bypassed,
+            RelayDirection::RightToLeft => &self.right_to_left_bypassed,
+        };
+        let increment = bytes as u64;
+        let _ =
+            counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(increment))
+            });
+    }
+}
+
+impl Drop for RelayTrafficAccounting {
+    fn drop(&mut self) {
+        let upload = self.left_to_right_bypassed.load(Ordering::Relaxed);
+        let download = self.right_to_left_bypassed.load(Ordering::Relaxed);
+        // Keep the single end-of-relay accounting event even when splice
+        // bypassed no bytes, matching the userspace relay completion path.
+        record_transfer(self.context.take(), upload, download);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelayDirection {
+    LeftToRight,
+    RightToLeft,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RelayProgress {
+    pub(super) activity_generation: u64,
+    pub(super) left_to_right_bytes: u64,
+    pub(super) right_to_left_bytes: u64,
+    pub(super) bypassed_left_to_right: u64,
+    pub(super) bypassed_right_to_left: u64,
+    pub(super) left_to_right_done: bool,
+    pub(super) right_to_left_done: bool,
+    effective_path: RelayEffectivePath,
+}
+
+impl Default for RelayProgress {
+    fn default() -> Self {
+        Self {
+            activity_generation: 0,
+            left_to_right_bytes: 0,
+            right_to_left_bytes: 0,
+            bypassed_left_to_right: 0,
+            bypassed_right_to_left: 0,
+            left_to_right_done: false,
+            right_to_left_done: false,
+            effective_path: RelayEffectivePath::UserspaceCopy,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RelayProgressReporter {
+    sender: Option<watch::Sender<RelayProgress>>,
+    accounting: Arc<RelayTrafficAccounting>,
+}
+
+impl RelayProgressReporter {
+    pub(super) fn new(
+        sender: watch::Sender<RelayProgress>,
+        accounting: Arc<RelayTrafficAccounting>,
+    ) -> Self {
+        Self {
+            sender: Some(sender),
+            accounting,
+        }
+    }
+
+    fn without_activity_watch(accounting: Arc<RelayTrafficAccounting>) -> Self {
+        Self {
+            sender: None,
+            accounting,
+        }
+    }
+
+    pub(super) fn activity(&self) {
+        if let Some(sender) = &self.sender {
+            sender.send_modify(|progress| {
+                progress.activity_generation =
+                    progress.activity_generation.saturating_add(1);
+            });
+        }
+    }
+
+    pub(super) fn bytes(&self, direction: RelayDirection, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(sender) = &self.sender {
+            sender.send_modify(|progress| {
+                progress.activity_generation =
+                    progress.activity_generation.saturating_add(1);
+                match direction {
+                    RelayDirection::LeftToRight => {
+                        progress.left_to_right_bytes = progress
+                            .left_to_right_bytes
+                            .saturating_add(bytes as u64);
+                    }
+                    RelayDirection::RightToLeft => {
+                        progress.right_to_left_bytes = progress
+                            .right_to_left_bytes
+                            .saturating_add(bytes as u64);
+                    }
+                }
+            });
+        }
+    }
+
+    fn bypassed_bytes(&self, direction: RelayDirection, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.accounting.record_bypassed(direction, bytes);
+        if let Some(sender) = &self.sender {
+            sender.send_modify(|progress| {
+                progress.activity_generation =
+                    progress.activity_generation.saturating_add(1);
+                match direction {
+                    RelayDirection::LeftToRight => {
+                        progress.left_to_right_bytes = progress
+                            .left_to_right_bytes
+                            .saturating_add(bytes as u64);
+                        progress.bypassed_left_to_right = progress
+                            .bypassed_left_to_right
+                            .saturating_add(bytes as u64);
+                    }
+                    RelayDirection::RightToLeft => {
+                        progress.right_to_left_bytes = progress
+                            .right_to_left_bytes
+                            .saturating_add(bytes as u64);
+                        progress.bypassed_right_to_left = progress
+                            .bypassed_right_to_left
+                            .saturating_add(bytes as u64);
+                    }
+                }
+            });
+        }
+    }
+
+    pub(super) fn direction_done(&self, direction: RelayDirection) {
+        if let Some(sender) = &self.sender {
+            sender.send_modify(|progress| match direction {
+                RelayDirection::LeftToRight => progress.left_to_right_done = true,
+                RelayDirection::RightToLeft => progress.right_to_left_done = true,
+            });
+        }
+    }
+
+    fn set_effective_path(&self, effective_path: RelayEffectivePath) {
+        if let Some(sender) = &self.sender {
+            sender.send_modify(|progress| progress.effective_path = effective_path);
+        }
+    }
+}
+
 impl TcpRelayResult {
     fn userspace(
         configured_backend: RelayBackend,
@@ -242,8 +426,62 @@ impl TcpRelayResult {
     pub(crate) fn fallback_reason(&self) -> Option<&'static str> {
         self.fallback_reason.map(RelayFallbackReason::as_str)
     }
+
+    pub(super) fn partial(progress: RelayProgress) -> Self {
+        Self {
+            left_to_right: progress.left_to_right_bytes,
+            right_to_left: progress.right_to_left_bytes,
+            bypassed_left_to_right: progress.bypassed_left_to_right,
+            bypassed_right_to_left: progress.bypassed_right_to_left,
+            configured_backend: configured_relay_backend(),
+            effective_path: progress.effective_path,
+            fallback_reason: None,
+        }
+    }
 }
 
+#[derive(Debug)]
+struct RelayErrorWithPartialResult {
+    source: io::Error,
+    partial_result: TcpRelayResult,
+}
+
+impl std::fmt::Display for RelayErrorWithPartialResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for RelayErrorWithPartialResult {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(super) fn error_with_partial_result(
+    error: io::Error,
+    progress: RelayProgress,
+) -> io::Error {
+    let kind = error.kind();
+    io::Error::new(
+        kind,
+        RelayErrorWithPartialResult {
+            source: error,
+            partial_result: TcpRelayResult::partial(progress),
+        },
+    )
+}
+
+pub(super) fn partial_result_from_error(
+    error: &io::Error,
+) -> Option<TcpRelayResult> {
+    error
+        .get_ref()?
+        .downcast_ref::<RelayErrorWithPartialResult>()
+        .map(|error| error.partial_result)
+}
+
+#[cfg(test)]
 pub(crate) async fn copy_bidirectional<A, B>(
     left: &mut A,
     right: &mut B,
@@ -252,9 +490,83 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    let copy_buffer = configured_copy_buffer();
+    copy_bidirectional_inner(left, right, None, None, configured_relay_backend())
+        .await
+}
+
+pub(crate) async fn copy_bidirectional_with_accounting<A, B>(
+    left: &mut A,
+    right: &mut B,
+    accounting: Arc<RelayTrafficAccounting>,
+) -> io::Result<TcpRelayResult>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    copy_bidirectional_inner(
+        left,
+        right,
+        Some(RelayProgressReporter::without_activity_watch(accounting)),
+        None,
+        configured_relay_backend(),
+    )
+    .await
+}
+
+pub(super) async fn copy_bidirectional_with_progress<A, B>(
+    left: &mut A,
+    right: &mut B,
+    progress: RelayProgressReporter,
+    buffer_size: Option<usize>,
+) -> io::Result<TcpRelayResult>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    copy_bidirectional_inner(
+        left,
+        right,
+        Some(progress),
+        buffer_size,
+        configured_relay_backend(),
+    )
+    .await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) async fn copy_bidirectional_with_downlink_splice_and_progress<A, B>(
+    left: &mut A,
+    right: &mut B,
+    progress: RelayProgressReporter,
+    buffer_size: Option<usize>,
+) -> io::Result<TcpRelayResult>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    copy_bidirectional_inner(
+        left,
+        right,
+        Some(progress),
+        buffer_size,
+        RelayBackend::SpliceDownlink,
+    )
+    .await
+}
+
+async fn copy_bidirectional_inner<A, B>(
+    left: &mut A,
+    right: &mut B,
+    progress: Option<RelayProgressReporter>,
+    buffer_size: Option<usize>,
+    backend: RelayBackend,
+) -> io::Result<TcpRelayResult>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    let copy_buffer = copy_buffer_with_override(buffer_size);
     let size = copy_buffer.size;
-    let backend = configured_relay_backend();
     match backend {
         RelayBackend::Copy => {
             let (left_to_right, right_to_left) =
@@ -271,7 +583,7 @@ where
         }
         #[cfg(target_os = "linux")]
         RelayBackend::Splice => {
-            relay_after_handoff_with_splice(left, right, size).await
+            relay_after_handoff_with_splice(left, right, size, progress).await
         }
         #[cfg(target_os = "linux")]
         RelayBackend::SpliceDownlink => {
@@ -282,6 +594,7 @@ where
                 size,
                 RelayBackend::SpliceDownlink,
                 None,
+                progress,
             )
             .await
         }
@@ -294,6 +607,7 @@ where
                 auto_uplink_copy_buffer_size(copy_buffer),
                 RelayBackend::Auto,
                 Some(configured_auto_max_connections()),
+                progress,
             )
             .await
         }
@@ -345,6 +659,7 @@ async fn relay_after_handoff_with_splice<A, B>(
     left: &mut A,
     right: &mut B,
     buffer_size: usize,
+    progress: Option<RelayProgressReporter>,
 ) -> io::Result<TcpRelayResult>
 where
     A: AsyncStream + ?Sized,
@@ -416,8 +731,11 @@ where
                 }
             };
 
+            if let Some(progress) = &progress {
+                progress.set_effective_path(RelayEffectivePath::Splice);
+            }
             let (bypassed_left_to_right, bypassed_right_to_left) =
-                splice.run().await?;
+                splice.run(progress).await?;
             Ok(TcpRelayResult::with_bypassed(
                 RelayBackend::Splice,
                 RelayEffectivePath::Splice,
@@ -438,6 +756,7 @@ async fn relay_after_handoff_with_downlink_splice<A, B>(
     uplink_buffer_size: usize,
     configured_backend: RelayBackend,
     auto_connection_limit: Option<usize>,
+    progress: Option<RelayProgressReporter>,
 ) -> io::Result<TcpRelayResult>
 where
     A: AsyncStream + ?Sized,
@@ -516,9 +835,13 @@ where
                 }
             };
 
+            if let Some(progress) = &progress {
+                progress.set_effective_path(RelayEffectivePath::SpliceDownlink);
+            }
+            let splice_progress = progress.clone();
             let (remaining_left_to_right, bypassed_right_to_left) = tokio::try_join!(
                 copy_one_direction(left, right, uplink_buffer_size),
-                downlink.run(),
+                downlink.run(splice_progress, RelayDirection::RightToLeft),
             )?;
             Ok(TcpRelayResult::with_bypassed(
                 configured_backend,
@@ -578,10 +901,6 @@ where
     ))
 }
 
-pub(super) fn configured_copy_buffer_size() -> usize {
-    configured_copy_buffer().size
-}
-
 fn configured_copy_buffer() -> CopyBufferConfig {
     *COPY_BUFFER_CONFIG.get_or_init(|| {
         let configured = std::env::var(ENV_COPY_BUFFER_SIZE).ok();
@@ -615,6 +934,16 @@ fn configured_copy_buffer() -> CopyBufferConfig {
             }
         }
     })
+}
+
+fn copy_buffer_with_override(buffer_size: Option<usize>) -> CopyBufferConfig {
+    match buffer_size {
+        Some(size) => CopyBufferConfig {
+            size,
+            explicit: true,
+        },
+        None => configured_copy_buffer(),
+    }
 }
 
 #[cfg(target_os = "linux")]

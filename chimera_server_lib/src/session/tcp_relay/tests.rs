@@ -219,6 +219,14 @@ fn default_uses_measured_thirty_two_kibibyte_buffer() {
     assert_eq!(parse_copy_buffer_size(None).unwrap(), 32 * 1024);
 }
 
+#[test]
+fn policy_copy_buffer_override_is_used_and_marked_explicit() {
+    let configured = copy_buffer_with_override(Some(96 * 1024));
+
+    assert_eq!(configured.size, 96 * 1024);
+    assert!(configured.explicit);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn auto_uplink_uses_measured_sixty_four_kibibyte_default() {
@@ -579,7 +587,7 @@ async fn splice_preserves_bidirectional_data_and_half_close() {
 
     let relay = tokio::spawn(async move {
         let _keep_alive = (left_relay, right_relay);
-        splice.run().await
+        splice.run(None).await
     });
 
     let left_payload = vec![0x5a; 1024 * 1024 + 17];
@@ -627,7 +635,7 @@ async fn downlink_splice_preserves_bidirectional_data_and_half_close() {
     let relay = tokio::spawn(async move {
         tokio::try_join!(
             copy_one_direction(&mut left_relay, &mut right_relay, 64 * 1024),
-            downlink.run(),
+            downlink.run(None, RelayDirection::RightToLeft),
         )
     });
 
@@ -659,6 +667,53 @@ async fn downlink_splice_preserves_bidirectional_data_and_half_close() {
         relay_result.unwrap(),
         (expected_upload.len() as u64, expected_download.len() as u64),
     );
+}
+
+#[cfg(all(target_os = "linux", feature = "traffic"))]
+#[tokio::test]
+async fn cancelled_splice_records_bytes_already_delivered() {
+    use crate::traffic::{TrafficContext, user_traffic};
+
+    static NEXT_ID: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    let identity = format!(
+        "cancelled-splice-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed),
+    );
+    let mut context = TrafficContext::new("test")
+        .with_identity(&identity)
+        .with_inbound_tag("cancelled-splice-test");
+    context.set_user_stats_policy(true, true, false);
+    let accounting = RelayTrafficAccounting::new(Some(context));
+    let progress = RelayProgressReporter::without_activity_watch(accounting);
+
+    let (mut left_peer, left_relay) = tcp_pair().await.unwrap();
+    let (mut right_peer, right_relay) = tcp_pair().await.unwrap();
+    let splice = SpliceDirection::new(
+        right_relay.as_raw_fd(),
+        left_relay.as_raw_fd(),
+        DEFAULT_SPLICE_PIPE_SIZE,
+    )
+    .unwrap();
+    let relay = tokio::spawn(async move {
+        let _keep_alive = (left_relay, right_relay);
+        splice
+            .run(Some(progress), RelayDirection::RightToLeft)
+            .await
+    });
+
+    let payload = vec![0x6d; 256 * 1024 + 19];
+    right_peer.write_all(&payload).await.unwrap();
+    let mut received = vec![0; payload.len()];
+    left_peer.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, payload);
+
+    relay.abort();
+    assert!(relay.await.unwrap_err().is_cancelled());
+
+    assert_eq!(user_traffic(&identity), Some((0, payload.len() as u64)));
 }
 
 #[cfg(target_os = "linux")]

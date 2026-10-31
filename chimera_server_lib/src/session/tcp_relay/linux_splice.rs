@@ -6,6 +6,8 @@ use std::{
 
 use tokio::io::unix::AsyncFd;
 
+use super::{RelayDirection, RelayProgressReporter};
+
 pub(super) struct SpliceRelay {
     pub(super) left_to_right: SpliceDirection,
     pub(super) right_to_left: SpliceDirection,
@@ -33,12 +35,18 @@ impl SpliceRelay {
         })
     }
 
-    pub(super) async fn run(self) -> io::Result<(u64, u64)> {
+    pub(super) async fn run(
+        self,
+        progress: Option<RelayProgressReporter>,
+    ) -> io::Result<(u64, u64)> {
         let Self {
             left_to_right,
             right_to_left,
         } = self;
-        tokio::try_join!(left_to_right.run(), right_to_left.run())
+        tokio::try_join!(
+            left_to_right.run(progress.clone(), RelayDirection::LeftToRight,),
+            right_to_left.run(progress, RelayDirection::RightToLeft),
+        )
     }
 }
 
@@ -79,7 +87,11 @@ impl SpliceDirection {
         })
     }
 
-    pub(super) async fn run(self) -> io::Result<u64> {
+    pub(super) async fn run(
+        self,
+        progress: Option<RelayProgressReporter>,
+        direction: RelayDirection,
+    ) -> io::Result<u64> {
         let mut pending = 0_usize;
         let mut transferred = 0_u64;
 
@@ -98,6 +110,9 @@ impl SpliceDirection {
                     Ok(Ok(written)) => {
                         pending -= written;
                         transferred = transferred.saturating_add(written as u64);
+                        if let Some(progress) = &progress {
+                            progress.bypassed_bytes(direction, written);
+                        }
                     }
                     Ok(Err(error)) => return Err(error),
                     Err(_would_block) => continue,
@@ -116,9 +131,19 @@ impl SpliceDirection {
             }) {
                 Ok(Ok(0)) => {
                     shutdown_write(self.destination.get_ref().as_raw_fd())?;
+                    if let Some(progress) = &progress {
+                        progress.direction_done(direction);
+                    }
                     return Ok(transferred);
                 }
-                Ok(Ok(read)) => pending = read,
+                Ok(Ok(read)) => {
+                    pending = read;
+                    if read > 0
+                        && let Some(progress) = &progress
+                    {
+                        progress.activity();
+                    }
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(_would_block) => continue,
             }

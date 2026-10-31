@@ -18,9 +18,9 @@ use crate::{
     resolver::Resolver,
     runtime::DataPlaneRuntime,
     session::{
-        policy_stream::copy_bidirectional_with_timeouts,
+        policy_stream::copy_bidirectional_with_timeouts_and_accounting,
         sniff::{SniffedRoutePlan, build_sniffed_route_plan, sniff_stream_protocol},
-        tcp_relay::copy_bidirectional,
+        tcp_relay::{self, RelayTrafficAccounting},
         udp::{
             run_bidirectional_udp, run_multi_directional_udp, run_session_based_udp,
         },
@@ -33,7 +33,7 @@ use crate::{
     util::prefixed_stream::PrefixedStream,
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 fn normalize_tcp_fallback(
     setup_outcome: TcpServerSetupOutcome,
@@ -437,7 +437,8 @@ where
                 .as_ref()
                 .map_or(0, |context| context.user_level);
             let _connection_guard = register_connection(traffic_context.as_ref());
-            let relay_traffic_context = traffic_context.clone();
+            let relay_accounting =
+                RelayTrafficAccounting::new(traffic_context.clone());
             let mut server_stream = MeteredStream::new(
                 server_stream,
                 traffic_context.clone(),
@@ -455,24 +456,47 @@ where
 
             let relay_timeouts = runtime.policy_relay_timeouts(user_level);
             let copy_result = if relay_timeouts.is_empty() {
-                copy_bidirectional(&mut server_stream, &mut client_stream).await
+                tcp_relay::copy_bidirectional_with_accounting(
+                    &mut server_stream,
+                    &mut client_stream,
+                    relay_accounting.clone(),
+                )
+                .await
             } else {
-                copy_bidirectional_with_timeouts(
+                copy_bidirectional_with_timeouts_and_accounting(
                     &mut server_stream,
                     &mut client_stream,
                     relay_timeouts,
+                    relay_accounting.clone(),
                 )
                 .await
             };
 
             let (_, _) =
                 futures::join!(server_stream.shutdown(), client_stream.shutdown());
-            let copy_result = copy_result?;
-            record_transfer(
-                relay_traffic_context,
-                copy_result.bypassed_left_to_right,
-                copy_result.bypassed_right_to_left,
-            );
+            let copy_result = match copy_result {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(partial) =
+                        tcp_relay::partial_result_from_error(&error)
+                    {
+                        warn!(
+                            relay_backend = partial.configured_backend(),
+                            relay_path = partial.effective_path(),
+                            relay_fallback = partial
+                                .fallback_reason()
+                                .unwrap_or("none"),
+                            bypassed_upload = partial.bypassed_left_to_right,
+                            bypassed_download = partial.bypassed_right_to_left,
+                            %error,
+                            "tcp forward stopped after relay error: client->remote {} bytes, remote->client {} bytes",
+                            partial.left_to_right,
+                            partial.right_to_left,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
 
             info!(
                 relay_backend = copy_result.configured_backend(),
