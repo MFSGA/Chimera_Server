@@ -5,9 +5,29 @@ use bytes::{Buf, BufMut, BytesMut};
 
 const EVENTS: usize = 2_000_000;
 const PAYLOAD_LEN: usize = 1200;
+const LEGACY_RECEIVE_BUFFER_SIZE: usize = 64 * 1024;
 
-fn run(keep_split: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Buffered,
+    Direct,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+fn run(mode: Mode) {
     let payload = vec![0x5a_u8; PAYLOAD_LEN];
+    let mut receive_buffer = match mode {
+        Mode::Buffered => Some(vec![0; LEGACY_RECEIVE_BUFFER_SIZE]),
+        Mode::Direct => None,
+    };
     let started = Instant::now();
     let mut checksum = 0_u64;
 
@@ -17,28 +37,31 @@ fn run(keep_split: bool) {
         input.extend_from_slice(black_box(&payload));
         let payload_len = input.get_u16() as usize;
         let split = input.split_to(payload_len);
-        if keep_split {
-            checksum = checksum.wrapping_add(black_box(split[0]) as u64);
-            black_box(split);
+        let owned = if mode == Mode::Buffered {
+            let buffer = receive_buffer
+                .as_mut()
+                .expect("buffered mode allocates a receive buffer");
+            buffer[..payload_len].copy_from_slice(&split);
+            buffer[..payload_len].to_vec()
         } else {
-            let owned = split.to_vec();
-            checksum = checksum.wrapping_add(black_box(owned[0]) as u64);
-            black_box(owned);
-        }
+            split.to_vec()
+        };
+        checksum = checksum.wrapping_add(black_box(owned[0]) as u64);
+        black_box(owned);
     }
 
     let elapsed = started.elapsed();
     println!(
-        "mode={} ns_per_payload={:.3} checksum={checksum}",
-        if keep_split { "split" } else { "vec" },
+        "mode={} payload_len={PAYLOAD_LEN} events={EVENTS} ns_per_payload={:.3} checksum={checksum}",
+        mode.name(),
         elapsed.as_nanos() as f64 / EVENTS as f64,
     );
 }
 
 fn main() {
     match std::env::var("XUDP_PAYLOAD_BENCH_MODE").as_deref() {
-        Ok("vec") => run(false),
-        Ok("split") => run(true),
-        _ => panic!("XUDP_PAYLOAD_BENCH_MODE must be vec or split"),
+        Ok("buffered") => run(Mode::Buffered),
+        Ok("direct") => run(Mode::Direct),
+        _ => panic!("XUDP_PAYLOAD_BENCH_MODE must be buffered or direct"),
     }
 }

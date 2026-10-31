@@ -1024,6 +1024,123 @@ traffic and a measured CPU/throughput benefit for larger packets in this
 channel/ack path; the aggregate production effect depends on the deployment's
 packet-size mix and still needs an end-to-end workload measurement.
 
+## Global XUDP multi-session probe
+
+For a release-server, real-Xray-client loopback load test that exercises the
+VLESS/XUDP framing and SOCKS UDP path, see [XUDP_E2E.md](XUDP_E2E.md).
+
+`global_xudp_probe` measures the current Global XUDP worker path across multiple
+simultaneous GlobalIDs. Each simulated GlobalID owns one unconnected Tokio UDP
+socket, one bounded request channel, one attachment with a token and traffic
+context, and one worker task. Its session producer sends one request at a time
+and waits for that request's oneshot completion, matching the current
+`SessionUdpSender::Global::send_to` call shape. The worker checks the attachment
+token, sends to a real loopback UDP echo target, validates the response source,
+and forwards the response through a bounded per-session channel. The probe
+also uses the real `chimera_server_lib::traffic::record_transfer_ref` and
+`user_traffic` APIs when accounting is enabled, and validates the exact
+per-user upload/download totals after each run. A configurable per-session
+in-flight window (default 16) limits outstanding echo responses so local kernel
+UDP queues do not turn an unrelated receive-buffer overflow into a hung sample.
+The probe reads the effective `SO_RCVBUF` after requesting 8 MiB and rejects a
+configuration if the estimated in-flight queue charge exceeds half the
+smallest effective receive buffer. The estimate adds 2 KiB per datagram for
+Linux packet metadata, then reserves half the reported buffer for estimation
+error and scheduling bursts. This is a conservative heuristic, not an exact
+kernel accounting model; the JSON summary reports the effective minimum, which
+Linux may clamp, so check it when comparing hosts.
+
+The `--accounting disabled` mode holds the socket, channel, completion,
+attachment, and response path constant while skipping only TrafficRecorder
+calls. It is a component-cost comparison, not an alternative production mode.
+The probe also mirrors the production 1200-byte `Vec`/`Bytes` retry-buffer
+threshold. Its sessions represent independent active GlobalIDs; a single
+GlobalID has one current attachment at a time, so this does not model concurrent
+attachments to the same ID.
+
+For an experimental direct-worker comparison, `--recycle-payload` returns the
+request's original buffer through the existing per-packet oneshot completion
+instead of keeping a retry copy. The simulated request also returns its owned
+buffer with an error when dropped. This flag models a candidate ownership
+change; it does not mean the production server has adopted it or verify the
+production worker's cancellation paths.
+
+Build and run on Linux with the CPU pinned. Compare accounting modes using the
+same host, session count, packet size, run order, and packet count. The reported
+CV should be at most 3% before treating differences as stable:
+
+```bash
+cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
+  --bin global_xudp_probe
+for sessions in 16 64; do
+  packets_per_session=$((262144 / sessions))
+  for pair in $(seq 0 9); do
+    if (( pair % 2 == 0 )); then
+      accounting_modes=(enabled disabled)
+    else
+      accounting_modes=(disabled enabled)
+    fi
+    for accounting in "${accounting_modes[@]}"; do
+      taskset -c 0-7 bench/chimera_perf/target/release/global_xudp_probe \
+        --worker-threads 8 --sessions "$sessions" \
+        --packets-per-session "$packets_per_session" \
+        --datagram-size 1200 --channel-capacity 64 \
+        --inflight-window 16 --accounting "$accounting" \
+        --warmup 1 --runs 1
+    done
+  done
+done | tee global-xudp-paired.jsonl
+```
+
+This is an in-process loopback mechanism probe, not an end-to-end XUDP client
+benchmark. It excludes XUDP framing and stream parsing, listener work, routing
+and DNS, remote network latency, and NIC queueing. Its response consumer uses a
+bounded channel but does not serialize and flush responses to a client stream;
+it therefore omits the production `SessionUdpEvent` write/flush cost, stale
+session-generation checks, detached/reconnected attachment handling, and
+pending-response retry path. The probe isolates the worker queue/socket/ack
+path and accounting calls under controlled local conditions; use a real-client
+end-to-end workload before drawing conclusions about deployed throughput.
+
+### Initial local sample
+
+On Linux 6.18.35, an AMD Ryzen 7 5800, Rust 1.98.0, CPUs 0–7 pinned,
+8 worker threads, a 1,200-byte datagram, a 64-entry request queue, a 16-packet
+in-flight window, and an effective 8 MiB `SO_RCVBUF`, each measured invocation
+sent 262,144 roundtrips after one warmup. Ten enabled/disabled pairs were run
+in alternating order:
+
+| GlobalIDs | Accounting | Median roundtrips/s | Across-invocation CV |
+| ---: | --- | ---: | ---: |
+| 16 | enabled | 166,875 | 2.12% |
+| 16 | disabled | 168,261 | 1.76% |
+| 64 | enabled | 168,244 | 7.30% |
+| 64 | disabled | 159,870 | 6.26% |
+
+For 16 GlobalIDs, the median paired throughput difference (enabled relative to
+disabled) was -0.04%, with individual pairs ranging from -5.78% to +3.20%.
+The per-mode CV passed the 3% screen, but pair-to-pair spread remains wider
+than the median difference; this sample does not resolve a measurable
+TrafficRecorder throughput cost. At 64 GlobalIDs, both CVs exceed 3%, so those
+throughput medians are inconclusive. This loopback sample is a baseline for
+future comparisons, not evidence that accounting has zero cost or that the
+observed rates predict production throughput.
+
+### Retry-buffer recycling candidate sample
+
+On the same host and CPU pinning, eight alternating pairs compared the current
+clone path with `--recycle-payload` at 64 GlobalIDs, 512-byte payloads, 131,072
+roundtrips per invocation, one warmup invocation, and accounting disabled. The
+current path measured a median 177,723 roundtrips/s (3.25% across-invocation
+CV); recycling measured 178,446 roundtrips/s (1.24% CV). The median paired
+throughput change was +0.41%, ranging from -0.67% to +8.45%. CPU seconds per
+million roundtrips changed by a median -1.61%, with paired changes ranging
+from -7.35% to +3.25%; the current and recycling path CVs were 3.96% and 2.52%.
+The noisy baseline and broad paired spread do not establish a repeatable gain,
+so this remains a probe-only candidate and does not justify a production-path
+change. The loopback probe is mechanism-level evidence, not an end-to-end
+Xray-client result.
+
 ## UDP shared response socket probe
 
 `udp_shared_socket_probe` closes the largest remaining topology gap. It creates

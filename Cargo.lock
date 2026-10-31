@@ -480,6 +480,7 @@ dependencies = [
  "h2",
  "http",
  "hyper-util",
+ "libc",
  "prost",
  "rcgen",
  "rustls",

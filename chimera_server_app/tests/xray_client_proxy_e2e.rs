@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+
 use aws_lc_rs::digest::{SHA256, digest};
 use prost::Message;
 use rustls::{
@@ -148,6 +151,11 @@ impl ChildGuard {
             Err(err) => panic!("failed to poll {}: {err}", self.name),
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for ChildGuard {
@@ -171,6 +179,30 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
 
     let chimera_config_path = work_dir.join("chimera-reality-vision.json");
     let xray_config_path = work_dir.join("xray-reality-vision-client.json");
+    let mut loopback_rules = vec![
+        json!({
+            "action": "allow",
+            "network": "tcp",
+            "port": echo_addr.port(),
+            "ip": "127.0.0.1/32"
+        }),
+        json!({
+            "action": "allow",
+            "network": "tcp",
+            "port": tls_echo_addr.port(),
+            "ip": "127.0.0.1/32"
+        }),
+    ];
+    if let Some(domain_echo_addr) = domain_echo_addr {
+        for ip in ["127.0.0.1/32", "::1/128"] {
+            loopback_rules.push(json!({
+                "action": "allow",
+                "network": "tcp",
+                "port": domain_echo_addr.port(),
+                "ip": ip
+            }));
+        }
+    }
 
     write_json(
         &chimera_config_path,
@@ -202,7 +234,8 @@ async fn xray_client_can_proxy_tcp_through_chimera_reality_vision() {
             }],
             "outbounds": [{
                 "tag": "direct",
-                "protocol": "freedom"
+                "protocol": "freedom",
+                "settings": {"finalRules": loopback_rules}
             }]
         }),
     );
@@ -3634,7 +3667,16 @@ async fn xray_client_xudp_domain_access_policy_allows_and_rejects_target() {
                 },
                 "streamSettings": {"network": "tcp", "security": "none"}
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": [{
+                    "action": "allow",
+                    "network": "udp",
+                    "port": udp_echo_addr.port(),
+                    "ip": "127.0.0.1/32"
+                }]}
+            }],
             "dns": {
                 "hosts": {
                     "allowed.example": echo_ip,
@@ -3728,7 +3770,16 @@ async fn xray_client_remote_policy_update_reaches_new_xudp_session() {
                 },
                 "streamSettings": {"network": "tcp", "security": "none"}
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": [{
+                    "action": "allow",
+                    "network": "udp",
+                    "port": udp_echo_addr.port(),
+                    "ip": "127.0.0.1/32"
+                }]}
+            }],
             "dns": {"hosts": {
                 "allowed.example": echo_ip,
                 "blocked.example": echo_ip
@@ -3809,6 +3860,305 @@ async fn xray_client_remote_policy_update_reaches_new_xudp_session() {
         udp_echo_addr.port(),
     )
     .await;
+}
+
+// This manual benchmark is Linux-only because process CPU and RSS are sampled from /proc.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "manual Xray VLESS XUDP end-to-end throughput and latency probe"]
+async fn xray_client_global_xudp_end_to_end_perf_probe() {
+    let workspace = workspace_root();
+    let work_dir = create_test_dir("vless-global-xudp-perf");
+    let chimera_port = free_localhost_port();
+    let xray_socks_port = free_localhost_port();
+    let chimera_config_path = work_dir.join("chimera.json");
+    let xray_config_path = work_dir.join("xray-client.json");
+    let xray_version = xray_version_triplet(&workspace);
+    let sessions = xudp_perf_env("CHIMERA_XUDP_E2E_SESSIONS", 16);
+    let packets_per_session =
+        xudp_perf_env("CHIMERA_XUDP_E2E_PACKETS_PER_SESSION", 2048);
+    let datagram_size = xudp_perf_env("CHIMERA_XUDP_E2E_DATAGRAM_SIZE", 1200);
+    let inflight_window = xudp_perf_env("CHIMERA_XUDP_E2E_INFLIGHT_WINDOW", 4);
+    let warmup_packets = xudp_perf_env("CHIMERA_XUDP_E2E_WARMUP_PACKETS", 16);
+    let runs = xudp_perf_env("CHIMERA_XUDP_E2E_RUNS", 5);
+
+    assert!((1..=128).contains(&sessions), "sessions must be 1..=128");
+    assert!(packets_per_session > 0, "packet count must be nonzero");
+    assert!(packets_per_session <= u32::MAX as usize);
+    assert!(
+        (8..=4096).contains(&datagram_size),
+        "datagram size must be 8..=4096"
+    );
+    assert!((1..=256).contains(&inflight_window));
+    assert!(runs > 0 && runs <= 20, "runs must be 1..=20");
+    let (udp_echo_addr, echo_counters) =
+        start_xudp_perf_echo_server(sessions, runs).await;
+
+    write_json(
+        &chimera_config_path,
+        json!({
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": chimera_port,
+                "protocol": "vless",
+                "tag": "chimera-vless-global-xudp-perf",
+                "settings": {
+                    "clients": [{"id": TEST_UUID, "email": "xudp-perf@example.test"}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": [{
+                    "action": "allow",
+                    "network": "udp",
+                    "port": udp_echo_addr.port(),
+                    "ip": "127.0.0.1/32"
+                }]}
+            }]
+        }),
+    );
+    write_json(
+        &xray_config_path,
+        json!({
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": xray_socks_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }],
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "127.0.0.1",
+                        "port": chimera_port,
+                        "users": [{"id": TEST_UUID, "encryption": "none"}]
+                    }]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"},
+                "mux": {"enabled": true, "concurrency": 4, "xudpConcurrency": 4}
+            }]
+        }),
+    );
+
+    let chimera_binary = env::var_os("CHIMERA_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target/release/chimera_server_app"));
+    assert!(
+        chimera_binary.is_file(),
+        "release server binary not found at {}; build it with `cargo build --release -p chimera_server_app` or set CHIMERA_BIN",
+        chimera_binary.display()
+    );
+    let mut chimera = ChildGuard::spawn(
+        "chimera",
+        &chimera_binary,
+        &[
+            "--config",
+            chimera_config_path.to_str().expect("config utf8"),
+            "--format",
+            "json",
+        ],
+        &work_dir,
+    )
+    .expect("start release Chimera server");
+    wait_for_tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, chimera_port)));
+    chimera.assert_running();
+    let mut xray = start_xray(&workspace, &work_dir, &xray_config_path);
+    let socks_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, xray_socks_port));
+    wait_for_tcp(socks_addr);
+    xray.assert_running();
+
+    // Reuse the same client associations across runs so measurements reflect
+    // steady-state GlobalID sessions instead of repeated setup and expiry.
+    let mut associations = Vec::with_capacity(sessions);
+    for _ in 0..sessions {
+        associations.push(open_xray_socks_udp_association(socks_addr).await);
+    }
+    for (session_id, association) in associations.iter().enumerate() {
+        let warmup = run_xudp_perf_session(
+            Arc::clone(&association.udp),
+            association.relay_addr,
+            XudpPerfSessionConfig {
+                target_addr: udp_echo_addr,
+                session_id: 0x8000_0000 | session_id as u32,
+                packet_count: warmup_packets,
+                datagram_size,
+                inflight_window,
+                stale_session_ids: &[],
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("XUDP warmup session {session_id} failed: {error}")
+        });
+        assert_eq!(warmup.sent_packets, warmup_packets);
+        assert_eq!(warmup.received_packets, warmup_packets);
+        assert_eq!(warmup.response_timeout_packets, 0);
+        assert_eq!(warmup.not_sent_packets, 0);
+    }
+
+    println!(
+        "xudp_e2e_environment={{\"xray_version\":\"{}.{}.{}\",\"chimera_binary\":\"release\",\"sessions\":{sessions},\"packets_per_session\":{packets_per_session},\"datagram_size\":{datagram_size},\"inflight_window\":{inflight_window},\"warmup_packets\":{warmup_packets},\"runs\":{runs},\"xudp_concurrency\":4}}",
+        xray_version.0, xray_version.1, xray_version.2
+    );
+
+    for run in 0..runs {
+        let server_before = linux_process_snapshot(chimera.pid())
+            .expect("read Chimera process metrics before run");
+        let xray_before = linux_process_snapshot(xray.pid())
+            .expect("read Xray process metrics before run");
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(sessions + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (session_id, association) in associations.iter().enumerate() {
+            let udp = Arc::clone(&association.udp);
+            let relay_addr = association.relay_addr;
+            let barrier = Arc::clone(&start_barrier);
+            let stale_session_ids = (0..run)
+                .map(|previous_run| (previous_run * sessions + session_id) as u32)
+                .collect::<Vec<_>>();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                let result = run_xudp_perf_session(
+                    udp,
+                    relay_addr,
+                    XudpPerfSessionConfig {
+                        target_addr: udp_echo_addr,
+                        session_id: (run * sessions + session_id) as u32,
+                        packet_count: packets_per_session,
+                        datagram_size,
+                        inflight_window,
+                        stale_session_ids: &stale_session_ids,
+                    },
+                )
+                .await;
+                (session_id, result)
+            });
+        }
+
+        let wall_started = tokio::time::Instant::now();
+        start_barrier.wait().await;
+        let mut session_samples = Vec::with_capacity(sessions);
+        while let Some(result) = tasks.join_next().await {
+            let (session_id, result) = result.expect("XUDP load task panicked");
+            let sample = result.unwrap_or_else(|error| {
+                panic!("XUDP load session {session_id} failed: {error}")
+            });
+            session_samples.push(sample);
+        }
+        let elapsed = wall_started.elapsed();
+        let server_after = linux_process_snapshot(chimera.pid())
+            .expect("read Chimera process metrics after run");
+        let xray_after = linux_process_snapshot(xray.pid())
+            .expect("read Xray process metrics after run");
+        let echo_received = echo_counters.by_run[run]
+            .datagrams_received
+            .load(Ordering::Relaxed);
+        let echo_echoed = echo_counters.by_run[run]
+            .datagrams_echoed
+            .load(Ordering::Relaxed);
+        chimera.assert_running();
+        xray.assert_running();
+
+        let offered_packets = sessions * packets_per_session;
+        let sent_packets = session_samples
+            .iter()
+            .map(|sample| sample.sent_packets)
+            .sum::<usize>();
+        let received_packets = session_samples
+            .iter()
+            .map(|sample| sample.received_packets)
+            .sum::<usize>();
+        let response_timeout_packets = session_samples
+            .iter()
+            .map(|sample| sample.response_timeout_packets)
+            .sum::<usize>();
+        let not_sent_packets = session_samples
+            .iter()
+            .map(|sample| sample.not_sent_packets)
+            .sum::<usize>();
+        let stale_response_packets = session_samples
+            .iter()
+            .map(|sample| sample.stale_response_packets)
+            .sum::<usize>();
+        let first_send_at = session_samples
+            .iter()
+            .filter_map(|sample| sample.first_send_at)
+            .min();
+        let last_response_at = session_samples
+            .iter()
+            .filter_map(|sample| sample.last_response_at)
+            .max();
+        let response_span_seconds = match (first_send_at, last_response_at) {
+            (Some(first_send), Some(last_response)) => {
+                last_response.duration_since(first_send).as_secs_f64()
+            }
+            _ => 0.0,
+        };
+        let mut sorted_latencies = session_samples
+            .iter()
+            .flat_map(|sample| sample.latencies_microseconds.iter().copied())
+            .collect::<Vec<_>>();
+        let (p50_us, p99_us) = if sorted_latencies.is_empty() {
+            (0, 0)
+        } else {
+            (
+                percentile_microseconds(&mut sorted_latencies, 50, 100),
+                percentile_microseconds(&mut sorted_latencies, 99, 100),
+            )
+        };
+        let elapsed_seconds = elapsed.as_secs_f64();
+        let active_packet_rate = if response_span_seconds == 0.0 {
+            0.0
+        } else {
+            received_packets as f64 / response_span_seconds
+        };
+        let wall_packet_rate = received_packets as f64 / elapsed_seconds;
+        let server_cpu_seconds =
+            server_after.cpu_seconds - server_before.cpu_seconds;
+        let xray_cpu_seconds = xray_after.cpu_seconds - xray_before.cpu_seconds;
+
+        println!(
+            "{}",
+            json!({
+                "record_type": "xray-client-global-xudp-e2e",
+                "run": run + 1,
+                "xray_version": format!("{}.{}.{}", xray_version.0, xray_version.1, xray_version.2),
+                "sessions": sessions,
+                "offered_packets": offered_packets,
+                "sent_packets": sent_packets,
+                "received_packets": received_packets,
+                "echo_target_received_packets": echo_received,
+                "echo_target_echoed_packets": echo_echoed,
+                "response_timeout_packets": response_timeout_packets,
+                "not_sent_packets": not_sent_packets,
+                "stale_response_packets": stale_response_packets,
+                "datagram_size": datagram_size,
+                "inflight_window": inflight_window,
+                "elapsed_seconds": elapsed_seconds,
+                "response_span_seconds": response_span_seconds,
+                "received_roundtrips_per_active_second": active_packet_rate,
+                "wall_received_roundtrips_per_second": wall_packet_rate,
+                "rtt_p50_microseconds": p50_us,
+                "rtt_p99_microseconds": p99_us,
+                "chimera_cpu_seconds": server_cpu_seconds,
+                "chimera_cpu_per_million_received_packets": if received_packets == 0 { 0.0 } else { server_cpu_seconds * 1_000_000.0 / received_packets as f64 },
+                "chimera_cpu_one_core_percent": server_cpu_seconds * 100.0 / elapsed_seconds,
+                "chimera_rss_start_kib": server_before.rss_kib,
+                "chimera_rss_end_kib": server_after.rss_kib,
+                "chimera_peak_rss_kib": server_after.peak_rss_kib,
+                "xray_cpu_seconds": xray_cpu_seconds,
+                "xray_cpu_per_million_received_packets": if received_packets == 0 { 0.0 } else { xray_cpu_seconds * 1_000_000.0 / received_packets as f64 },
+                "xray_cpu_one_core_percent": xray_cpu_seconds * 100.0 / elapsed_seconds,
+                "xray_rss_start_kib": xray_before.rss_kib,
+                "xray_rss_end_kib": xray_after.rss_kib,
+                "xray_peak_rss_kib": xray_after.peak_rss_kib
+            })
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5765,6 +6115,73 @@ fn try_start_tcp_echo_server_on(bind_addr: SocketAddr) -> io::Result<SocketAddr>
     Ok(addr)
 }
 
+#[cfg(target_os = "linux")]
+struct XudpPerfEchoCounters {
+    sessions_per_run: usize,
+    by_run: Vec<XudpPerfEchoRunCounters>,
+}
+
+#[cfg(target_os = "linux")]
+struct XudpPerfEchoRunCounters {
+    datagrams_received: AtomicUsize,
+    datagrams_echoed: AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+async fn start_xudp_perf_echo_server(
+    sessions_per_run: usize,
+    runs: usize,
+) -> (SocketAddr, Arc<XudpPerfEchoCounters>) {
+    let socket = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind XUDP performance echo server");
+    let addr = socket.local_addr().expect("XUDP performance echo address");
+    let counters = Arc::new(XudpPerfEchoCounters {
+        sessions_per_run,
+        by_run: (0..runs)
+            .map(|_| XudpPerfEchoRunCounters {
+                datagrams_received: AtomicUsize::new(0),
+                datagrams_echoed: AtomicUsize::new(0),
+            })
+            .collect(),
+    });
+    let task_counters = Arc::clone(&counters);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            let run_counters = (len >= 4)
+                .then(|| u32::from_be_bytes(buf[..4].try_into().unwrap()))
+                .and_then(|session_id| task_counters.for_session(session_id));
+            if let Some(run_counters) = run_counters {
+                run_counters
+                    .datagrams_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            match socket.send_to(&buf[..len], peer).await {
+                Ok(sent) if sent == len => {
+                    if let Some(run_counters) = run_counters {
+                        run_counters
+                            .datagrams_echoed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+    (addr, counters)
+}
+
+#[cfg(target_os = "linux")]
+impl XudpPerfEchoCounters {
+    fn for_session(&self, session_id: u32) -> Option<&XudpPerfEchoRunCounters> {
+        if session_id & 0x8000_0000 != 0 {
+            return None;
+        }
+        self.by_run.get(session_id as usize / self.sessions_per_run)
+    }
+}
+
 async fn start_udp_echo_server() -> SocketAddr {
     let socket = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -6184,6 +6601,303 @@ async fn assert_socks5_udp_echo(
         payload.len()
     );
     assert_eq!(&response[payload_offset..len], payload);
+}
+
+#[cfg(target_os = "linux")]
+struct XraySocksUdpAssociation {
+    _control: tokio::net::TcpStream,
+    udp: Arc<TokioUdpSocket>,
+    relay_addr: SocketAddr,
+}
+
+#[cfg(target_os = "linux")]
+struct XudpPerfSessionSample {
+    latencies_microseconds: Vec<u64>,
+    sent_packets: usize,
+    received_packets: usize,
+    response_timeout_packets: usize,
+    not_sent_packets: usize,
+    stale_response_packets: usize,
+    first_send_at: Option<tokio::time::Instant>,
+    last_response_at: Option<tokio::time::Instant>,
+}
+
+#[cfg(target_os = "linux")]
+struct XudpPerfSessionConfig<'a> {
+    target_addr: SocketAddr,
+    session_id: u32,
+    packet_count: usize,
+    datagram_size: usize,
+    inflight_window: usize,
+    stale_session_ids: &'a [u32],
+}
+
+#[cfg(target_os = "linux")]
+const XUDP_PERF_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+async fn open_xray_socks_udp_association(
+    socks_addr: SocketAddr,
+) -> XraySocksUdpAssociation {
+    let mut control = tokio::net::TcpStream::connect(socks_addr)
+        .await
+        .expect("connect Xray SOCKS UDP control");
+    control
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("write Xray SOCKS UDP greeting");
+    let mut greeting = [0u8; 2];
+    control
+        .read_exact(&mut greeting)
+        .await
+        .expect("read Xray SOCKS UDP greeting");
+    assert_eq!(greeting, [0x05, 0x00]);
+
+    control
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("request Xray SOCKS UDP association");
+    let mut response = [0u8; 4];
+    control
+        .read_exact(&mut response)
+        .await
+        .expect("read Xray SOCKS UDP association response");
+    assert_eq!(response[0], 0x05);
+    assert_eq!(response[1], 0x00, "Xray SOCKS UDP association failed");
+    let mut relay_addr =
+        read_async_socks_bound_address(&mut control, response[3]).await;
+    if relay_addr.ip().is_unspecified() {
+        relay_addr.set_ip(socks_addr.ip());
+    }
+
+    let udp = TokioUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind Xray SOCKS UDP client socket");
+    XraySocksUdpAssociation {
+        _control: control,
+        udp: Arc::new(udp),
+        relay_addr,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_xudp_perf_session(
+    udp: Arc<TokioUdpSocket>,
+    relay_addr: SocketAddr,
+    config: XudpPerfSessionConfig<'_>,
+) -> io::Result<XudpPerfSessionSample> {
+    let XudpPerfSessionConfig {
+        target_addr,
+        session_id,
+        packet_count,
+        datagram_size,
+        inflight_window,
+        stale_session_ids,
+    } = config;
+    let target_ip = match target_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "XUDP performance target must be IPv4",
+            ));
+        }
+    };
+    let mut request = vec![0; datagram_size + 10];
+    request[..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    request[4..8].copy_from_slice(&target_ip.octets());
+    request[8..10].copy_from_slice(&target_addr.port().to_be_bytes());
+    let mut response = vec![0; datagram_size + 64];
+    let mut pending = HashMap::with_capacity(inflight_window);
+    let mut latencies = Vec::with_capacity(packet_count);
+    let mut next_sequence = 0usize;
+    let mut stale_response_packets = 0usize;
+    let mut first_send_at = None;
+    let mut last_response_at = None;
+
+    while next_sequence < packet_count || !pending.is_empty() {
+        while next_sequence < packet_count && pending.len() < inflight_window {
+            let sequence = next_sequence as u32;
+            let marker = session_id.wrapping_mul(31).wrapping_add(sequence) as u8;
+            request[10..14].copy_from_slice(&session_id.to_be_bytes());
+            request[14..18].copy_from_slice(&sequence.to_be_bytes());
+            request[18..].fill(marker);
+            let sent_at = tokio::time::Instant::now();
+            udp.send_to(&request, relay_addr).await?;
+            first_send_at.get_or_insert_with(tokio::time::Instant::now);
+            pending.insert(sequence, sent_at);
+            next_sequence += 1;
+        }
+
+        let (length, source) = match tokio::time::timeout(
+            XUDP_PERF_RESPONSE_TIMEOUT,
+            udp.recv_from(&mut response),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => break,
+        };
+        if source != relay_addr {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Xray SOCKS UDP response came from unexpected source {source}"
+                ),
+            ));
+        }
+        let payload_offset = socks_udp_payload_offset(&response[..length]);
+        let Some(payload_length) = length.checked_sub(payload_offset) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Xray SOCKS UDP response address header was truncated",
+            ));
+        };
+        if payload_length != datagram_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Xray SOCKS UDP response payload length was {payload_length}, expected {datagram_size}"
+                ),
+            ));
+        }
+        let payload = &response[payload_offset..length];
+        let response_session = u32::from_be_bytes(payload[..4].try_into().unwrap());
+        let sequence = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+        let marker =
+            (response_session.wrapping_mul(31).wrapping_add(sequence)) as u8;
+        if payload[8..].iter().any(|byte| *byte != marker) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("XUDP response payload changed for sequence {sequence}"),
+            ));
+        }
+        if response_session != session_id {
+            if stale_session_ids.contains(&response_session) {
+                stale_response_packets += 1;
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "XUDP response was routed to session {response_session}, expected {session_id}"
+                ),
+            ));
+        }
+        let Some(sent_at) = pending.remove(&sequence) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate or unexpected XUDP response sequence {sequence}"),
+            ));
+        };
+        let received_at = tokio::time::Instant::now();
+        latencies.push(received_at.duration_since(sent_at).as_micros() as u64);
+        last_response_at = Some(received_at);
+    }
+
+    let received_packets = latencies.len();
+    Ok(XudpPerfSessionSample {
+        latencies_microseconds: latencies,
+        sent_packets: next_sequence,
+        received_packets,
+        response_timeout_packets: next_sequence - received_packets,
+        not_sent_packets: packet_count - next_sequence,
+        stale_response_packets,
+        first_send_at,
+        last_response_at,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn xudp_perf_env(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name} must be an integer: {error}"))
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(target_os = "linux")]
+fn percentile_microseconds(
+    samples: &mut [u64],
+    numerator: usize,
+    denominator: usize,
+) -> u64 {
+    assert!(!samples.is_empty());
+    samples.sort_unstable();
+    let rank = samples
+        .len()
+        .saturating_mul(numerator)
+        .div_ceil(denominator);
+    samples[rank.saturating_sub(1).min(samples.len() - 1)]
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxProcessSnapshot {
+    cpu_seconds: f64,
+    rss_kib: u64,
+    peak_rss_kib: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_snapshot(pid: u32) -> io::Result<LinuxProcessSnapshot> {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let status = fs::read_to_string(proc_dir.join("status"))?;
+    let rss_kib = linux_status_kib(&status, "VmRSS:")?;
+    let peak_rss_kib = linux_status_kib(&status, "VmHWM:")?;
+    let stat = fs::read_to_string(proc_dir.join("stat"))?;
+    let command_end = stat.rfind(')').ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "invalid Linux process stat")
+    })?;
+    let fields = stat[command_end + 1..]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user_ticks = fields
+        .get(11)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing process utime")
+        })?
+        .parse::<u64>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let system_ticks = fields
+        .get(12)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing process stime")
+        })?
+        .parse::<u64>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    // SAFETY: sysconf reads no pointers; _SC_CLK_TCK is a valid Linux selector.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(LinuxProcessSnapshot {
+        cpu_seconds: (user_ticks + system_ticks) as f64 / ticks_per_second as f64,
+        rss_kib,
+        peak_rss_kib,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_status_kib(status: &str, name: &str) -> io::Result<u64> {
+    status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing {name} in Linux process status"),
+            )
+        })
 }
 
 async fn assert_socks5_udp_domain_echo(

@@ -1,42 +1,67 @@
-# XUDP payload handoff copy benchmark
+# XUDP session payload handoff
 
-This iteration re-ranked a non-TCP data-plane hotspot after the current TCP Brutal2 relay/readiness and ACK arithmetic lines had largely converged. The XUDP reader already owns each complete frame in a `BytesMut`, then `split_to()` isolates the payload. The production path immediately called `.to_vec()` on that split before sending it through the bounded reader channel, which adds one heap allocation and one full payload copy before `poll_read_session_message()` copies the payload into the caller's `ReadBuf`.
+The XUDP frame decoder already uses `BytesMut::split_to()` to isolate the
+payload and passes that owned buffer through the bounded reader channel. The
+old session handoff then copied the payload into a per-connection 64 KiB
+`ReadBuf`, after which `run_session_based_udp()` copied it again into the
+`Vec<u8>` required by the existing worker sender.
 
-The candidate keeps the `BytesMut` returned by `split_to()` as the private `DecodedFrame`/`IncomingMessage` payload. Frame parsing, channel capacity/backpressure, target resolution, session state, and the final `ReadBuf::put_slice()` copy are unchanged. This removes only the intermediate allocation/copy; no unsafe code or new syscall path is introduced.
+`SessionMessage::Data` now owns a `Vec<u8>`. `XudpMessageStream` copies the
+decoded payload into that vector once, and the session owner moves it directly
+to the worker path. This removes one payload copy and the fixed 64 KiB scratch
+allocation per session-based UDP connection. Routing, target selection,
+GlobalID attachment, traffic accounting, queue backpressure, retries, and XUDP
+wire framing are unchanged. A single payload copy remains deliberately: it
+releases the decoder's shared read-buffer allocation before routing or worker
+queue delays can extend its lifetime.
 
-## Focused benchmark
+## Focused component benchmark
 
-`xudp_payload_copy_bench` models the exact ownership choice for a 1200-byte UDP payload. Both modes allocate/fill the same input `BytesMut`, parse the same two-byte length, and call `split_to(payload_len)`. `vec` then performs the production `.to_vec()` copy while `split` retains the split buffer. Each process handles two million payloads.
+`xudp_payload_copy_bench` compares the old session handoff (`buffered`: copy
+into the legacy 64 KiB scratch buffer, then copy into a `Vec`) with the new
+handoff (`direct`: copy the split payload directly into the owned `Vec`). Both
+modes construct and parse the same length-prefixed `BytesMut` payload and run
+two million 1,200-byte payloads per invocation.
 
 ```bash
 cargo build --release --manifest-path bench/chimera_perf/Cargo.toml \
   --bin xudp_payload_copy_bench
 
-XUDP_PAYLOAD_BENCH_MODE=vec taskset -c 0 \
+XUDP_PAYLOAD_BENCH_MODE=buffered taskset -c 0 \
   bench/chimera_perf/target/release/xudp_payload_copy_bench
-XUDP_PAYLOAD_BENCH_MODE=split taskset -c 0 \
+XUDP_PAYLOAD_BENCH_MODE=direct taskset -c 0 \
   bench/chimera_perf/target/release/xudp_payload_copy_bench
 ```
 
-After three warmup pairs, ten independent alternating-order pairs measured:
+On Linux 6.18.35, an AMD Ryzen 7 5800, Rust 1.98.0, and CPU 0 pinned, three
+warmup pairs were followed by 20 alternating-order pairs. All results had the
+same checksum:
 
-- `vec` median: **89.442 ns/payload**
-- `split` median: **64.148 ns/payload**
-- paired `split / vec` ratio median: **0.710x**
-- paired ratio range: **0.640x-0.747x**
-- favorable pairs: **10/10**
-- all runs produced the same checksum
+| Mode | Median ns/payload | Across-invocation CV |
+| --- | ---: | ---: |
+| Old buffered handoff | 78.511 | 0.96% |
+| Direct owned handoff | 74.480 | 1.81% |
 
-Paired ratios were `0.7126, 0.6935, 0.7085, 0.7466, 0.7116, 0.7342, 0.7183, 0.6401, 0.6685, 0.6944`.
+The median paired `direct / buffered` ratio was **0.945x** (about **5.5% less
+handoff time**), ranging from 0.917x to 1.014x; 19 of 20 pairs favored the new
+path. This is a component benchmark of payload copies and allocation. It does
+not include sockets, Tokio scheduling, routing, worker queues, or network
+latency and is not an end-to-end throughput claim.
 
-This is a component benchmark, not an end-to-end packet-rate claim. It establishes that the intermediate allocation/copy is large enough to be a real per-datagram CPU cost and that retaining the existing split buffer materially reduces that cost.
+## Correctness and known test ordering race
 
-## Correctness scope
+The XUDP stream tests cover the new message handoff for ordinary and maximum
+65,535-byte payloads, fragmented/coalesced frames, channel backpressure,
+session takeover, keep/end/error handling, and runtime UDP roundtrips. The
+fixed Xray 26.9.9 client smoke
+`xray_client_remote_policy_update_reaches_new_xudp_session` passes after its
+local UDP echo fixture explicitly allows `127.0.0.1/32` and its selected UDP
+port through Freedom `finalRules`. It was rerun with official Xray 26.10.29
+(`0afec66`, Go 1.27.3, Linux amd64) using that port-scoped rule and passed.
 
-The production type change is private to `handler/xudp/message_stream.rs`. Existing XUDP tests cover fragmented/coalesced frames, maximum-size UDP payloads, channel backpressure, session takeover, keep/end/error handling, and runtime UDP roundtrips. The candidate does not retain external references to the mutable reader buffer; `BytesMut::split_to()` transfers the split region into its own handle while the reader continues with the remaining region.
-
-Grouped XUDP runs expose an existing asynchronous response-order flake in `global_id_takeover_across_session_ids_rebinds_responses` (`24` observed where the test expects `25`). The candidate reproduced it, while five immediate exact candidate reruns passed. A separate pristine `b6961635` worktree then reproduced the same grouped failure in **3/3** baseline runs; one baseline run also reordered the `repeated_global_new_preserves_queued_payload_and_udp_socket` payloads. This establishes that the grouped-order failure predates the payload representation change. Full workspace test output should still report it explicitly if it recurs.
-
-## Brutal2 screening in this pass
-
-Before moving to XUDP, a small Brutal2 hypothesis was tested: cache the MTU-derived minimum congestion-window floor instead of recomputing `max_datagram_size.saturating_mul(MIN_CONGESTION_WINDOW_DATAGRAMS)` on every ACK. Twelve CPU-pinned process pairs were strongly bimodal (roughly 2.8-3.1 and 5.6-7.0 ns/ACK), with candidate direction reversing repeatedly. The effect is below the current host noise floor, so no Brutal production change or benchmark mode is retained from that experiment.
+`global_id_takeover_across_session_ids_rebinds_responses` has a pre-existing
+response-order race: it can observe session 24 where the test assumes session
+25. This was reproduced against a pristine `b6961635` worktree in 3/3 grouped
+runs before this handoff change; the exact test also passes on repeated
+isolated runs. Treat a recurrence as a test-ordering failure requiring separate
+investigation, not as a payload truncation result.

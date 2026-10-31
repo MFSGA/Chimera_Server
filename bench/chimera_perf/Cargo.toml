@@ -11,6 +11,7 @@ anyhow = "1"
 blake3 = "1"
 bytes = "=1.11.1"
 clap = { version = "4", features = ["derive"] }
+chimera_server_lib = { path = "../../chimera_server_lib", default-features = false, features = ["traffic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

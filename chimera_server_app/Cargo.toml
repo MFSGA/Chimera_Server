@@ -12,6 +12,7 @@ clap = { workspace = true }
 [dev-dependencies]
 aws-lc-rs = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
 hyper-util = { workspace = true }
