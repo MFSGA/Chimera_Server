@@ -7,7 +7,7 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, ReadBuf, WriteHalf, split},
+    io::{AsyncReadExt, AsyncWrite, WriteHalf, split},
     sync::mpsc,
     task::JoinHandle,
 };
@@ -188,7 +188,6 @@ impl AsyncReadSessionMessage for XudpMessageStream {
     fn poll_read_session_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<SessionMessage>> {
         let this = self.get_mut();
         match this.poll_pending_end_reply(cx) {
@@ -204,25 +203,13 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                 target,
                 global_id,
                 is_new,
-            }))) => {
-                if payload.len() > buffer.remaining() {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "XUDP payload exceeds receive buffer: {} > {}",
-                            payload.len(),
-                            buffer.remaining()
-                        ),
-                    )));
-                }
-                buffer.put_slice(&payload);
-                Poll::Ready(Ok(SessionMessage::Data {
-                    session_id,
-                    target,
-                    global_id,
-                    is_new,
-                }))
-            }
+            }))) => Poll::Ready(Ok(SessionMessage::Data {
+                session_id,
+                target,
+                payload: payload.to_vec(),
+                global_id,
+                is_new,
+            })),
             Poll::Ready(Some(Ok(IncomingMessage::End { session_id, reply }))) => {
                 if reply {
                     this.pending_end_reply = Some((session_id, false));

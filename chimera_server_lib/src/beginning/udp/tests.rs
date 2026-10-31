@@ -199,7 +199,7 @@ impl AsyncStream for TestStream {}
 
 #[cfg(any(feature = "vless", feature = "vmess"))]
 struct FailingSessionResponseStream {
-    request: Option<(SessionMessage, Vec<u8>)>,
+    request: Option<SessionMessage>,
 }
 
 #[cfg(any(feature = "vless", feature = "vmess"))]
@@ -207,12 +207,10 @@ impl crate::async_stream::AsyncReadSessionMessage for FailingSessionResponseStre
     fn poll_read_session_message(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<SessionMessage>> {
-        let Some((message, payload)) = self.request.take() else {
+        let Some(message) = self.request.take() else {
             return Poll::Pending;
         };
-        buffer.put_slice(&payload);
         Poll::Ready(Ok(message))
     }
 }
@@ -2030,18 +2028,13 @@ async fn session_udp_write_error_waits_for_local_worker_cleanup() {
     });
 
     let stream = FailingSessionResponseStream {
-        request: Some((
-            SessionMessage::Data {
-                session_id: 24,
-                target: NetLocation::from_ip_addr(
-                    target_addr.ip(),
-                    target_addr.port(),
-                ),
-                global_id: None,
-                is_new: true,
-            },
-            b"cleanup".to_vec(),
-        )),
+        request: Some(SessionMessage::Data {
+            session_id: 24,
+            target: NetLocation::from_ip_addr(target_addr.ip(), target_addr.port()),
+            payload: b"cleanup".to_vec(),
+            global_id: None,
+            is_new: true,
+        }),
     };
     let relay = tokio::spawn(run_session_based_udp(
         Box::new(stream),

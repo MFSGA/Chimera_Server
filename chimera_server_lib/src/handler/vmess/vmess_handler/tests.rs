@@ -996,24 +996,14 @@ async fn fragmented_mux_request_preserves_first_xudp_frame() {
     else {
         panic!("fragmented VMess MUX returned a non-session result");
     };
-    let mut payload = [0u8; 16];
-    let (message, length) = poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(&mut payload);
-        match Pin::new(&mut *stream).poll_read_session_message(cx, &mut read_buffer)
-        {
-            Poll::Ready(Ok(message)) => {
-                Poll::Ready(Ok((message, read_buffer.filled().len())))
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
-        }
-    })
-    .await
-    .expect("read first fragmented VMess XUDP message");
+    let message = poll_fn(|cx| Pin::new(&mut *stream).poll_read_session_message(cx))
+        .await
+        .expect("read first fragmented VMess XUDP message");
 
     let crate::async_stream::SessionMessage::Data {
         session_id,
         target: actual_target,
+        payload,
         global_id,
         is_new,
     } = message
@@ -1027,7 +1017,7 @@ async fn fragmented_mux_request_preserves_first_xudp_frame() {
     );
     assert_eq!(global_id, None);
     assert!(is_new);
-    assert_eq!(&payload[..length], b"ping");
+    assert_eq!(payload.as_slice(), b"ping");
     let context = traffic_context.expect("fragmented VMess XUDP context");
     assert_eq!(context.identity.as_deref(), Some("fragmented-vmess-xudp"));
     writer.await.expect("fragmented VMess MUX writer task");

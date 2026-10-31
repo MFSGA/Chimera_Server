@@ -1,7 +1,7 @@
 use std::{collections::HashMap, future::poll_fn, net::Ipv4Addr, sync::Arc};
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, duplex},
+    io::{AsyncReadExt, AsyncWriteExt, ReadBuf, duplex},
     net::UdpSocket,
     time::{Duration, timeout},
 };
@@ -456,13 +456,9 @@ async fn unknown_keep_writes_end_reply_and_keeps_stream_open() {
         Box::new(TestStream(server)),
         vec![0, 0],
     );
-    let mut buffer = [0u8; 32];
-    let end = poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(&mut buffer);
-        Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-    })
-    .await
-    .expect("read local End event for unknown Keep");
+    let end = poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx))
+        .await
+        .expect("read local End event for unknown Keep");
     assert_eq!(end, SessionMessage::End { session_id: 71 });
 
     let mut response_prefix = [0u8; 2];
@@ -493,14 +489,17 @@ async fn unknown_keep_writes_end_reply_and_keeps_stream_open() {
     assert!(!metadata.option.has_error());
     assert!(raw.is_empty());
 
-    let next = poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(&mut buffer);
-        Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-    })
-    .await
-    .expect("read data after unknown Keep");
-    assert!(matches!(next, SessionMessage::Data { session_id: 72, .. }));
-    assert_eq!(&buffer[..4], b"next");
+    let next = poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx))
+        .await
+        .expect("read data after unknown Keep");
+    assert!(matches!(
+        next,
+        SessionMessage::Data {
+            session_id: 72,
+            payload,
+            ..
+        } if payload.as_slice() == b"next"
+    ));
 }
 
 #[test]
@@ -559,7 +558,7 @@ fn truncated_data_frame_prefixes_do_not_consume_or_mutate_state() {
 }
 
 #[tokio::test]
-async fn payload_larger_than_read_buffer_is_rejected_without_truncation() {
+async fn session_message_owns_payload_without_a_caller_buffer() {
     let (mut client, server) = duplex(2048);
     let frame = encode_data_frame(
         SessionStatus::New,
@@ -572,18 +571,47 @@ async fn payload_larger_than_read_buffer_is_rejected_without_truncation() {
         .await
         .expect("write oversized-for-caller XUDP frame");
     let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
-    let mut buffer = [0u8; 4];
 
-    let error = poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(&mut buffer);
-        Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-    })
-    .await
-    .expect_err("XUDP payload larger than the caller buffer must fail");
+    let message = poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx))
+        .await
+        .expect("read XUDP payload without caller buffer");
+    let SessionMessage::Data { payload, .. } = message else {
+        panic!("XUDP data frame decoded as End");
+    };
+    assert_eq!(payload.as_slice(), b"payload-too-large");
+}
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("exceeds receive buffer"));
-    assert_eq!(buffer, [0; 4]);
+#[tokio::test]
+async fn maximum_udp_payload_survives_session_message_handoff() {
+    let payload = vec![0xa5; u16::MAX as usize];
+    let (mut client, server) = duplex(70 * 1024);
+    let frame = encode_data_frame(
+        SessionStatus::New,
+        90,
+        Some(NetLocation::from_ip_addr(Ipv4Addr::LOCALHOST.into(), 53)),
+        &payload,
+    );
+    client
+        .write_all(&frame)
+        .await
+        .expect("write maximum-size XUDP frame");
+    let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
+
+    let message = poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx))
+        .await
+        .expect("read maximum-size XUDP session message");
+    let SessionMessage::Data {
+        session_id,
+        payload: received,
+        ..
+    } = message
+    else {
+        panic!("maximum-size XUDP data frame decoded as End");
+    };
+
+    assert_eq!(session_id, 90);
+    assert_eq!(received.len(), u16::MAX as usize);
+    assert_eq!(received, payload);
 }
 
 #[test]
@@ -729,21 +757,9 @@ async fn fragmented_frame_is_reassembled_across_single_byte_reads() {
         }
     });
     let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
-    let mut payload = [0u8; 32];
-
-    let (message, length) = timeout(
+    let message = timeout(
         Duration::from_secs(1),
-        poll_fn(|cx| {
-            let mut read_buffer = ReadBuf::new(&mut payload);
-            match Pin::new(&mut stream)
-                .poll_read_session_message(cx, &mut read_buffer)
-            {
-                Poll::Ready(result) => Poll::Ready(
-                    result.map(|message| (message, read_buffer.filled().len())),
-                ),
-                Poll::Pending => Poll::Pending,
-            }
-        }),
+        poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx)),
     )
     .await
     .expect("fragmented XUDP frame timeout")
@@ -753,11 +769,11 @@ async fn fragmented_frame_is_reassembled_across_single_byte_reads() {
         message,
         SessionMessage::Data {
             session_id: 94,
+            payload,
             is_new: true,
             ..
-        }
+        } if payload.as_slice() == b"fragmented"
     ));
-    assert_eq!(&payload[..length], b"fragmented");
     writer.await.expect("fragmented XUDP writer task");
 }
 
@@ -783,13 +799,9 @@ async fn coalesced_frames_preserve_order_across_channel_backpressure() {
     let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
 
     for expected in 0..FRAME_COUNT {
-        let mut payload = [0u8; 1];
         let message = timeout(
             Duration::from_secs(1),
-            poll_fn(|cx| {
-                let mut read_buffer = ReadBuf::new(&mut payload);
-                Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-            }),
+            poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx)),
         )
         .await
         .expect("coalesced XUDP frame timeout")
@@ -798,11 +810,11 @@ async fn coalesced_frames_preserve_order_across_channel_backpressure() {
             message,
             SessionMessage::Data {
                 session_id: 95,
+                payload,
                 is_new,
                 ..
-            } if is_new == (expected == 0)
+            } if is_new == (expected == 0) && payload.as_slice() == [expected as u8]
         ));
-        assert_eq!(payload[0], expected as u8);
     }
 }
 
@@ -824,14 +836,9 @@ async fn partial_frame_eof_is_reported_without_hanging() {
         .await
         .expect("shutdown partial XUDP writer");
     let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
-    let mut payload = [0u8; 32];
-
     let error = timeout(
         Duration::from_secs(1),
-        poll_fn(|cx| {
-            let mut read_buffer = ReadBuf::new(&mut payload);
-            Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-        }),
+        poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx)),
     )
     .await
     .expect("partial XUDP EOF must not hang")
@@ -861,40 +868,34 @@ async fn reads_new_and_keep_frames_for_same_session() {
     client.write_all(&frames).await.expect("write XUDP frames");
 
     let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
-    let mut buffer = [0u8; 32];
     for (expected, expected_is_new) in
         [(b"first".as_slice(), true), (b"second".as_slice(), false)]
     {
-        let (length, session_id, target, actual_global_id, is_new) = poll_fn(|cx| {
-            let mut read_buffer = ReadBuf::new(&mut buffer);
-            match Pin::new(&mut stream)
-                .poll_read_session_message(cx, &mut read_buffer)
-            {
-                Poll::Ready(Ok(SessionMessage::Data {
-                    session_id,
-                    target,
-                    global_id,
-                    is_new,
-                })) => Poll::Ready(Ok((
-                    read_buffer.filled().len(),
-                    session_id,
-                    target,
-                    global_id,
-                    is_new,
-                ))),
-                Poll::Ready(Ok(SessionMessage::End { .. })) => {
-                    Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "unexpected XUDP End while reading data",
-                    )))
+        let (payload, session_id, target, actual_global_id, is_new) =
+            poll_fn(|cx| {
+                match Pin::new(&mut stream).poll_read_session_message(cx) {
+                    Poll::Ready(Ok(SessionMessage::Data {
+                        session_id,
+                        target,
+                        payload,
+                        global_id,
+                        is_new,
+                    })) => Poll::Ready(Ok((
+                        payload, session_id, target, global_id, is_new,
+                    ))),
+                    Poll::Ready(Ok(SessionMessage::End { .. })) => {
+                        Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unexpected XUDP End while reading data",
+                        )))
+                    }
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                    Poll::Pending => Poll::Pending,
                 }
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await
-        .expect("read XUDP message");
-        assert_eq!(&buffer[..length], expected);
+            })
+            .await
+            .expect("read XUDP message");
+        assert_eq!(payload.as_slice(), expected);
         assert_eq!(session_id, 17);
         assert_eq!(
             target,
@@ -1099,21 +1100,14 @@ async fn end_frame_is_forwarded_and_clears_codec_session() {
         .expect("write XUDP session frames");
 
     let mut stream = XudpMessageStream::new(Box::new(TestStream(server)));
-    let mut buffer = [0u8; 32];
-    let first = poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(&mut buffer);
-        Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-    })
-    .await
-    .expect("read XUDP data event");
+    let first = poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx))
+        .await
+        .expect("read XUDP data event");
     assert!(matches!(first, SessionMessage::Data { session_id: 31, .. }));
 
-    let end = poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(&mut buffer);
-        Pin::new(&mut stream).poll_read_session_message(cx, &mut read_buffer)
-    })
-    .await
-    .expect("read XUDP End event");
+    let end = poll_fn(|cx| Pin::new(&mut stream).poll_read_session_message(cx))
+        .await
+        .expect("read XUDP End event");
     assert_eq!(end, SessionMessage::End { session_id: 31 });
 }
 

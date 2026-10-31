@@ -31,27 +31,19 @@ pub(crate) async fn run_session_based_udp(
         mpsc::channel::<SessionUdpEvent>(UDP_SESSION_CHANNEL_CAPACITY);
     let mut sessions = HashMap::<u16, SessionUdpWorker>::new();
     let mut next_generation = 1u64;
-    let mut client_buffer = vec![0u8; UDP_BUFFER_SIZE];
 
     let result = loop {
         tokio::select! {
-            request = read_session_message(&mut *server_stream, &mut client_buffer) => {
-                let (
-                    session_id,
-                    target_location,
-                    global_id,
-                    is_new,
-                    payload_length,
-                ) = match request {
-                    Ok((SessionMessage::Data {
+            request = read_session_message(&mut *server_stream) => {
+                let (session_id, target_location, global_id, is_new, payload) = match request {
+                    Ok(SessionMessage::Data {
                         session_id,
                         target,
+                        payload,
                         global_id,
                         is_new,
-                    }, payload_length)) => {
-                        (session_id, target, global_id, is_new, payload_length)
-                    }
-                    Ok((SessionMessage::End { session_id }, _)) => {
+                    }) => (session_id, target, global_id, is_new, payload),
+                    Ok(SessionMessage::End { session_id }) => {
                         expire_session_udp_worker(&mut sessions, session_id).await;
                         debug!("session udp {} ended by peer", session_id);
                         continue;
@@ -61,10 +53,11 @@ pub(crate) async fn run_session_based_udp(
                     }
                     Err(error) => break Err(error),
                 };
+                let payload_length = payload.len();
                 if is_new && sessions.contains_key(&session_id) {
                     expire_session_udp_worker(&mut sessions, session_id).await;
                 }
-                let mut payload = client_buffer[..payload_length].to_vec();
+                let mut payload = payload;
                 if !is_new {
                     let existing_worker = sessions
                         .get(&session_id)
@@ -605,20 +598,8 @@ fn same_session_udp_target(left: &NetLocation, right: &NetLocation) -> bool {
 
 async fn read_session_message(
     stream: &mut dyn AsyncSessionMessageStream,
-    buffer: &mut [u8],
-) -> std::io::Result<(SessionMessage, usize)> {
-    poll_fn(|cx| {
-        let mut read_buffer = ReadBuf::new(buffer);
-        match Pin::new(&mut *stream).poll_read_session_message(cx, &mut read_buffer)
-        {
-            std::task::Poll::Ready(Ok(message)) => {
-                std::task::Poll::Ready(Ok((message, read_buffer.filled().len())))
-            }
-            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    })
-    .await
+) -> std::io::Result<SessionMessage> {
+    poll_fn(|cx| Pin::new(&mut *stream).poll_read_session_message(cx)).await
 }
 
 async fn write_session_message(

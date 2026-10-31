@@ -108,6 +108,7 @@ pub enum SessionMessage {
     Data {
         session_id: u16,
         target: NetLocation,
+        payload: Vec<u8>,
         global_id: Option<[u8; 8]>,
         is_new: bool,
     },
@@ -120,7 +121,6 @@ pub trait AsyncReadSessionMessage {
     fn poll_read_session_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<SessionMessage>>;
 }
 
