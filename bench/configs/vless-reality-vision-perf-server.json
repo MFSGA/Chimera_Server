@@ -21,9 +21,7 @@
         "serverNames": ["www.apple.com"],
         "privateKey": "dnprBfWdJgo5yaGClSaZ12TZW-SiD988YmjDKOhXLKI",
         "shortIds": ["4ac97aaf8b9b0356"],
-        "maxTimeDiff": 0,
-        "minClientVer": "26.2.6",
-        "maxClientVer": "26.2.6"
+        "maxTimeDiff": 0
       }
     }
   }],

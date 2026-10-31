@@ -208,7 +208,7 @@ impl RelayTrafficAccounting {
         };
         let increment = bytes as u64;
         let _ =
-            counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(increment))
             });
     }
