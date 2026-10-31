@@ -3556,7 +3556,24 @@ async fn xray_client_hysteria2_domain_access_policy_allows_and_rejects_target() 
                     }
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": [
+                    {
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    },
+                    {
+                        "action": "allow",
+                        "network": "udp",
+                        "port": udp_echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    }
+                ]}
+            }],
             "dns": {"hosts": {
                 "allowed.example": echo_ip,
                 "blocked.example": echo_ip
@@ -4850,7 +4867,21 @@ async fn xray_client_can_proxy_tcp_and_udp_through_chimera_hysteria2_with_xray_d
             }],
             "outbounds": [{
                 "tag": "direct",
-                "protocol": "freedom"
+                "protocol": "freedom",
+                "settings": {"finalRules": [
+                    {
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    },
+                    {
+                        "action": "allow",
+                        "network": "udp",
+                        "port": udp_echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    }
+                ]}
             }]
         }),
     );
@@ -5252,7 +5283,16 @@ fn xray_hysteria2_empty_user_auth_can_proxy_tcp() {
                     }
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": [{
+                    "action": "allow",
+                    "network": "tcp",
+                    "port": echo_addr.port(),
+                    "ip": "127.0.0.1/32"
+                }]}
+            }]
         }),
     );
     write_json(
@@ -5350,7 +5390,16 @@ fn xray_hysteria2_uuid_auth_routes_by_embedded_vless_route() {
             }],
             "outbounds": [
                 {"tag": "blocked", "protocol": "blackhole"},
-                {"tag": "direct", "protocol": "freedom"}
+                {
+                    "tag": "direct",
+                    "protocol": "freedom",
+                    "settings": {"finalRules": [{
+                        "action": "allow",
+                        "network": "tcp",
+                        "port": echo_addr.port(),
+                        "ip": "127.0.0.1/32"
+                    }]}
+                }
             ],
             "routing": {
                 "rules": [{
