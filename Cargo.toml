@@ -139,7 +139,7 @@ sha1 = "0.11"
 sha2 = "0.10"
 boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.8.11", features = ["async", "tokio"] }
-rtnetlink = { version = "0.23.0", default-features = false, features = ["tokio_socket"] }
+rtnetlink = { version = "0.24.0", default-features = false, features = ["tokio_socket"] }
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
