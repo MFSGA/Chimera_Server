@@ -1,5 +1,7 @@
 use super::*;
 
+const HYSTERIA2_COPY_BUFFER_SIZE: usize = 32 * 1024;
+
 pub(super) async fn drive_tcp_streams(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
     resolver: Arc<dyn Resolver>,
@@ -269,8 +271,8 @@ where
     match tokio::io::copy_bidirectional_with_sizes(
         &mut quic_stream,
         &mut tcp_stream,
-        32 * 1024,
-        32 * 1024,
+        HYSTERIA2_COPY_BUFFER_SIZE,
+        HYSTERIA2_COPY_BUFFER_SIZE,
     )
     .await
     {
@@ -288,6 +290,8 @@ where
 pub(super) struct H3RawStream {
     stream: BidiStream<Bytes>,
     read_buffer: Bytes,
+    eof: bool,
+    pending_read_error: Option<Error>,
 }
 
 impl H3RawStream {
@@ -295,6 +299,8 @@ impl H3RawStream {
         Self {
             stream,
             read_buffer: Bytes::new(),
+            eof: false,
+            pending_read_error: None,
         }
     }
 }
@@ -306,25 +312,76 @@ impl AsyncRead for H3RawStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
+        let H3RawStream {
+            stream,
+            read_buffer,
+            eof,
+            pending_read_error,
+        } = this;
+        poll_read_quic_chunks(read_buffer, eof, pending_read_error, cx, buf, |cx| {
+            match H3RecvStream::poll_data(stream, cx) {
+                Poll::Ready(Ok(data)) => Poll::Ready(Ok(data)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(Error::other(err))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+    }
+}
 
-        loop {
-            if !this.read_buffer.is_empty() {
-                let len = this.read_buffer.len().min(buf.remaining());
-                let chunk = this.read_buffer.split_to(len);
-                buf.put_slice(&chunk);
+fn poll_read_quic_chunks<F>(
+    read_buffer: &mut Bytes,
+    eof: &mut bool,
+    pending_read_error: &mut Option<Error>,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+    mut poll_data: F,
+) -> Poll<std::io::Result<()>>
+where
+    F: FnMut(&mut Context<'_>) -> Poll<std::io::Result<Option<Bytes>>>,
+{
+    if buf.remaining() == 0 {
+        return Poll::Ready(Ok(()));
+    }
+    if let Some(err) = pending_read_error.take() {
+        return Poll::Ready(Err(err));
+    }
+    if *eof {
+        return Poll::Ready(Ok(()));
+    }
+
+    let filled_before = buf.filled().len();
+    loop {
+        if !read_buffer.is_empty() {
+            let len = read_buffer.len().min(buf.remaining());
+            // Copy directly from the current view. `split_to` creates a
+            // temporary `Bytes` handle (and may touch its refcount) even
+            // though Tokio's ReadBuf always copies these bytes immediately.
+            buf.put_slice(&read_buffer[..len]);
+            read_buffer.advance(len);
+            if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
+        }
 
-            match H3RecvStream::poll_data(&mut this.stream, cx) {
-                Poll::Ready(Ok(Some(data))) => this.read_buffer = data,
-                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
-                Poll::Ready(Err(err)) => {
-                    return Poll::Ready(Err(Error::other(err)));
+        match poll_data(cx) {
+            Poll::Ready(Ok(Some(data))) => *read_buffer = data,
+            Poll::Ready(Ok(None)) => {
+                *eof = true;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(err)) => {
+                if buf.filled().len() != filled_before {
+                    *pending_read_error = Some(err);
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Pending => return Poll::Pending,
+                return Poll::Ready(Err(err));
+            }
+            Poll::Pending => {
+                return if buf.filled().len() != filled_before {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                };
             }
         }
     }
