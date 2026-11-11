@@ -352,6 +352,79 @@ impl StatsInner {
 
 const TRAFFIC_SHARD_COUNT: usize = 32;
 
+const FAST_TRAFFIC_PROTOCOLS: [&str; 12] = [
+    "vless",
+    "vmess",
+    "trojan",
+    "shadowsocks",
+    "hysteria2",
+    "tuic",
+    "socks",
+    "http",
+    "dokodemo-door",
+    "vless-reverse",
+    "wireguard",
+    "unknown",
+];
+
+fn fast_traffic_protocol_index(protocol: &str) -> Option<usize> {
+    FAST_TRAFFIC_PROTOCOLS
+        .iter()
+        .position(|candidate| *candidate == protocol)
+}
+
+#[derive(Debug, Default)]
+struct AtomicTransferTotals {
+    connections: AtomicU64,
+    upload_bytes: AtomicU64,
+    download_bytes: AtomicU64,
+}
+
+impl AtomicTransferTotals {
+    fn accumulate(&self, upload: u64, download: u64) {
+        saturating_atomic_add(&self.connections, 1);
+        saturating_atomic_add(&self.upload_bytes, upload);
+        saturating_atomic_add(&self.download_bytes, download);
+    }
+
+    fn merge_into(&self, totals: &mut TransferTotals) {
+        totals.merge(&TransferTotals {
+            connections: self.connections.load(Ordering::Relaxed),
+            upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
+            download_bytes: self.download_bytes.load(Ordering::Relaxed),
+        });
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+type FastTrafficShard = [AtomicTransferTotals; FAST_TRAFFIC_PROTOCOLS.len()];
+
+fn merge_fast_traffic_into_snapshot(
+    snapshot: &mut TrafficSnapshot,
+    shards: &[FastTrafficShard; TRAFFIC_SHARD_COUNT],
+) {
+    for shard in shards {
+        for (protocol, totals) in FAST_TRAFFIC_PROTOCOLS.iter().zip(shard) {
+            let mut aggregate = TransferTotals::default();
+            totals.merge_into(&mut aggregate);
+            if aggregate.connections == 0 {
+                continue;
+            }
+            snapshot.total.merge(&aggregate);
+            snapshot
+                .per_protocol
+                .entry((*protocol).to_owned())
+                .or_default()
+                .merge(&aggregate);
+        }
+    }
+}
+
 thread_local! {
     static TRAFFIC_SHARD_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
 }
@@ -413,6 +486,7 @@ fn merge_stats_into_snapshot(snapshot: &mut TrafficSnapshot, stats: &StatsInner)
 #[derive(Debug)]
 struct TrafficRecorder {
     shards: [RwLock<StatsInner>; TRAFFIC_SHARD_COUNT],
+    fast_shards: [FastTrafficShard; TRAFFIC_SHARD_COUNT],
     next_thread_shard: AtomicUsize,
 }
 
@@ -420,6 +494,9 @@ impl Default for TrafficRecorder {
     fn default() -> Self {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(StatsInner::default())),
+            fast_shards: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicTransferTotals::default())
+            }),
             next_thread_shard: AtomicUsize::new(0),
         }
     }
@@ -449,8 +526,20 @@ impl TrafficRecorder {
 
     fn record(&self, context: &TrafficContext, upload: u64, download: u64) {
         let plan = plan_traffic_record(context, upload, download);
+        let shard_index = self.current_thread_shard_index();
+        if !plan.record_user
+            && !plan.record_inbound
+            && !plan.record_outbound
+            && let Some(protocol_index) = fast_traffic_protocol_index(plan.protocol)
+        {
+            self.fast_shards[shard_index][protocol_index]
+                .accumulate(upload, download);
+            return;
+        }
         let mut guard = self
-            .current_thread_shard()
+            .shards
+            .get(shard_index)
+            .expect("thread shard index is in range")
             .write()
             .expect("traffic stats shard poisoned");
         guard.apply(plan);
@@ -474,6 +563,7 @@ impl TrafficRecorder {
             let guard = shard.read().expect("traffic stats shard poisoned");
             merge_stats_into_snapshot(&mut snapshot, &guard);
         }
+        merge_fast_traffic_into_snapshot(&mut snapshot, &self.fast_shards);
         snapshot
     }
 
