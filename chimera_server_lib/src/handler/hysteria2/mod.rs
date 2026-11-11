@@ -32,6 +32,9 @@ const SHOES_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const SHOES_SEND_WINDOW: u64 = 16 * 1024 * 1024;
 const SHOES_INITIAL_RTT: Duration = Duration::from_millis(100);
 const SHOES_UDP_SOCKET_BUFFER_SIZE: usize = 8_625_000;
+// Xray 26.10.29 uses quic-go's 8 MiB UDP read/write socket buffers.
+// The OS may cap either value; keep this a best-effort socket setting.
+const XRAY_UDP_SOCKET_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const SHOES_INITIAL_MTU: u16 = 1200;
 const XRAY_INITIAL_MTU: u16 = 1280;
 const XRAY_MAX_DATAGRAM_FRAME_SIZE: u32 = 1200;
@@ -410,7 +413,11 @@ fn configured_initial_rtt(xray_compat: bool) -> Option<Duration> {
 }
 
 fn configured_udp_socket_buffer_size(xray_compat: bool) -> Option<usize> {
-    (!xray_compat).then_some(SHOES_UDP_SOCKET_BUFFER_SIZE)
+    Some(if xray_compat {
+        XRAY_UDP_SOCKET_BUFFER_SIZE
+    } else {
+        SHOES_UDP_SOCKET_BUFFER_SIZE
+    })
 }
 
 fn configured_max_datagram_frame_size(xray_compat: bool) -> Option<quinn::VarInt> {
