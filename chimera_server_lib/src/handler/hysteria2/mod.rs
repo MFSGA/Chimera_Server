@@ -472,8 +472,8 @@ mod tests {
         SHOES_KEEP_ALIVE_INTERVAL, SHOES_MAX_INCOMING_UNI_STREAMS,
         SHOES_SEND_WINDOW, SHOES_UDP_SOCKET_BUFFER_SIZE, XRAY_INITIAL_MTU,
         XRAY_MAX_DATAGRAM_FRAME_SIZE, XRAY_MAX_INCOMING_UNI_STREAMS,
-        configured_assume_peer_max_datagram_frame_size, configured_congestion_mode,
-        configured_initial_mtu, configured_initial_rtt,
+        XRAY_UDP_SOCKET_BUFFER_SIZE, configured_assume_peer_max_datagram_frame_size,
+        configured_congestion_mode, configured_initial_mtu, configured_initial_rtt,
         configured_keep_alive_interval, configured_max_datagram_frame_size,
         configured_max_idle_timeout_secs, configured_max_incoming_bidi_streams,
         configured_max_incoming_uni_streams, configured_mtu_discovery,
@@ -558,11 +558,18 @@ mod tests {
         assert_eq!(configured_send_window(true), None);
         assert_eq!(configured_initial_rtt(false), Some(SHOES_INITIAL_RTT));
         assert_eq!(configured_initial_rtt(true), None);
+    }
+
+    #[test]
+    fn udp_socket_buffers_follow_xray_and_shoes_defaults() {
         assert_eq!(
             configured_udp_socket_buffer_size(false),
             Some(SHOES_UDP_SOCKET_BUFFER_SIZE)
         );
-        assert_eq!(configured_udp_socket_buffer_size(true), None);
+        assert_eq!(
+            configured_udp_socket_buffer_size(true),
+            Some(XRAY_UDP_SOCKET_BUFFER_SIZE)
+        );
     }
 
     #[test]
