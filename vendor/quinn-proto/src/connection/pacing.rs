@@ -142,6 +142,14 @@ impl Pacer {
             // effective rate. Keep 25% of capacity as jitter headroom while
             // retaining the same bounded burst size and refill rate.
             let wake_budget = bytes_to_send.max(self.capacity - self.capacity / 4);
+            let wake_budget = if self.capacity == MIN_BURST_SIZE * u64::from(mtu) {
+                let rate_budget = ((rate as u128 * FIXED_RATE_BURST_INTERVAL_NANOS * 3 / 4)
+                    / 1_000_000_000)
+                    .min(u64::MAX as u128) as u64;
+                wake_budget.min(bytes_to_send.max(rate_budget))
+            } else {
+                wake_budget
+            };
             let needed = wake_budget - self.tokens;
             let nanos = (needed as u128 * 1_000_000_000)
                 .div_ceil(rate as u128)
@@ -410,6 +418,62 @@ mod tests {
             start + Duration::from_millis(1),
         );
         assert_eq!(pacer.tokens, 1_000, "the new rate applies only after the switch");
+    }
+
+    #[test]
+    fn fixed_rate_minimum_does_not_sleep_for_most_of_a_burst() {
+        // Xray Brutal's TimeUntilSend waits for the next datagram budget,
+        // not an almost-full 10-datagram minimum burst. At 64KiB/s, the
+        // next 1200B packet needs about 18.3ms, not ~137ms.
+        let start = Instant::now();
+        let mtu = 1200;
+        let rate = 65_536;
+        let rtt = Duration::from_micros(100);
+        let window = 3 * mtu as u64;
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        assert!(pacer
+            .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
+            .is_none());
+        while pacer.tokens >= mtu as u64 {
+            pacer.on_transmit(mtu);
+        }
+        assert_eq!(pacer.tokens, 0);
+        let resume = pacer
+            .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
+            .expect("out of tokens");
+        let exact_packet_interval_ns =
+            ((u128::from(mtu) * 1_000_000_000).div_ceil(u128::from(rate))) as u64;
+        assert_eq!(
+            resume.duration_since(start),
+            Duration::from_nanos(exact_packet_interval_ns),
+            "low-rate pacing should wake as soon as the next packet is budgeted",
+        );
+        assert!(pacer
+            .delay(rtt, mtu as u64, mtu, window, Some(rate), resume)
+            .is_none());
+    }
+
+    #[test]
+    fn fixed_rate_high_rate_preserves_existing_early_wake_policy() {
+        let mtu = 1200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let rate = 62_500_000; // 500 Mbit/s
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        assert_eq!(pacer.capacity, 250_000); // 500 Mbps * 4ms
+        pacer.tokens = 0;
+        let wake_budget = pacer.capacity - pacer.capacity / 4;
+        let expected_ns =
+            ((u128::from(wake_budget) * 1_000_000_000).div_ceil(u128::from(rate))) as u64;
+        let wake = pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(rate), start)
+            .expect("out of tokens");
+        assert_eq!(
+            wake.duration_since(start),
+            Duration::from_nanos(expected_ns)
+        );
     }
 
     #[test]
