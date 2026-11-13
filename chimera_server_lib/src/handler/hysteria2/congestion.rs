@@ -17,13 +17,16 @@ use tracing::debug;
 const PACKET_INFO_SLOT_COUNT: u64 = 5;
 const MIN_SAMPLE_COUNT: u64 = 50;
 const MIN_ACK_RATE: f64 = 0.8;
-// Quinn's pacer refills at ~1.25x cwnd per RTT, so scale cwnd to keep target rate.
-const CONGESTION_WINDOW_MULTIPLIER: f64 = 0.8;
+// Xray Brutal uses a 2x BDP congestion window and independently paces at the
+// configured bytes/s (adjusted for ACK loss). The Quinn pacing override below
+// keeps that rate separate from this in-flight safety window.
+const CONGESTION_WINDOW_MULTIPLIER: f64 = 2.0;
 const DEFAULT_CONGESTION_WINDOW: u64 = 10_240;
-// Xray Brutal allows another datagram when bytes-in-flight is exactly cwnd.
-// Quinn treats `window()` as a hard maximum for ack-eliciting bytes in flight,
-// so preserve Xray's effective one-extra-datagram allowance at the minimum.
-const MIN_CONGESTION_WINDOW_DATAGRAMS: u64 = 2;
+// Xray permits a datagram when bytes-in-flight == cwnd, whereas Quinn blocks
+// whenever bytes-in-flight + the next datagram >= window(). Its strict limit
+// therefore needs room for two datagrams plus one at the minimum, so delayed-
+// ACK peers can acknowledge a pair without waiting for the ACK timeout.
+const MIN_CONGESTION_WINDOW_DATAGRAMS: u64 = 3;
 const DEBUG_ENV: &str = "HYSTERIA_BRUTAL_DEBUG";
 const DEBUG_PRINT_INTERVAL: u64 = 2;
 #[cfg(feature = "brutal-ack-batch-trace")]
@@ -354,7 +357,6 @@ impl BrutalController {
         }
     }
 
-    #[cfg(feature = "brutal-pacing-trace")]
     fn pacing_target_rate(&self) -> u64 {
         ((self.brutal_tx_bps as f64) * self.brutal.reciprocal_ack_rate) as u64
     }
@@ -451,6 +453,13 @@ impl Controller for BrutalController {
                 self.brutal.initial_window()
             }
         }
+    }
+
+    fn pacing_rate_override(&self) -> Option<u64> {
+        // Before authentication, the original handshake BBR pacing remains in
+        // effect. Once Brutal activates, pace at the configured target divided
+        // by the observed ACK rate, as Xray does.
+        self.brutal_active.then(|| self.pacing_target_rate())
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
@@ -725,6 +734,7 @@ impl BrutalState {
         self.refresh_ack_rate(timestamp);
     }
 
+    #[cfg(any(test, feature = "brutal-pacing-trace"))]
     #[inline]
     fn ack_rate(&self) -> f64 {
         1.0 / self.reciprocal_ack_rate
@@ -853,7 +863,7 @@ mod tests {
                 .iter()
                 .all(|slot| slot.ack_count == 0 && slot.loss_count == 0)
         );
-        assert_eq!(controller.window(), 64_000);
+        assert_eq!(controller.window(), 160_000);
 
         controller
             .activate_brutal_if_configured(activated_at + Duration::from_secs(1));
@@ -963,20 +973,46 @@ mod tests {
 
         assert!(!controller.brutal_active);
         assert!(controller.bbr.is_some());
+        assert_eq!(controller.pacing_rate_override(), None);
     }
 
     #[test]
-    fn brutal_low_rtt_window_preserves_xray_send_allowance() {
+    fn brutal_pacing_rate_activates_after_auth_and_tracks_ack_compensation() {
+        let tx_bps = Arc::new(AtomicU64::new(0));
+        let now = Instant::now();
+        let mut controller = controller(tx_bps.clone(), now);
+        assert_eq!(controller.pacing_rate_override(), None);
+
+        tx_bps.store(7_500_000, Ordering::Relaxed);
+        controller.activate_brutal_if_configured(now);
+        assert_eq!(controller.pacing_rate_override(), Some(7_500_000));
+        assert!(controller.bbr.is_none());
+
+        controller.brutal.reciprocal_ack_rate = 1.25;
+        assert_eq!(controller.pacing_rate_override(), Some(9_375_000));
+    }
+
+    #[test]
+    fn brutal_low_rtt_window_allows_two_packets_before_delayed_ack() {
         let now = Instant::now();
         let mut state = BrutalState::new(now, 1200);
         state.last_rtt = Duration::from_micros(100);
 
-        // At Xray's minimum valid Brutal rate this RTT would otherwise collapse
-        // Quinn's strict in-flight window to a single datagram.
-        assert_eq!(state.window(65_536), 2400);
+        // Xray permits another packet when bytes-in-flight == cwnd. Quinn
+        // requires bytes-in-flight + next datagram < window, so a two-datagram
+        // window only transmits one packet and stalls on delayed ACK peers.
+        for tx_bps in [65_536, 7_500_000] {
+            let mtu = state.max_datagram_size;
+            let window = state.window(tx_bps);
+            assert_eq!(window, mtu * 3);
+            assert!(mtu * 2 < window, "need two packets at {tx_bps} B/s");
+        }
+        // Above the floor, use Xray's 2x-BDP congestion window rather than
+        // deriving the send rate from the window.
+        assert_eq!(state.window(25_000_000), 5_000);
 
         state.on_mtu_update(1450);
-        assert_eq!(state.window(65_536), 2900);
+        assert_eq!(state.window(65_536), 4350);
     }
 
     #[test]
@@ -1005,7 +1041,7 @@ mod tests {
         let mut state = BrutalState::new(now, 1200);
         state.last_rtt = Duration::from_millis(100);
 
-        assert_eq!(state.window(1_000_000), 80_000);
+        assert_eq!(state.window(1_000_000), 200_000);
     }
 
     #[test]
