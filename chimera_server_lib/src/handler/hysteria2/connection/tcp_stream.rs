@@ -542,3 +542,227 @@ where
     stream.write_all(&buf).await.map_err(Error::other)?;
     stream.flush().await.map_err(Error::other)
 }
+
+#[cfg(test)]
+mod raw_stream_tests {
+    use std::{collections::VecDeque, io, task::Poll};
+
+    use bytes::Bytes;
+    use tokio::io::ReadBuf;
+
+    use super::poll_read_quic_chunks;
+
+    #[tokio::test]
+    async fn raw_stream_read_coalesces_ready_quic_chunks() {
+        let mut chunks = VecDeque::from([
+            Ok(Some(Bytes::from_static(b"abc"))),
+            Ok(Some(Bytes::from_static(b"defgh"))),
+        ]);
+        let mut read_buffer = Bytes::new();
+        let mut eof = false;
+        let mut pending_read_error = None;
+        let mut destination = [0; 16];
+        let mut read_buf = ReadBuf::new(&mut destination);
+        let mut poll_count = 0;
+
+        let result = std::future::poll_fn(|cx| {
+            poll_read_quic_chunks(
+                &mut read_buffer,
+                &mut eof,
+                &mut pending_read_error,
+                cx,
+                &mut read_buf,
+                |_| {
+                    poll_count += 1;
+                    chunks.pop_front().map_or(Poll::Pending, Poll::Ready)
+                },
+            )
+        })
+        .await;
+
+        result.expect("coalesced raw reads should succeed");
+        assert_eq!(read_buf.filled(), b"abcdefgh");
+        assert_eq!(poll_count, 3, "read until the QUIC stream is pending");
+    }
+
+    #[tokio::test]
+    async fn raw_stream_read_preserves_partially_consumed_owned_chunks() {
+        let mut chunks = VecDeque::from([
+            Ok(Some(Bytes::from(b"abcdefghij".to_vec()))),
+            Ok(None),
+        ]);
+        let mut read_buffer = Bytes::new();
+        let mut eof = false;
+        let mut pending_read_error = None;
+        let mut poll_count = 0;
+        let mut received = Vec::new();
+
+        for buffer_size in [3, 4, 5] {
+            let mut destination = vec![0; buffer_size];
+            let mut read_buf = ReadBuf::new(&mut destination);
+            std::future::poll_fn(|cx| {
+                poll_read_quic_chunks(
+                    &mut read_buffer,
+                    &mut eof,
+                    &mut pending_read_error,
+                    cx,
+                    &mut read_buf,
+                    |_| {
+                        poll_count += 1;
+                        chunks.pop_front().map_or(Poll::Pending, Poll::Ready)
+                    },
+                )
+            })
+            .await
+            .expect("partial reads from an owned Bytes chunk must succeed");
+            received.extend_from_slice(read_buf.filled());
+        }
+
+        assert_eq!(received, b"abcdefghij");
+        assert!(read_buffer.is_empty());
+        assert!(eof);
+        assert_eq!(poll_count, 2, "one chunk and one EOF, no duplicate reads");
+    }
+
+    #[tokio::test]
+    async fn raw_stream_read_preserves_randomized_owned_chunk_boundaries() {
+        for seed in 0usize..512 {
+            let len = (seed * 37) % 157;
+            let payload: Vec<u8> = (0..len)
+                .map(|i| ((i * 13 + seed * 7) & 255) as u8)
+                .collect();
+            let mut chunks = VecDeque::new();
+            let mut offset = 0usize;
+            while offset < len {
+                if (offset + seed).is_multiple_of(5) {
+                    chunks.push_back(Ok(Some(Bytes::new())));
+                }
+                let take = ((offset + seed * 3) % 17 + 1).min(len - offset);
+                chunks.push_back(Ok(Some(Bytes::from(
+                    payload[offset..offset + take].to_vec(),
+                ))));
+                offset += take;
+            }
+            chunks.push_back(Ok(None));
+
+            let mut read_buffer = Bytes::new();
+            let mut eof = false;
+            let mut pending_read_error = None;
+            let mut received = Vec::new();
+            let mut poll_count = 0usize;
+            for iteration in 0usize..512 {
+                let buffer_len = (seed + iteration * 11) % 31 + 1;
+                let mut destination = vec![0; buffer_len];
+                let mut read_buf = ReadBuf::new(&mut destination);
+                std::future::poll_fn(|cx| {
+                    poll_read_quic_chunks(
+                        &mut read_buffer,
+                        &mut eof,
+                        &mut pending_read_error,
+                        cx,
+                        &mut read_buf,
+                        |_| {
+                            poll_count += 1;
+                            chunks.pop_front().map_or(Poll::Pending, Poll::Ready)
+                        },
+                    )
+                })
+                .await
+                .expect("randomized chunk read must succeed");
+                received.extend_from_slice(read_buf.filled());
+                if eof {
+                    break;
+                }
+                assert!(iteration < 511, "seed={seed}: EOF not reached");
+            }
+            assert_eq!(received, payload, "seed={seed}");
+            assert!(eof, "seed={seed}");
+            assert!(pending_read_error.is_none(), "seed={seed}");
+            assert!(read_buffer.is_empty(), "seed={seed}");
+            assert!(chunks.is_empty(), "seed={seed}");
+            assert!(poll_count > 0, "seed={seed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_stream_read_defers_errors_until_buffered_bytes_are_returned() {
+        let mut chunks = VecDeque::from([
+            Ok(Some(Bytes::from_static(b"payload"))),
+            Err(io::Error::other("injected read failure")),
+        ]);
+        let mut read_buffer = Bytes::new();
+        let mut eof = false;
+        let mut pending_read_error = None;
+        let mut destination = [0; 16];
+        let mut read_buf = ReadBuf::new(&mut destination);
+
+        std::future::poll_fn(|cx| {
+            poll_read_quic_chunks(
+                &mut read_buffer,
+                &mut eof,
+                &mut pending_read_error,
+                cx,
+                &mut read_buf,
+                |_| chunks.pop_front().map_or(Poll::Pending, Poll::Ready),
+            )
+        })
+        .await
+        .expect("buffered bytes must be returned before a read error");
+        assert_eq!(read_buf.filled(), b"payload");
+
+        let mut next_buf = ReadBuf::new(&mut destination);
+        let err = std::future::poll_fn(|cx| {
+            poll_read_quic_chunks(
+                &mut read_buffer,
+                &mut eof,
+                &mut pending_read_error,
+                cx,
+                &mut next_buf,
+                |_| panic!("a deferred read error must not poll QUIC again"),
+            )
+        })
+        .await
+        .expect_err("deferred QUIC error must be surfaced on the next read");
+        assert_eq!(err.to_string(), "injected read failure");
+    }
+
+    #[tokio::test]
+    async fn raw_stream_read_preserves_eof_after_returning_buffered_data() {
+        let mut chunks =
+            VecDeque::from([Ok(Some(Bytes::from_static(b"payload"))), Ok(None)]);
+        let mut read_buffer = Bytes::new();
+        let mut eof = false;
+        let mut pending_read_error = None;
+        let mut destination = [0; 16];
+        let mut read_buf = ReadBuf::new(&mut destination);
+
+        std::future::poll_fn(|cx| {
+            poll_read_quic_chunks(
+                &mut read_buffer,
+                &mut eof,
+                &mut pending_read_error,
+                cx,
+                &mut read_buf,
+                |_| chunks.pop_front().map_or(Poll::Pending, Poll::Ready),
+            )
+        })
+        .await
+        .expect("buffered bytes must be returned before EOF");
+        assert_eq!(read_buf.filled(), b"payload");
+
+        let mut next_buf = ReadBuf::new(&mut destination);
+        let result = std::future::poll_fn(|cx| {
+            poll_read_quic_chunks(
+                &mut read_buffer,
+                &mut eof,
+                &mut pending_read_error,
+                cx,
+                &mut next_buf,
+                |_| panic!("known EOF must not poll QUIC again"),
+            )
+        })
+        .await;
+        result.expect("EOF is reported as a successful empty read");
+        assert!(next_buf.filled().is_empty());
+    }
+}
