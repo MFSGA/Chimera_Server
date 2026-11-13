@@ -862,6 +862,8 @@ pub fn active_connection_count() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -910,6 +912,106 @@ mod tests {
         );
         assert_eq!(snapshot.per_outbound["direct"].connections, 1);
         assert!(snapshot.known_identities.contains("bob"));
+    }
+
+    #[test]
+    fn traffic_recorder_fast_path_preserves_aggregate_snapshot_totals() {
+        let recorder = TrafficRecorder::default();
+        let mut context = TrafficContext::new("hysteria2")
+            .with_identity("alice")
+            .with_inbound_tag("hy2-in");
+        context.set_user_stats_policy(false, false, false);
+        context.set_system_stats_policy(false, false, false, false);
+
+        recorder.record(&context, 7, 11);
+        recorder.record(&context, 13, 17);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.total.connections, 2);
+        assert_eq!(snapshot.total.upload_bytes, 20);
+        assert_eq!(snapshot.total.download_bytes, 28);
+        assert_eq!(snapshot.per_protocol["hysteria2"].connections, 2);
+        assert_eq!(snapshot.per_protocol["hysteria2"].upload_bytes, 20);
+        assert_eq!(snapshot.per_protocol["hysteria2"].download_bytes, 28);
+        assert!(snapshot.per_identity.is_empty());
+        assert!(snapshot.per_inbound.is_empty());
+        assert!(snapshot.known_identities.is_empty());
+    }
+
+    #[test]
+    fn traffic_recorder_fast_path_aggregates_across_threads() {
+        const WRITERS: usize = 8;
+        const RECORDS_PER_WRITER: usize = 1_000;
+
+        let recorder = Arc::new(TrafficRecorder::default());
+        let writers = (0..WRITERS)
+            .map(|_| {
+                let recorder = Arc::clone(&recorder);
+                std::thread::spawn(move || {
+                    let mut context = TrafficContext::new("hysteria2");
+                    context.set_user_stats_policy(false, false, false);
+                    context.set_system_stats_policy(false, false, false, false);
+                    for _ in 0..RECORDS_PER_WRITER {
+                        recorder.record(&context, 3, 5);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().expect("fast-path stats writer");
+        }
+
+        let snapshot = recorder.snapshot();
+        let expected_records = (WRITERS * RECORDS_PER_WRITER) as u64;
+        assert_eq!(snapshot.total.connections, expected_records);
+        assert_eq!(snapshot.total.upload_bytes, expected_records * 3);
+        assert_eq!(snapshot.total.download_bytes, expected_records * 5);
+        assert_eq!(
+            snapshot.per_protocol["hysteria2"].connections,
+            expected_records
+        );
+        assert_eq!(
+            snapshot.per_protocol["hysteria2"].upload_bytes,
+            expected_records * 3
+        );
+        assert_eq!(
+            snapshot.per_protocol["hysteria2"].download_bytes,
+            expected_records * 5
+        );
+    }
+
+    #[test]
+    fn traffic_recorder_snapshot_merges_fast_and_detailed_paths() {
+        let recorder = TrafficRecorder::default();
+        let mut fast_context = TrafficContext::new("vless")
+            .with_identity("alice")
+            .with_inbound_tag("edge");
+        fast_context.set_user_stats_policy(false, false, false);
+        fast_context.set_system_stats_policy(false, false, false, false);
+        let detailed_context = TrafficContext::new("vless")
+            .with_identity("bob")
+            .with_inbound_tag("edge");
+
+        recorder.record(&fast_context, 3, 5);
+        recorder.record(&detailed_context, 7, 11);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.total.connections, 2);
+        assert_eq!(snapshot.total.upload_bytes, 10);
+        assert_eq!(snapshot.total.download_bytes, 16);
+        assert_eq!(snapshot.per_protocol["vless"].connections, 2);
+        assert_eq!(snapshot.per_protocol["vless"].upload_bytes, 10);
+        assert_eq!(snapshot.per_protocol["vless"].download_bytes, 16);
+        assert_eq!(
+            snapshot.per_identity[&("vless".to_string(), "bob".to_string())]
+                .upload_bytes,
+            7
+        );
+        assert!(
+            !snapshot
+                .per_identity
+                .contains_key(&("vless".to_string(), "alice".to_string()))
+        );
     }
     #[test]
     fn inbound_totals_and_users_share_internal_entry_without_changing_snapshot() {
