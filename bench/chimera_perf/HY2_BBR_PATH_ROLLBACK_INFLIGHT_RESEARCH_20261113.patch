@@ -1,0 +1,1208 @@
+diff --git a/vendor/quinn-proto/src/connection/mod.rs b/vendor/quinn-proto/src/connection/mod.rs
+--- a/vendor/quinn-proto/src/connection/mod.rs
++++ b/vendor/quinn-proto/src/connection/mod.rs
+@@ -44,8 +44,13 @@
+ pub use assembler::Chunk;
+ 
+ mod cid_state;
+ use cid_state::CidState;
++
++#[cfg(test)]
++mod delivery_rate_pool;
++#[cfg(test)]
++use delivery_rate_pool::DeliverySampler;
+ 
+ mod datagrams;
+ use datagrams::DatagramState;
+ pub use datagrams::{Datagrams, SendDatagramError};
+@@ -237,8 +242,10 @@
+     /// Connection level statistics
+     stats: ConnectionStats,
+     /// QUIC version used for the connection.
+     version: u32,
++    #[cfg(test)]
++    delivery_sampler: DeliverySampler,
+ }
+ 
+ impl Connection {
+     pub(crate) fn new(
+@@ -354,8 +361,10 @@
+             rem_cids: CidQueue::new(rem_cid),
+             rng,
+             stats: ConnectionStats::default(),
+             version,
++            #[cfg(test)]
++            delivery_sampler: DeliverySampler::new(now, 256),
+         };
+         if path_validated {
+             this.on_path_validated();
+         }
+@@ -1201,9 +1210,26 @@
+                 }
+                 Timer::PathValidation => {
+                     debug!("path validation failed");
+                     if let Some((_, prev)) = self.prev_path.take() {
++                        #[cfg(test)]
++                        {
++                            // The failed new path has no future ACK clock.
++                            // Keep its SentPacket records for QUIC loss/ACK
++                            // processing, but release their obsolete BBR
++                            // sampling slots now, not after eventual loss.
++                            let abandoned_generation = self.path.generation();
++                            for space in &mut self.spaces {
++                                for packet in space.sent_packets.values_mut() {
++                                    if packet.path_generation == abandoned_generation {
++                                        self.delivery_sampler.discard(packet.delivery_handle.take());
++                                    }
++                                }
++                            }
++                        }
+                         self.path = prev;
++                        #[cfg(test)]
++                        self.delivery_sampler.reset_path_anchor();
+                     }
+                     self.path.challenge = None;
+                     self.path.challenge_pending = false;
+                 }
+@@ -1508,8 +1534,10 @@
+             self.path.in_flight.bytes,
+             self.app_limited,
+             self.spaces[space].largest_acked_packet,
+         );
++        #[cfg(test)]
++        self.delivery_sampler.end_acks();
+ 
+         if new_largest && ack_eliciting_acked {
+             let ack_delay = if space != SpaceId::Data {
+                 Duration::from_micros(0)
+@@ -1585,8 +1613,18 @@
+ 
+     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
+     // high-latency handshakes
+     fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
++        #[cfg(test)]
++        self.delivery_sampler.ack(
++            info.delivery_handle,
++            info.time_sent,
++            now,
++            info.size as u64,
++            info.path_generation == self.path.generation()
++                && info.ack_eliciting
++                && self.path.challenge.is_none(),
++        );
+         self.remove_in_flight(&info);
+         if info.ack_eliciting && self.path.challenge.is_none() {
+             // Only pass ACKs to the congestion controller if we are not validating the current
+             // path, so as to ignore any ACKs from older paths still coming in.
+@@ -2480,8 +2518,10 @@
+ 
+                 let space = &mut self.spaces[SpaceId::Initial];
+                 if let Some(info) = space.take(0) {
+                     self.on_packet_acked(now, info);
++                    #[cfg(test)]
++                    self.delivery_sampler.end_acks(); // inferred ACK on Retry
+                 };
+ 
+                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
+                 self.spaces[SpaceId::Initial] = PacketSpace {
+@@ -3074,8 +3114,10 @@
+         new_path.challenge_pending = true;
+         let prev_pto = self.pto(SpaceId::Data);
+ 
+         let mut prev = mem::replace(&mut self.path, new_path);
++        #[cfg(test)]
++        self.delivery_sampler.reset_path_anchor();
+         // Don't clobber the original path if the previous one hasn't been validated yet
+         if prev.challenge.is_none() {
+             prev.challenge = Some(self.rng.random());
+             prev.challenge_pending = true;
+@@ -3091,8 +3133,10 @@
+     }
+ 
+     /// Handle a change in the local address, i.e. an active migration
+     pub fn local_address_changed(&mut self) {
++        #[cfg(test)]
++        self.delivery_sampler.reset_path_anchor();
+         self.update_rem_cid();
+         self.ping();
+     }
+ 
+@@ -3607,8 +3651,61 @@
+     pub(crate) fn bytes_in_flight(&self) -> u64 {
+         self.path.in_flight.bytes
+     }
+ 
++    /// Read-only counters for the isolated delivery instrumentation.
++    #[cfg(test)]
++    pub(crate) fn delivery_sample_diagnostics(&self) -> (usize, u64, u64, u64, u64) {
++        self.delivery_sampler.diagnostics()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn delivery_set_pool_capacity_for_test(&mut self, now: Instant, capacity: usize) {
++        assert_eq!(self.delivery_sampler.diagnostics().0, 0, "cannot discard live handles");
++        self.delivery_sampler = DeliverySampler::new(now, capacity);
++    }
++
++    #[cfg(test)]
++    pub(crate) fn delivery_anchor_valid(&self) -> bool {
++        self.delivery_sampler.has_current_path_anchor()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn delivery_path_validation_deadline(&self) -> Option<Instant> {
++        self.timers.get(Timer::PathValidation)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn delivery_path_generation(&self) -> u64 {
++        self.path.generation()
++    }
++
++    /// Debug-only correlation between pool occupancy and sent packet owners.
++    #[cfg(test)]
++    pub(crate) fn delivery_live_packet_snapshot_paths(&self) -> (usize, usize, usize) {
++        let current_generation = self.path.generation();
++        let mut tracked = 0;
++        let mut current = 0;
++        let mut other = 0;
++        for pkt in self.spaces.iter().flat_map(|space| space.sent_packets.values()) {
++            if pkt.delivery_handle.is_none() {
++                continue;
++            }
++            tracked += 1;
++            if pkt.path_generation == current_generation {
++                current += 1;
++            } else {
++                other += 1;
++            }
++        }
++        (tracked, current, other)
++    }
++
++    #[cfg(test)]
++    pub(crate) fn delivery_pool_misses(&self) -> u64 {
++        self.delivery_sampler.missed_samples_due_to_capacity()
++    }
++
+     /// Number of bytes worth of non-ack-only packets that may be sent
+     #[cfg(test)]
+     pub(crate) fn congestion_window(&self) -> u64 {
+         self.path
+@@ -3685,8 +3782,10 @@
+     }
+ 
+     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
+     fn remove_in_flight(&mut self, packet: &SentPacket) {
++        #[cfg(test)]
++        self.delivery_sampler.discard(packet.delivery_handle);
+         // Visit known paths from newest to oldest to find the one `packet` was sent on
+         for path in [&mut self.path]
+             .into_iter()
+             .chain(self.prev_path.as_mut().map(|(_, data)| data))
+diff --git a/vendor/quinn-proto/src/connection/packet_builder.rs b/vendor/quinn-proto/src/connection/packet_builder.rs
+--- a/vendor/quinn-proto/src/connection/packet_builder.rs
++++ b/vendor/quinn-proto/src/connection/packet_builder.rs
+@@ -203,18 +203,30 @@
+         };
+ 
+         let packet = SentPacket {
+             path_generation: conn.path.generation(),
++            #[cfg(test)]
++            delivery_handle: if size != 0 {
++                conn.delivery_sampler.send(now, size as u64, conn.app_limited)
++            } else {
++                None
++            },
+             largest_acked: sent.largest_acked,
+             time_sent: now,
+             size,
+             ack_eliciting,
+             retransmits: sent.retransmits,
+             stream_frames: sent.stream_frames,
+         };
+ 
+-        conn.path
++        let forgotten = conn.path
+             .sent(exact_number, packet, &mut conn.spaces[space_id]);
++        #[cfg(test)]
++        if let Some(forgotten) = forgotten {
++            conn.delivery_sampler.discard(forgotten.delivery_handle);
++        }
++        #[cfg(not(test))]
++        let _ = forgotten;
+         conn.stats.path.sent_packets += 1;
+         conn.reset_keep_alive(now);
+         if size != 0 {
+             if ack_eliciting {
+diff --git a/vendor/quinn-proto/src/connection/paths.rs b/vendor/quinn-proto/src/connection/paths.rs
+--- a/vendor/quinn-proto/src/connection/paths.rs
++++ b/vendor/quinn-proto/src/connection/paths.rs
+@@ -159,16 +159,23 @@
+         self.mtud.current_mtu()
+     }
+ 
+     /// Account for transmission of `packet` with number `pn` in `space`
+-    pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketSpace) {
++    pub(super) fn sent(
++        &mut self,
++        pn: u64,
++        packet: SentPacket,
++        space: &mut PacketSpace,
++    ) -> Option<SentPacket> {
+         self.in_flight.insert(&packet);
+         if self.first_packet.is_none() {
+             self.first_packet = Some(pn);
+         }
+         if let Some(forgotten) = space.sent(pn, packet) {
+             self.remove_in_flight(&forgotten);
+-        }
++            return Some(forgotten);
++        }
++        None
+     }
+ 
+     /// Remove `packet` with number `pn` from this path's congestion control counters, or return
+     /// `false` if `pn` was sent before this path was established.
+diff --git a/vendor/quinn-proto/src/connection/spaces.rs b/vendor/quinn-proto/src/connection/spaces.rs
+--- a/vendor/quinn-proto/src/connection/spaces.rs
++++ b/vendor/quinn-proto/src/connection/spaces.rs
+@@ -287,8 +287,11 @@
+     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
+     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
+     /// "in flight" packet.
+     pub(super) size: u16,
++    /// Experimental connection-owned metadata handle. No effect outside tests.
++    #[cfg(test)]
++    pub(super) delivery_handle: Option<super::delivery_rate_pool::Handle>,
+     /// Whether an acknowledgement is expected directly in response to this packet.
+     pub(super) ack_eliciting: bool,
+     /// The largest packet number acknowledged by this packet
+     pub(super) largest_acked: Option<u64>,
+diff --git a/vendor/quinn-proto/src/tests/mod.rs b/vendor/quinn-proto/src/tests/mod.rs
+--- a/vendor/quinn-proto/src/tests/mod.rs
++++ b/vendor/quinn-proto/src/tests/mod.rs
+@@ -651,10 +651,16 @@
+     assert!(pair.client_conn_mut(client_ch).has_0rtt());
+     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+     const MSG: &[u8] = b"Hello, 0-RTT!";
+     pair.client_send(client_ch, s).write(MSG).unwrap();
++    pair.drive_client(); // Send genuine 0-RTT packets before rejection is received.
++    let before_rejection = pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert!(before_rejection.0 > 0, "0-RTT packet snapshots must be tracked");
+     pair.drive();
+     assert!(!pair.client_conn_mut(client_ch).accepted_0rtt());
++    let after_rejection = pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert_eq!(after_rejection.0, 0, "rejected 0-RTT snapshots must be released");
++    assert!(after_rejection.3 > before_rejection.3, "0-RTT rejection must free snapshot slots");
+     let server_ch = pair.server.assert_accept();
+     assert_matches!(
+         pair.server_conn_mut(server_ch).poll(),
+         Some(Event::HandshakeDataReady)
+@@ -1256,8 +1262,11 @@
+     let (client_ch, server_ch) = pair.connect();
+     pair.drive();
+ 
+     let client_stats_after_connect = pair.client_conn_mut(client_ch).stats();
++    let server_delivery_before = pair.server_conn_mut(server_ch).delivery_sample_diagnostics();
++    assert!(pair.server_conn_mut(server_ch).delivery_anchor_valid(),
++        "initial path established a delivery-rate anchor");
+ 
+     pair.client.addr = SocketAddr::new(
+         Ipv4Addr::new(127, 0, 0, 1).into(),
+         CLIENT_PORTS.lock().unwrap().next().unwrap(),
+@@ -1268,11 +1277,22 @@
+     // anti-amplification budget
+     pair.drive_client();
+     pair.drive_server();
+     assert_ne!(pair.server_conn_mut(server_ch).total_recvd(), 0);
++    assert!(!pair.server_conn_mut(server_ch).delivery_anchor_valid(),
++        "freshly migrated path must not reuse old-path ACK anchor before a new ACK");
+ 
+     pair.drive();
+     assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
++    let server_delivery_after = pair.server_conn_mut(server_ch).delivery_sample_diagnostics();
++    assert!(
++        server_delivery_after.1 > server_delivery_before.1,
++        "new path validation must send real QUIC packets"
++    );
++    assert_eq!(
++        server_delivery_after.0, 0,
++        "migration must not retain orphaned old/new path metadata"
++    );
+     assert_eq!(
+         pair.server_conn_mut(server_ch).remote_address(),
+         pair.client.addr
+     );
+@@ -3397,4 +3417,293 @@
+ 
+     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+     pair.connect();
+ }
++
++
++// The instrumentation is cfg(test)-only but these exercise real
++// Endpoint / Connection / PacketBuilder / ACK and loss handling.
++#[test]
++fn delivery_instrumentation_real_handshake_and_stream_ack() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, server_ch) = pair.connect();
++    let before = pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    pair.client_send(client_ch, stream).write(&[42u8; 8192]).unwrap();
++    pair.client_send(client_ch, stream).finish().unwrap();
++    pair.drive();
++    let accepted = pair.server_streams(server_ch).accept(Dir::Uni).unwrap();
++    assert_eq!(accepted, stream);
++    let mut received = Vec::new();
++    {
++        let mut recv = pair.server_recv(server_ch, stream);
++        let mut chunks = recv.read(true).unwrap();
++        while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
++            received.extend_from_slice(&chunk.bytes);
++        }
++        let _ = chunks.finalize();
++    }
++    let (occupied, sent, acked, _discards, _samples) =
++        pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert_eq!(received, vec![42u8; 8192]);
++    assert!(sent > before.1, "must track actual outgoing QUIC packets");
++    assert!(acked > before.2, "real ACK path must account delivered bytes");
++    assert_eq!(occupied, 0, "ACKed packets must release all snapshots");
++}
++
++#[test]
++fn delivery_instrumentation_real_retry_releases_initial() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    pair.server.handle_incoming = Box::new(validate_incoming);
++    let (client_ch, _server_ch) = pair.connect();
++    let (occupied, sent, acked, _discards, _samples) =
++        pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert!(sent > 0, "Retry handshake must have tracked actual sends");
++    assert!(acked > 0, "Retry handshake should preserve ACK accounting");
++    assert_eq!(occupied, 0, "Initial/Retry snapshots must not leak");
++}
++
++#[test]
++fn delivery_instrumentation_real_loss_path_releases_snapshot() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, server_ch) = pair.connect();
++    let before = pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    pair.client_send(client_ch, stream).write(&[42u8; 4096]).unwrap();
++    pair.client_send(client_ch, stream).finish().unwrap();
++    pair.drive_client();
++    assert!(
++        pair.client_conn_mut(client_ch).delivery_sample_diagnostics().0 > 0,
++        "unacknowledged actual packets must retain snapshots"
++    );
++    pair.server.inbound.clear(); // Drop outgoing traffic once
++    pair.drive(); // QUIC recovers using PTO and retransmissions
++    let accepted = pair.server_streams(server_ch).accept(Dir::Uni).unwrap();
++    assert_eq!(accepted, stream);
++    let mut received = Vec::new();
++    {
++        let mut recv = pair.server_recv(server_ch, stream);
++        let mut chunks = recv.read(true).unwrap();
++        while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
++            received.extend_from_slice(&chunk.bytes);
++        }
++        let _ = chunks.finalize();
++    }
++    let (occupied, sent, acked, discards, _samples) =
++        pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert!(sent > before.1);
++    assert!(acked > before.2);
++    assert_eq!(received, vec![42u8; 4096]);
++    assert!(discards > before.3, "lost packets must release metadata");
++    assert_eq!(occupied, 0, "loss recovery must not leave orphaned snapshots");
++}
++
++
++#[test]
++fn delivery_instrumentation_real_bounded_exhaustion_keeps_quic_acks() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, server_ch) = pair.connect();
++    let now = pair.time;
++    pair.client_conn_mut(client_ch)
++        .delivery_set_pool_capacity_for_test(now, 1);
++    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
++    pair.client_send(client_ch, stream).write(&[42u8; 8192]).unwrap();
++    pair.client_send(client_ch, stream).finish().unwrap();
++    pair.drive_client();
++    assert!(
++        pair.client_conn_mut(client_ch).delivery_pool_misses() > 0,
++        "multiple in-flight packets with a one-slot pool must exhaust snapshots"
++    );
++    pair.drive();
++    let accepted = pair.server_streams(server_ch).accept(Dir::Uni).unwrap();
++    assert_eq!(accepted, stream);
++    let mut received = Vec::new();
++    {
++        let mut recv = pair.server_recv(server_ch, stream);
++        let mut chunks = recv.read(true).unwrap();
++        while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
++            received.extend_from_slice(&chunk.bytes);
++        }
++        let _ = chunks.finalize();
++    }
++    let (occupied, sent, acked, _discards, _samples) =
++        pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert_eq!(occupied, 0, "remaining tracked snapshot must be released");
++    assert_eq!(received, vec![42u8; 8192]);
++    assert!(sent > 1, "real packets were sent");
++    assert!(acked > 0, "ACK bytes still count with missing samples");
++}
++
++// Local address changes do not mutate PathData on the client, so the
++// delivery-rate epoch must be reset explicitly as well.
++#[test]
++fn delivery_instrumentation_local_address_change_resets_old_anchor() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, _server_ch) = pair.connect();
++    assert!(
++        pair.client_conn_mut(client_ch).delivery_anchor_valid(),
++        "handshake must have an ACK anchor for the original local path"
++    );
++    pair.client_conn_mut(client_ch).local_address_changed();
++    assert!(
++        !pair.client_conn_mut(client_ch).delivery_anchor_valid(),
++        "moving local address cannot reuse previous path's ACK clock"
++    );
++    pair.drive();
++    let (outstanding, sent, acked, _, _) =
++        pair.client_conn_mut(client_ch).delivery_sample_diagnostics();
++    assert!(sent > 0 && acked > 0);
++    assert_eq!(outstanding, 0);
++}
++
++// The server must retain a snapshot of an old-path packet while the new
++// path is being validated and then reject that validation at the real timer.
++#[test]
++fn delivery_real_migration_timeout_rolls_back_with_old_path_inflight() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, server_ch) = pair.connect();
++    pair.drive();
++    let original_client_addr = pair.client.addr;
++    let original_generation = pair.server_conn_mut(server_ch).delivery_path_generation();
++
++    // Real server -> client STREAM packet, not yet received or ACKed.
++    let stream = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
++    let payload = vec![0x5a_u8; 4096];
++    pair.server_send(server_ch, stream).write(&payload).unwrap();
++    pair.server_send(server_ch, stream).finish().unwrap();
++    pair.drive_server();
++    let old_packets = std::mem::take(&mut pair.client.inbound);
++    assert!(!old_packets.is_empty(), "the first path transmitted stream packets");
++    let original_inflight = pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0;
++    assert!(original_inflight > 0, "the old path must have outstanding packet snapshots");
++
++    // Change client source address and send a real ping, causing server migration.
++    pair.client.addr = SocketAddr::new(
++        Ipv4Addr::LOCALHOST.into(),
++        CLIENT_PORTS.lock().unwrap().next().unwrap(),
++    );
++    pair.client_conn_mut(client_ch).ping();
++    pair.drive_client();
++    pair.drive_server();
++
++    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), pair.client.addr);
++    assert_ne!(pair.server_conn_mut(server_ch).delivery_path_generation(), original_generation);
++    let during = pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0;
++    assert!(during >= original_inflight, "old-path outstanding snapshots must survive migration");
++
++    // Drop PATH_CHALLENGE / PATH_RESPONSE exchanges, not the original old-path bytes.
++    pair.client.inbound.clear();
++    let deadline = pair.server_conn_mut(server_ch)
++        .delivery_path_validation_deadline()
++        .expect("migration arms a validation timeout");
++    assert!(deadline > pair.time, "must exercise the scheduled timeout");
++    pair.time = deadline;
++    pair.server_conn_mut(server_ch).handle_timeout(deadline);
++
++    assert_eq!(
++        pair.server_conn_mut(server_ch).remote_address(),
++        original_client_addr,
++        "expired validation must restore previous path"
++    );
++    assert_eq!(pair.server_conn_mut(server_ch).delivery_path_generation(), original_generation);
++    assert!(!pair.server_conn_mut(server_ch).delivery_anchor_valid(),
++        "rollback cannot reuse an ACK anchor from the rejected path");
++    assert!(
++        pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0 >= original_inflight,
++        "pending old-path packet snapshots must not be destroyed by rollback"
++    );
++
++    // Resume the original source and deliver the retained original packets.
++    pair.client.addr = original_client_addr;
++    pair.client.inbound = old_packets;
++    pair.drive();
++    let accepted = pair.client_streams(client_ch).accept(Dir::Uni).unwrap();
++    assert_eq!(accepted, stream);
++    let mut received = Vec::new();
++    {
++        let mut recv = pair.client_recv(client_ch, stream);
++        let mut chunks = recv.read(true).unwrap();
++        while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
++            received.extend_from_slice(&chunk.bytes);
++        }
++        let _ = chunks.finalize();
++    }
++    assert_eq!(received, payload);
++    let pool_occupied = pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0;
++    let owners = pair.server_conn_mut(server_ch).delivery_live_packet_snapshot_paths();
++    eprintln!(
++        "rollback snapshot diagnostic: pool={}, packet owners (all,current,other)={owners:?}",
++        pool_occupied,
++    );
++    assert_eq!(pool_occupied, owners.0, "all snapshots must have live SentPacket owners");
++    assert_eq!(owners.2, 0,
++        "abandoned path snapshots must be released instead of blocking the bounded pool");
++}
++
++
++#[test]
++fn delivery_real_validated_migration_releases_old_path_inflight() {
++    let _guard = subscribe();
++    let mut pair = Pair::default();
++    let (client_ch, server_ch) = pair.connect();
++    pair.drive();
++    let initial_generation = pair.server_conn_mut(server_ch).delivery_path_generation();
++
++    let stream = pair.server_streams(server_ch).open(Dir::Uni).unwrap();
++    let payload = vec![0x3c_u8; 2048];
++    pair.server_send(server_ch, stream).write(&payload).unwrap();
++    pair.server_send(server_ch, stream).finish().unwrap();
++    pair.drive_server();
++    let old_inbound = std::mem::take(&mut pair.client.inbound);
++    assert!(!old_inbound.is_empty());
++    let old_occupied = pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0;
++    assert!(old_occupied > 0, "old path packet handles must exist during migration");
++
++    // Start migration without delivering the original path's in-flight bytes.
++    pair.client.addr = SocketAddr::new(
++        Ipv4Addr::LOCALHOST.into(),
++        CLIENT_PORTS.lock().unwrap().next().unwrap(),
++    );
++    pair.client_conn_mut(client_ch).ping();
++    pair.drive_client();
++    pair.drive_server();
++    assert_ne!(
++        pair.server_conn_mut(server_ch).delivery_path_generation(),
++        initial_generation
++    );
++    assert!(
++        pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0 >= old_occupied,
++        "path switch must preserve old packet snapshot ownership"
++    );
++
++    // Deliver path validation before releasing the delayed old-path packets.
++    pair.drive();
++    assert_eq!(pair.server_conn_mut(server_ch).remote_address(), pair.client.addr);
++    assert!(pair.server_conn_mut(server_ch).delivery_path_validation_deadline().is_none());
++
++    // Late old-path packets can now be received/ACKed while a new path is active.
++    pair.client.inbound.extend(old_inbound);
++    pair.drive();
++    let accepted = pair.client_streams(client_ch).accept(Dir::Uni).unwrap();
++    assert_eq!(accepted, stream);
++    let mut received = Vec::new();
++    {
++        let mut recv = pair.client_recv(client_ch, stream);
++        let mut chunks = recv.read(true).unwrap();
++        while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
++            received.extend_from_slice(&chunk.bytes);
++        }
++        let _ = chunks.finalize();
++    }
++    assert_eq!(received, payload);
++    let pool_occupied = pair.server_conn_mut(server_ch).delivery_sample_diagnostics().0;
++    let (tracked, _current, other) =
++        pair.server_conn_mut(server_ch).delivery_live_packet_snapshot_paths();
++    assert_eq!(pool_occupied, tracked, "no orphaned sampler slots");
++    assert_eq!(other, 0, "late old-path packet ACK/loss must release old-path handles");
++}
+diff --git a/vendor/quinn-proto/src/connection/delivery_rate_pool.rs b/vendor/quinn-proto/src/connection/delivery_rate_pool.rs
+new file mode 100644
+--- /dev/null
++++ b/vendor/quinn-proto/src/connection/delivery_rate_pool.rs
+@@ -0,0 +1,573 @@
++//! Experimental Xray-style dual-slope sampler and bounded packet metadata pool.
++//! This module is test-only, and does not affect live Quinn/BBR behavior.
++
++use super::SentPacket;
++use crate::Instant;
++use std::num::NonZeroU64;
++
++#[derive(Clone, Copy, Debug)]
++struct SendState {
++    sent_total: u64,
++    acked_total_at_send: u64,
++    last_acked_sent_total: u64,
++    last_acked_sent_ns: u64,
++    last_acked_ack_ns: u64,
++    last_acked_valid: bool,
++    sent_app_limited: bool,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct RateSample {
++    send_bps: Option<u64>, // None = no send-rate constraint, per Xray
++    ack_bps: u64,
++    bandwidth_bps: u64,
++    sent_app_limited: bool,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct Handle(NonZeroU64);
++
++#[derive(Debug)]
++struct Slot {
++    generation: u32,
++    snapshot: Option<SendState>,
++}
++
++#[derive(Debug)]
++struct SnapshotPool {
++    slots: Vec<Slot>,
++    free: Vec<u32>,
++    capacity: usize,
++}
++
++impl SnapshotPool {
++    pub(super) fn new(capacity: usize) -> Self {
++        assert!(capacity > 0 && capacity <= u32::MAX as usize);
++        Self {
++            slots: Vec::with_capacity(capacity),
++            free: Vec::with_capacity(capacity),
++            capacity,
++        }
++    }
++
++    fn insert(&mut self, snapshot: SendState) -> Option<Handle> {
++        let index = if let Some(index) = self.free.pop() {
++            index
++        } else if self.slots.len() < self.capacity {
++            let index = self.slots.len() as u32;
++            self.slots.push(Slot {
++                generation: 1,
++                snapshot: None,
++            });
++            index
++        } else {
++            return None;
++        };
++        let slot = &mut self.slots[index as usize];
++        debug_assert!(slot.generation != 0 && slot.snapshot.is_none());
++        slot.snapshot = Some(snapshot);
++        let id = ((slot.generation as u64) << 32) | (u64::from(index) + 1);
++        Some(Handle(
++            NonZeroU64::new(id).expect("index+1 and generation are nonzero"),
++        ))
++    }
++
++    fn take(&mut self, handle: Handle) -> Option<SendState> {
++        let raw = handle.0.get();
++        let low = raw as u32;
++        let index = low.checked_sub(1)? as usize;
++        let generation = (raw >> 32) as u32;
++        let slot = self.slots.get_mut(index)?;
++        if slot.generation != generation || generation == 0 {
++            return None;
++        }
++        let snapshot = slot.snapshot.take()?;
++        // Retire exhausted generations rather than allow a stale handle to
++        // become valid after wrapping 2^32 reuse cycles.
++        if let Some(next) = slot.generation.checked_add(1) {
++            slot.generation = next;
++            self.free.push(index as u32);
++        } else {
++            slot.generation = 0;
++        }
++        Some(snapshot)
++    }
++
++    fn occupied(&self) -> usize {
++        self.slots
++            .iter()
++            .filter(|slot| slot.snapshot.is_some())
++            .count()
++    }
++}
++
++#[allow(dead_code)]
++struct PacketWithHandle {
++    packet: SentPacket,
++    handle: Option<Handle>,
++}
++
++pub(super) struct DeliverySampler {
++    origin: Instant,
++    pool: SnapshotPool,
++    sent_total: u64,
++    acked_total: u64,
++    last_acked_sent_total: u64,
++    last_acked_sent_ns: u64,
++    last_acked_ack_ns: u64,
++    has_last_ack: bool,
++    frame_best: Option<RateSample>,
++    skipped_capacity: u64,
++    integrated_samples: u64,
++    integrated_sends: u64,
++    integrated_discards: u64,
++}
++
++impl DeliverySampler {
++    pub(super) fn new(now: Instant, max_inflight_snapshots: usize) -> Self {
++        Self {
++            origin: now,
++            pool: SnapshotPool::new(max_inflight_snapshots),
++            sent_total: 0,
++            acked_total: 0,
++            last_acked_sent_total: 0,
++            last_acked_sent_ns: 0,
++            last_acked_ack_ns: 0,
++            has_last_ack: false,
++            frame_best: None,
++            skipped_capacity: 0,
++            integrated_samples: 0,
++            integrated_sends: 0,
++            integrated_discards: 0,
++        }
++    }
++
++    fn nanos(&self, at: Instant) -> u64 {
++        at.checked_duration_since(self.origin)
++            .unwrap_or_default()
++            .as_nanos()
++            .min(u64::MAX as u128) as u64
++    }
++
++    /// Called after the packet's size is known. Returns None when the bounded
++    /// pool is full; the packet may still be sent without a rate snapshot.
++    pub(super) fn send(
++        &mut self,
++        _now: Instant,
++        bytes: u64,
++        sent_app_limited: bool,
++    ) -> Option<Handle> {
++        self.integrated_sends = self.integrated_sends.saturating_add(1);
++        self.sent_total = self.sent_total.saturating_add(bytes);
++        let snapshot = SendState {
++            sent_total: self.sent_total,
++            acked_total_at_send: self.acked_total,
++            last_acked_sent_total: self.last_acked_sent_total,
++            last_acked_sent_ns: self.last_acked_sent_ns,
++            last_acked_ack_ns: self.last_acked_ack_ns,
++            last_acked_valid: self.has_last_ack,
++            sent_app_limited,
++        };
++        let handle = self.pool.insert(snapshot);
++        if handle.is_none() {
++            self.skipped_capacity = self.skipped_capacity.saturating_add(1);
++        }
++        handle
++    }
++
++    fn rate(bytes: u64, duration_ns: u64) -> Option<u64> {
++        if duration_ns == 0 {
++            return None;
++        }
++        Some(((bytes as u128 * 1_000_000_000) / duration_ns as u128).min(u64::MAX as u128) as u64)
++    }
++
++    /// Invoked only for a newly ACKed packet removed from sent_packets.
++    /// An explicit stale handle is rejected, while None denotes legitimate
++    /// snapshot exhaustion and still accounts for the ACKed bytes.
++    pub(super) fn ack(
++        &mut self,
++        handle: Option<Handle>,
++        sent_at: Instant,
++        ack_at: Instant,
++        bytes: u64,
++        current_path: bool,
++    ) -> Option<RateSample> {
++        let snapshot = handle.and_then(|handle| self.pool.take(handle));
++        if !current_path {
++            return None;
++        }
++        if handle.is_some() && snapshot.is_none() {
++            return None; // stale or duplicate handle, not a new ACK
++        }
++
++        self.acked_total = self.acked_total.saturating_add(bytes);
++        let sent_ns = self.nanos(sent_at);
++        let ack_ns = self.nanos(ack_at);
++        let Some(state) = snapshot else {
++            // The ACK is real, but a capacity-exhausted snapshot cannot tell
++            // us how many bytes had been sent *at that packet's send time*.
++            // Do not forge a reference point with the current total_sent.
++            self.has_last_ack = false;
++            return None;
++        };
++        self.last_acked_sent_total = state.sent_total;
++        self.last_acked_sent_ns = sent_ns;
++        self.last_acked_ack_ns = ack_ns;
++        self.has_last_ack = true;
++        if !state.last_acked_valid || ack_ns <= state.last_acked_ack_ns {
++            return None;
++        }
++
++        let ack_bps = Self::rate(
++            self.acked_total.saturating_sub(state.acked_total_at_send),
++            ack_ns - state.last_acked_ack_ns,
++        )?;
++        let send_bps = if sent_ns > state.last_acked_sent_ns {
++            Self::rate(
++                state.sent_total.saturating_sub(state.last_acked_sent_total),
++                sent_ns - state.last_acked_sent_ns,
++            )
++        } else {
++            None // Xray treats send rate as +infinity for equal send instants
++        };
++        let sample = RateSample {
++            send_bps,
++            ack_bps,
++            bandwidth_bps: send_bps.map_or(ack_bps, |rate| rate.min(ack_bps)),
++            sent_app_limited: state.sent_app_limited,
++        };
++        if self
++            .frame_best
++            .is_none_or(|prev| sample.bandwidth_bps > prev.bandwidth_bps)
++        {
++            self.frame_best = Some(sample);
++        }
++        Some(sample)
++    }
++
++    /// Drop snapshot state for a packet deemed lost/neutered/discarded.
++    pub(super) fn discard(&mut self, handle: Option<Handle>) -> bool {
++        let removed = handle.is_some_and(|handle| self.pool.take(handle).is_some());
++        if removed {
++            self.integrated_discards = self.integrated_discards.saturating_add(1);
++        }
++        removed
++    }
++
++    /// One ACK frame, not one instant (two frames may share an Instant).
++    pub(super) fn end_acks(&mut self) -> Option<RateSample> {
++        let sample = self.frame_best.take();
++        if sample.is_some() {
++            self.integrated_samples = self.integrated_samples.saturating_add(1);
++        }
++        sample
++    }
++
++    /// Path change invalidates the old link's delivery-rate anchor, but not
++    /// the packet-owned snapshot slots: those stay until ACK/loss/discard.
++    pub(super) fn reset_path_anchor(&mut self) {
++        self.has_last_ack = false;
++        self.last_acked_sent_total = 0;
++        self.last_acked_sent_ns = 0;
++        self.last_acked_ack_ns = 0;
++        self.frame_best = None;
++    }
++
++    pub(super) fn has_current_path_anchor(&self) -> bool {
++        self.has_last_ack
++    }
++
++    pub(super) fn missed_samples_due_to_capacity(&self) -> u64 {
++        self.skipped_capacity
++    }
++
++    pub(super) fn diagnostics(&self) -> (usize, u64, u64, u64, u64) {
++        (
++            self.pool.occupied(),
++            self.integrated_sends,
++            self.acked_total,
++            self.integrated_discards,
++            self.integrated_samples,
++        )
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::Duration;
++
++    fn at(t: Instant, ms: u64) -> Instant {
++        t + Duration::from_millis(ms)
++    }
++
++    #[test]
++    fn handle_is_eight_bytes_without_per_packet_box_or_layout_regression() {
++        assert_eq!(std::mem::size_of::<Handle>(), 8);
++        assert_eq!(std::mem::size_of::<Option<Handle>>(), 8);
++        assert_eq!(std::mem::size_of::<SentPacket>(), 104);
++        assert!(std::mem::size_of::<PacketWithHandle>() <= 128);
++        println!(
++            "layout: SentPacket={}B, PacketWithHandle={}B, SendState={}B, Slot={}B, Handle={}B",
++            std::mem::size_of::<SentPacket>(),
++            std::mem::size_of::<PacketWithHandle>(),
++            std::mem::size_of::<SendState>(),
++            std::mem::size_of::<Slot>(),
++            std::mem::size_of::<Handle>(),
++        );
++    }
++
++    #[test]
++    fn ack_compression_is_capped_by_send_slope_after_valid_anchor() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 3);
++        let anchor = s.send(t, 1_000, false);
++        assert_eq!(s.ack(anchor, t, at(t, 100), 1_000, true), None);
++        assert_eq!(s.end_acks(), None);
++        let a = s.send(at(t, 101), 1_000, false);
++        let b = s.send(at(t, 201), 1_000, false);
++
++        let first = s.ack(a, at(t, 101), at(t, 202), 1_000, true).unwrap();
++        let second = s.ack(b, at(t, 201), at(t, 202), 1_000, true).unwrap();
++        let frame = s.end_acks().unwrap();
++
++        // For packet b: 2000 sent bytes in 201ms, but 2000 acked bytes
++        // in 102ms. ACK compression must not exceed the send slope.
++        assert_eq!(first.send_bps, Some(9_900));
++        assert_eq!(first.ack_bps, 9_803);
++        assert_eq!(second.send_bps, Some(9_950));
++        assert_eq!(second.ack_bps, 19_607);
++        assert_eq!(second.bandwidth_bps, 9_950);
++        assert_eq!(frame.bandwidth_bps, 9_950);
++    }
++
++    #[test]
++    fn path_switch_invalidates_previous_anchor_but_keeps_inflight_snapshots() {
++        let t = Instant::now();
++        let mut sampler = DeliverySampler::new(t, 3);
++        let old = sampler.send(t, 1_000, false);
++        assert_eq!(sampler.ack(old, t, at(t, 10), 1_000, true), None);
++        assert!(sampler.has_current_path_anchor());
++
++        // A packet from the old path is still outstanding at migration.
++        let old_inflight = sampler.send(at(t, 11), 1_000, false);
++        sampler.reset_path_anchor();
++        assert!(!sampler.has_current_path_anchor());
++        assert_eq!(sampler.pool.occupied(), 1);
++        assert_eq!(
++            sampler.ack(old_inflight, at(t, 11), at(t, 12), 1_000, false),
++            None,
++        );
++        assert_eq!(sampler.pool.occupied(), 0);
++        assert!(!sampler.has_current_path_anchor());
++
++        // The first new-path ACK only reestablishes a fresh anchor.
++        let new_path_first = sampler.send(at(t, 13), 1_000, false);
++        assert_eq!(
++            sampler.ack(new_path_first, at(t, 13), at(t, 20), 1_000, true),
++            None,
++        );
++        assert!(sampler.has_current_path_anchor());
++        let new_path_second = sampler.send(at(t, 21), 1_000, false);
++        assert!(sampler
++            .ack(new_path_second, at(t, 21), at(t, 30), 1_000, true)
++            .is_some());
++    }
++
++    #[test]
++    fn initial_packets_before_first_ack_have_no_sample() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 2);
++        let a = s.send(t, 1_000, false);
++        let b = s.send(at(t, 50), 1_000, false);
++        assert_eq!(s.ack(a, t, at(t, 60), 1_000, true), None);
++        assert_eq!(s.ack(b, at(t, 50), at(t, 60), 1_000, true), None);
++        assert_eq!(s.acked_total, 2_000);
++    }
++
++    #[test]
++    fn same_ack_timestamp_skips_zero_duration_and_keeps_byte_accounting() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 3);
++        let anchor = s.send(t, 1_000, false);
++        s.ack(anchor, t, at(t, 10), 1_000, true);
++        let a = s.send(at(t, 11), 1_000, false);
++        s.ack(a, at(t, 11), at(t, 10), 1_000, true);
++        assert_eq!(s.end_acks(), None);
++        assert_eq!(s.acked_total, 2_000);
++    }
++
++    #[test]
++    fn app_limited_is_captured_at_send_not_ack_time() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 2);
++        let anchor = s.send(t, 1_000, false);
++        s.ack(anchor, t, at(t, 10), 1_000, true);
++        let limited = s.send(at(t, 11), 1_000, true);
++        let sample = s.ack(limited, at(t, 11), at(t, 12), 1_000, true).unwrap();
++        assert!(sample.sent_app_limited);
++    }
++
++    #[test]
++    fn bounded_pool_exhaustion_preserves_ack_bytes_and_recovers_after_release() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 1);
++        let tracked = s.send(t, 1_000, false);
++        let untracked = s.send(at(t, 1), 1_000, false);
++        assert!(untracked.is_none());
++        assert_eq!(s.pool.occupied(), 1);
++        assert_eq!(s.skipped_capacity, 1);
++        s.ack(untracked, at(t, 1), at(t, 2), 1_000, true);
++        assert_eq!(s.acked_total, 1_000);
++        assert_eq!(s.pool.occupied(), 1);
++        s.ack(tracked, t, at(t, 3), 1_000, true);
++        assert_eq!(s.acked_total, 2_000);
++        assert_eq!(s.pool.occupied(), 0);
++        assert!(s.send(at(t, 4), 1_000, false).is_some());
++    }
++
++    #[test]
++    fn exhausted_snapshot_cannot_forge_a_send_rate_anchor() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 1);
++        let anchor = s.send(t, 1_000, false);
++        let unavailable = s.send(at(t, 1), 1_000, false);
++        assert!(unavailable.is_none());
++        assert_eq!(s.ack(anchor, t, at(t, 2), 1_000, true), None);
++        assert!(s.has_last_ack);
++        assert_eq!(s.ack(unavailable, at(t, 1), at(t, 3), 1_000, true), None);
++        assert_eq!(s.acked_total, 2_000);
++        assert!(!s.has_last_ack);
++        let after_gap = s.send(at(t, 4), 1_000, false);
++        assert_eq!(s.ack(after_gap, at(t, 4), at(t, 8), 1_000, true), None);
++        // After the first complete post-gap ACK, the sampler can reanchor.
++        assert!(s.has_last_ack);
++        let next = s.send(at(t, 9), 1_000, false);
++        assert!(s.ack(next, at(t, 9), at(t, 19), 1_000, true).is_some());
++    }
++
++    #[test]
++    fn reordering_does_not_consume_an_unrelated_packet_slot() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 3);
++        let initial = s.send(t, 1_000, false);
++        let earlier = s.send(at(t, 1), 1_000, false);
++        let later = s.send(at(t, 2), 1_000, false);
++        s.ack(initial, t, at(t, 5), 1_000, true);
++        s.ack(later, at(t, 2), at(t, 10), 1_000, true);
++        assert_eq!(s.pool.occupied(), 1);
++        s.ack(earlier, at(t, 1), at(t, 12), 1_000, true);
++        assert_eq!(s.pool.occupied(), 0);
++        assert_eq!(s.acked_total, 3_000);
++        assert!(s.send(at(t, 13), 1_000, false).is_some());
++    }
++
++    #[test]
++    fn loss_discard_reuses_slot_without_resurrecting_stale_generation() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 1);
++        let old = s.send(t, 1_000, false);
++        assert!(s.discard(old));
++        assert_eq!(s.pool.occupied(), 0);
++        let new = s.send(at(t, 10), 1_000, false);
++        assert_ne!(new, old);
++        assert_eq!(s.ack(old, t, at(t, 11), 1_000, true), None);
++        assert_eq!(s.acked_total, 0);
++        assert!(!s.discard(old));
++        assert_eq!(s.pool.occupied(), 1);
++        s.ack(new, at(t, 10), at(t, 12), 1_000, true);
++        assert_eq!(s.pool.occupied(), 0);
++        assert_eq!(s.acked_total, 1_000);
++    }
++
++    #[test]
++    fn other_path_ack_releases_snapshot_without_affecting_current_path_samples() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 1);
++        let old_path = s.send(t, 1_000, false);
++        s.ack(old_path, t, at(t, 10), 1_000, false);
++        assert_eq!(s.pool.occupied(), 0);
++        assert_eq!(s.acked_total, 0);
++        assert_eq!(s.end_acks(), None);
++    }
++
++    #[test]
++    fn overflow_safe_rate_and_repeated_frame_boundaries() {
++        assert_eq!(DeliverySampler::rate(u64::MAX, 1), Some(u64::MAX));
++        assert_eq!(DeliverySampler::rate(100, 0), None);
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 1);
++        let h = s.send(t, u64::MAX, false);
++        s.ack(h, t, at(t, 10), u64::MAX, true);
++        assert_eq!(s.acked_total, u64::MAX);
++        assert_eq!(s.end_acks(), None);
++        assert_eq!(s.end_acks(), None);
++    }
++
++    #[test]
++    fn sustained_send_ack_loss_cycles_have_bounded_storage_and_reusable_slots() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 32);
++        let slot_capacity = s.pool.slots.capacity();
++        let freelist_capacity = s.pool.free.capacity();
++        let mut all_old = Vec::new();
++        for i in 0..10_000 {
++            let when = at(t, i as u64 + 1);
++            let handle = s.send(when, 1_200, false);
++            assert!(handle.is_some(), "a released slot must be reusable");
++            all_old.push(handle);
++            if i % 3 == 0 {
++                assert!(s.discard(handle));
++            } else {
++                s.ack(handle, when, at(t, i as u64 + 2), 1_200, true);
++                let _ = s.end_acks();
++            }
++            assert_eq!(s.pool.occupied(), 0);
++            assert!(s.pool.slots.len() <= 32);
++            assert_eq!(s.pool.slots.capacity(), slot_capacity);
++            assert_eq!(s.pool.free.capacity(), freelist_capacity);
++        }
++        assert_eq!(s.skipped_capacity, 0);
++        assert!(s.pool.occupied() == 0);
++        assert!(all_old.windows(2).all(|pair| pair[0] != pair[1]));
++        assert!(!s.discard(all_old[0]));
++    }
++
++    #[test]
++    fn generation_wrap_retires_slot_instead_of_revalidating_old_handle() {
++        let mut pool = SnapshotPool::new(1);
++        let stub = SendState {
++            sent_total: 1,
++            acked_total_at_send: 0,
++            last_acked_sent_total: 0,
++            last_acked_sent_ns: 0,
++            last_acked_ack_ns: 0,
++            last_acked_valid: false,
++            sent_app_limited: false,
++        };
++        pool.slots.push(Slot {
++            generation: u32::MAX,
++            snapshot: None,
++        });
++        pool.free.push(0);
++        let final_generation = pool.insert(stub).expect("last generation usable");
++        assert_eq!(pool.take(final_generation).unwrap().sent_total, 1);
++        assert_eq!(pool.slots[0].generation, 0);
++        assert!(pool.insert(stub).is_none());
++        assert_eq!(pool.take(final_generation).map(|s| s.sent_total), None);
++    }
++
++    #[test]
++    fn two_packet_number_spaces_can_have_independent_handle_lifetimes() {
++        let t = Instant::now();
++        let mut s = DeliverySampler::new(t, 2);
++        let initial = s.send(t, 1_000, false);
++        let data = s.send(at(t, 1), 1_000, false);
++        assert!(s.discard(initial)); // Initial keys discarded
++        assert_eq!(s.pool.occupied(), 1);
++        s.ack(data, at(t, 1), at(t, 2), 1_000, true);
++        assert_eq!(s.pool.occupied(), 0);
++        assert_eq!(s.acked_total, 1_000);
++    }
++}
