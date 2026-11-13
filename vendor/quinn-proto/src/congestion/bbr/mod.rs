@@ -323,7 +323,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if self.cwnd < target_window || self.acked_bytes < self.init_cwnd {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -648,3 +648,38 @@ const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
 
 const PROBE_RTT_BASED_ON_BDP: bool = true;
 const DRAIN_TO_TARGET: bool = true;
+
+#[cfg(test)]
+mod startup_cwnd_tests {
+    use super::*;
+
+    fn fresh_bbr() -> Bbr {
+        Bbr::new(Arc::new(BbrConfig::default()), BASE_DATAGRAM_SIZE as u16)
+    }
+
+    #[test]
+    fn startup_stops_growing_once_cwnd_exceeds_target_after_initial_acks() {
+        let mut bbr = fresh_bbr();
+        let target = bbr.get_target_cwnd(bbr.cwnd_gain);
+        bbr.cwnd = target * 2;
+        bbr.acked_bytes = bbr.init_cwnd;
+        bbr.calculate_cwnd(1_200, 0);
+        assert_eq!(bbr.cwnd, target * 2, "startup must not grow beyond its target");
+    }
+
+    #[test]
+    fn startup_grows_below_target_or_while_draining_initial_acks() {
+        let mut below_target = fresh_bbr();
+        let target = below_target.get_target_cwnd(below_target.cwnd_gain);
+        below_target.cwnd = target - 2_400;
+        below_target.acked_bytes = below_target.init_cwnd;
+        below_target.calculate_cwnd(1_200, 0);
+        assert_eq!(below_target.cwnd, target - 1_200);
+
+        let mut initial_acks = fresh_bbr();
+        initial_acks.cwnd = target * 2;
+        initial_acks.acked_bytes = initial_acks.init_cwnd - 1;
+        initial_acks.calculate_cwnd(1_200, 0);
+        assert_eq!(initial_acks.cwnd, target * 2 + 1_200);
+    }
+}
