@@ -619,6 +619,7 @@ impl Connection {
                         bytes_to_send,
                         self.path.current_mtu(),
                         self.path.congestion.window(),
+                        self.path.congestion.pacing_rate_override(),
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);
