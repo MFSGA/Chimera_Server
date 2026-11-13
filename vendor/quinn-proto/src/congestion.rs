@@ -65,6 +65,13 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Optional sender pacing rate in bytes per second, independent of the
+    /// congestion window. Defaults to the existing cwnd/RTT-based pacer for
+    /// congestion controllers that do not require a fixed target rate.
+    fn pacing_rate_override(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
