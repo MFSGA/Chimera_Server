@@ -84,7 +84,9 @@ impl Pacer {
                 None => 0,
             };
             self.tokens = self.tokens.saturating_add(earned).min(self.capacity);
-            self.prev = now;
+            // Ignore a stale caller timestamp instead of rewinding the clock
+            // and crediting the same elapsed interval a second time.
+            self.prev = self.prev.max(now);
         }
         if window != self.last_window
             || mtu != self.last_mtu
@@ -129,7 +131,8 @@ impl Pacer {
                 * (time_elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64())) as u64,
         };
         self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
-        self.prev = now;
+        // No future refill may re-count time before the last account point.
+        self.prev = self.prev.max(now);
 
         if self.tokens >= bytes_to_send {
             return None;
@@ -376,6 +379,56 @@ mod tests {
             None
         );
         assert_eq!(pacer.tokens, pacer.capacity);
+    }
+
+    #[test]
+    fn backwards_timestamp_during_rate_change_does_not_mint_tokens() {
+        let rtt = Duration::from_millis(50);
+        let window = 100_000;
+        let mtu = 1_000;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, 2_000, mtu, window, Some(1_000_000), start);
+        pacer.tokens = 0;
+
+        // A stale caller time must not rewind the accounting anchor.
+        pacer.delay(
+            rtt,
+            2_000,
+            mtu,
+            window,
+            Some(2_000_000),
+            start - Duration::from_millis(1),
+        );
+        assert_eq!(pacer.prev, start);
+        assert_eq!(pacer.tokens, 0);
+
+        // Returning to the original time is not an elapsed 1ms.
+        pacer.delay(rtt, 2_000, mtu, window, Some(2_000_000), start);
+        assert_eq!(pacer.tokens, 0, "no time elapsed since the anchor");
+    }
+
+    #[test]
+    fn backwards_timestamp_with_fixed_rate_does_not_mint_tokens() {
+        let rtt = Duration::from_millis(50);
+        let window = 100_000;
+        let mtu = 1_000;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, 2_000, mtu, window, Some(2_000_000), start);
+        pacer.tokens = 0;
+
+        pacer.delay(
+            rtt,
+            2_000,
+            mtu,
+            window,
+            Some(2_000_000),
+            start - Duration::from_millis(1),
+        );
+        assert_eq!(pacer.prev, start);
+        pacer.delay(rtt, 2_000, mtu, window, Some(2_000_000), start);
+        assert_eq!(pacer.tokens, 0);
     }
 
     #[test]
