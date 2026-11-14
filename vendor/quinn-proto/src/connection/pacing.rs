@@ -48,6 +48,12 @@ impl Pacer {
     /// when ACKs or other events invoke the pacer more often than once per
     /// whole-byte refill. Saturating arithmetic handles extreme intervals.
     fn credit_fixed_rate(&mut self, rate: u64, elapsed: Duration) {
+        // When the bucket is already full, idle time cannot accumulate
+        // additional credit. Avoid doing u128 arithmetic on this hot path.
+        if self.tokens == self.capacity {
+            self.fractional_tokens = 0;
+            return;
+        }
         const NANOBYTES_PER_BYTE: u128 = 1_000_000_000;
         let nanobytes = u128::from(rate)
             .saturating_mul(elapsed.as_nanos())
@@ -131,6 +137,18 @@ impl Pacer {
         }
 
         if self.tokens >= bytes_to_send {
+            if let Some(rate) = pacing_rate_override {
+                // Even when the next datagram fits the bucket, settle the
+                // previous interval before permitting a send. Otherwise an
+                // idle, initially full bucket can send a whole burst and
+                // then refill a *second* burst from the same idle interval.
+                let elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
+                    warn!("received a timestamp early than a previous recorded time, ignoring");
+                    Default::default()
+                });
+                self.credit_fixed_rate(rate, elapsed);
+                self.prev = self.prev.max(now);
+            }
             return None;
         }
 
@@ -457,6 +475,66 @@ mod tests {
         assert_eq!(pacer.prev, start);
         pacer.delay(rtt, 2_000, mtu, window, Some(2_000_000), start);
         assert_eq!(pacer.tokens, 0);
+    }
+
+    #[test]
+    fn fixed_rate_idle_does_not_allow_a_second_full_bucket() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let rate = 65_536;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        let after_idle = start + Duration::from_secs(1);
+        assert_eq!(pacer.capacity, 10 * u64::from(mtu));
+
+        // Long idle does not permit a carry-over burst *after* the
+        // initially full bucket has already been spent.
+        for _ in 0..10 {
+            assert!(
+                pacer
+                    .delay(rtt, u64::from(mtu), mtu, window, Some(rate), after_idle)
+                    .is_none(),
+            );
+            pacer.on_transmit(mtu);
+        }
+        assert_eq!(pacer.tokens, 0);
+        assert_eq!(pacer.prev, after_idle);
+        let next = pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(rate), after_idle)
+            .expect("idle time must not refill a second full bucket");
+        let refill_ns = (u128::from(mtu) * 1_000_000_000)
+            .div_ceil(u128::from(rate)) as u64;
+        assert_eq!(next, after_idle + Duration::from_nanos(refill_ns));
+    }
+
+    #[test]
+    fn fixed_rate_alternating_ack_updates_integrate_old_rate() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(50_000), start);
+        pacer.tokens = 0;
+
+        // Twenty 10us intervals, each using the previous policy:
+        // 10 * (50k + 70k) * 10us = 12 whole bytes.
+        for step in 1..=20 {
+            let rate = if step % 2 == 1 { 70_000 } else { 50_000 };
+            pacer.delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                Some(rate),
+                start + Duration::from_micros(step * 10),
+            );
+            assert!(pacer.tokens <= pacer.capacity);
+        }
+        assert_eq!(pacer.tokens, 12);
+        assert_eq!(pacer.fractional_tokens, 0);
     }
 
     #[test]
