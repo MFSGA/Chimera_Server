@@ -4023,7 +4023,7 @@ async fn xray_client_global_xudp_end_to_end_perf_probe() {
         xray_version.0, xray_version.1, xray_version.2
     );
 
-    for run in 0..runs {
+    for (run, echo_run_counters) in echo_counters.by_run.iter().enumerate() {
         let server_before = linux_process_snapshot(chimera.pid())
             .expect("read Chimera process metrics before run");
         let xray_before = linux_process_snapshot(xray.pid())
@@ -4071,12 +4071,9 @@ async fn xray_client_global_xudp_end_to_end_perf_probe() {
             .expect("read Chimera process metrics after run");
         let xray_after = linux_process_snapshot(xray.pid())
             .expect("read Xray process metrics after run");
-        let echo_received = echo_counters.by_run[run]
-            .datagrams_received
-            .load(Ordering::Relaxed);
-        let echo_echoed = echo_counters.by_run[run]
-            .datagrams_echoed
-            .load(Ordering::Relaxed);
+        let echo_received =
+            echo_run_counters.datagrams_received.load(Ordering::Relaxed);
+        let echo_echoed = echo_run_counters.datagrams_echoed.load(Ordering::Relaxed);
         chimera.assert_running();
         xray.assert_running();
 
