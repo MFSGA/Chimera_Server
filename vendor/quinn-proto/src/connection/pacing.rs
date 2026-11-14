@@ -18,6 +18,9 @@ pub(super) struct Pacer {
     last_mtu: u16,
     last_rate_override: Option<u64>,
     tokens: u64,
+    /// Fractional bytes in billionths, retained across short pacing checks.
+    /// Applies only to the fixed-rate controller; legacy Quinn is unchanged.
+    fractional_tokens: u32,
     prev: Instant,
 }
 
@@ -31,6 +34,7 @@ impl Pacer {
             last_mtu: mtu,
             last_rate_override: None,
             tokens: capacity,
+            fractional_tokens: 0,
             prev: now,
         }
     }
@@ -38,6 +42,25 @@ impl Pacer {
     /// Record that a packet has been transmitted.
     pub(super) fn on_transmit(&mut self, packet_length: u16) {
         self.tokens = self.tokens.saturating_sub(packet_length.into())
+    }
+
+    /// Credit a fixed byte-per-second rate without losing sub-byte accrual
+    /// when ACKs or other events invoke the pacer more often than once per
+    /// whole-byte refill. Saturating arithmetic handles extreme intervals.
+    fn credit_fixed_rate(&mut self, rate: u64, elapsed: Duration) {
+        const NANOBYTES_PER_BYTE: u128 = 1_000_000_000;
+        let nanobytes = u128::from(rate)
+            .saturating_mul(elapsed.as_nanos())
+            .saturating_add(u128::from(self.fractional_tokens));
+        let earned = (nanobytes / NANOBYTES_PER_BYTE).min(u128::from(u64::MAX)) as u64;
+        self.tokens = self.tokens.saturating_add(earned).min(self.capacity);
+        // Once the bucket fills, any surplus (including fractional bytes)
+        // is discarded; otherwise a later send could spend past capacity.
+        self.fractional_tokens = if self.tokens == self.capacity {
+            0
+        } else {
+            (nanobytes % NANOBYTES_PER_BYTE) as u32
+        };
     }
 
     /// Return how long we need to wait before sending `bytes_to_send`
@@ -72,18 +95,16 @@ impl Pacer {
                 warn!("received a timestamp early than a previous recorded time, ignoring");
                 Default::default()
             });
-            let earned = match self.last_rate_override {
-                Some(previous_rate) => {
-                    ((previous_rate as u128 * elapsed.as_nanos()) / 1_000_000_000)
-                        .min(u64::MAX as u128) as u64
-                }
+            match self.last_rate_override {
+                Some(previous_rate) => self.credit_fixed_rate(previous_rate, elapsed),
                 None if self.last_window <= u64::from(u32::MAX) && !smoothed_rtt.is_zero() => {
-                    (self.last_window as f64 * 1.25
-                        * (elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64())) as u64
+                    let earned = (self.last_window as f64
+                        * 1.25
+                        * (elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64())) as u64;
+                    self.tokens = self.tokens.saturating_add(earned).min(self.capacity);
                 }
-                None => 0,
-            };
-            self.tokens = self.tokens.saturating_add(earned).min(self.capacity);
+                None => {}
+            }
             // Ignore a stale caller timestamp instead of rewinding the clock
             // and crediting the same elapsed interval a second time.
             self.prev = self.prev.max(now);
@@ -99,6 +120,11 @@ impl Pacer {
 
             // Clamp the tokens when congestion state, MTU or pacing policy changes.
             self.tokens = self.capacity.min(self.tokens);
+            if pacing_rate_override.is_none() || self.tokens == self.capacity {
+                // Fractional credit from a fixed-rate policy must not carry
+                // across a legacy-controller boundary or full capacity.
+                self.fractional_tokens = 0;
+            }
             self.last_window = window;
             self.last_mtu = mtu;
             self.last_rate_override = pacing_rate_override;
@@ -124,13 +150,15 @@ impl Pacer {
             return None;
         }
 
-        let new_tokens = match pacing_rate_override {
-            Some(rate) => ((rate as u128 * time_elapsed.as_nanos()) / 1_000_000_000)
-                .min(u64::MAX as u128) as u64,
-            None => (window as f64 * 1.25
-                * (time_elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64())) as u64,
-        };
-        self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
+        match pacing_rate_override {
+            Some(rate) => self.credit_fixed_rate(rate, time_elapsed),
+            None => {
+                let new_tokens = (window as f64
+                    * 1.25
+                    * (time_elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64())) as u64;
+                self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
+            }
+        }
         // No future refill may re-count time before the last account point.
         self.prev = self.prev.max(now);
 
@@ -429,6 +457,122 @@ mod tests {
         assert_eq!(pacer.prev, start);
         pacer.delay(rtt, 2_000, mtu, window, Some(2_000_000), start);
         assert_eq!(pacer.tokens, 0);
+    }
+
+    #[test]
+    fn fixed_rate_subbyte_credit_survives_frequent_pacing_checks() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let rate = 65_536; // bytes/s: 0.65536 bytes per 10us
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        pacer.tokens = 0;
+
+        for step in 1..=10 {
+            pacer.delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                Some(rate),
+                start + Duration::from_micros(10 * step),
+            );
+        }
+        // Total elapsed = 100us -> 6.5536 bytes, not zero.
+        assert_eq!(pacer.tokens, 6);
+    }
+
+    #[test]
+    fn fixed_rate_switch_keeps_accrued_subbyte_credit() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(50_000), start);
+        pacer.tokens = 0;
+
+        pacer.delay(
+            rtt,
+            u64::from(mtu),
+            mtu,
+            window,
+            Some(70_000),
+            start + Duration::from_micros(10),
+        ); // old rate earns 0.5 bytes
+        assert_eq!(pacer.tokens, 0);
+        pacer.delay(
+            rtt,
+            u64::from(mtu),
+            mtu,
+            window,
+            Some(70_000),
+            start + Duration::from_micros(20),
+        ); // new rate earns 0.7 bytes
+        assert_eq!(pacer.tokens, 1);
+    }
+
+    #[test]
+    fn fixed_rate_fraction_is_discarded_when_bucket_is_full() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let rate = 65_536;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        pacer.tokens = pacer.capacity - 1;
+
+        // After 20us we hit capacity; no unused fractional budget may
+        // accumulate behind a full bucket and turn into a future burst.
+        pacer.delay(
+            rtt,
+            pacer.capacity + 1,
+            mtu,
+            window,
+            Some(rate),
+            start + Duration::from_micros(20),
+        );
+        assert_eq!(pacer.tokens, pacer.capacity);
+        pacer.on_transmit(mtu);
+        let remaining = pacer.tokens;
+        // New 15us interval earns less than one whole byte, and surplus
+        // fractional credit at full capacity must have been discarded.
+        pacer.delay(
+            rtt,
+            pacer.capacity + 1,
+            mtu,
+            window,
+            Some(rate),
+            start + Duration::from_micros(35),
+        );
+        assert_eq!(pacer.tokens, remaining);
+    }
+
+    #[test]
+    fn fixed_rate_fraction_does_not_leak_into_legacy_pacing() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(50_000), start);
+        pacer.tokens = 0;
+        pacer.delay(
+            rtt, u64::from(mtu), mtu, window, None,
+            start + Duration::from_micros(10),
+        );
+        pacer.delay(
+            rtt, u64::from(mtu), mtu, window, Some(50_000),
+            start + Duration::from_micros(10),
+        );
+        pacer.delay(
+            rtt, u64::from(mtu), mtu, window, Some(50_000),
+            start + Duration::from_micros(20),
+        );
+        assert_eq!(pacer.tokens, 0, "legacy transition must drop subbyte residue");
     }
 
     #[test]
