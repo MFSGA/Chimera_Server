@@ -431,11 +431,13 @@ fn ensure_api_tunnels_are_control_only(
 
 fn api_inbound_uses_tls(_protocol: &ServerProxyConfig) -> bool {
     #[cfg(feature = "tls")]
-    if matches!(_protocol, ServerProxyConfig::Tls(_)) {
-        return true;
+    {
+        matches!(_protocol, ServerProxyConfig::Tls(_))
     }
-
-    false
+    #[cfg(not(feature = "tls"))]
+    {
+        false
+    }
 }
 
 struct ValidatedServerPlan {
