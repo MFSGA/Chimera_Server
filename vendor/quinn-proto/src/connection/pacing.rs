@@ -200,9 +200,14 @@ impl Pacer {
                 wake_budget
             };
             let needed = wake_budget - self.tokens;
-            let nanos = (needed as u128 * 1_000_000_000)
-                .div_ceil(rate as u128)
-                .min(u64::MAX as u128) as u64;
+            // The fractional bytes were already earned and carried forward
+            // by credit_fixed_rate. Subtract them from the next wake's debt;
+            // otherwise frequent ACK callbacks postpone the wake repeatedly.
+            let remaining_nanobytes = u128::from(needed) * 1_000_000_000
+                - u128::from(self.fractional_tokens);
+            let nanos = remaining_nanobytes
+                .div_ceil(u128::from(rate))
+                .min(u128::from(u64::MAX)) as u64;
             return Some(self.prev + Duration::from_nanos(nanos.max(1)));
         }
 
@@ -475,6 +480,57 @@ mod tests {
         assert_eq!(pacer.prev, start);
         pacer.delay(rtt, 2_000, mtu, window, Some(2_000_000), start);
         assert_eq!(pacer.tokens, 0);
+    }
+
+    #[test]
+    fn fixed_rate_subbyte_credit_advances_next_wake() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let rate = 65_536;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        pacer.tokens = 0;
+
+        // Ten microseconds earns 0.65536 byte. The next wake must account
+        // for it instead of waiting for another full 1,200 bytes.
+        let wake = pacer
+            .delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                Some(rate),
+                start + Duration::from_micros(10),
+            )
+            .expect("insufficient token balance");
+        assert_eq!(pacer.fractional_tokens, 655_360_000);
+        let full_packet_ns =
+            (u128::from(mtu) * 1_000_000_000).div_ceil(u128::from(rate)) as u64;
+        assert_eq!(wake, start + Duration::from_nanos(full_packet_ns));
+    }
+
+    #[test]
+    fn fixed_rate_rate_change_reuses_fraction_in_next_wake() {
+        let mtu = 1_200;
+        let rtt = Duration::from_millis(50);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(50_000), start);
+        pacer.tokens = 0;
+
+        // 10us at the OLD rate earns 0.5 byte. The NEW 70k B/s
+        // rate must schedule using that existing credit, not discard it.
+        let switched = start + Duration::from_micros(10);
+        let wake = pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(70_000), switched)
+            .expect("insufficient token balance");
+        assert_eq!(pacer.fractional_tokens, 500_000_000);
+        let remaining_ns = (u128::from(mtu) * 1_000_000_000 - 500_000_000)
+            .div_ceil(70_000) as u64;
+        assert_eq!(wake, switched + Duration::from_nanos(remaining_ns));
     }
 
     #[test]
