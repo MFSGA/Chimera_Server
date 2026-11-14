@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -40,6 +40,53 @@ fn auth_request(auth: &str, uri: &str) -> Request<()> {
         .header(AUTH_HEADER, auth)
         .body(())
         .expect("valid Hysteria2 auth request")
+}
+
+#[tokio::test(start_paused = true)]
+async fn quic_diag_log_slots_are_fifo_and_rate_limited() {
+    let limiter = Arc::new(tokio::sync::Mutex::new(None));
+    wait_for_quic_diag_log_slot_with(&limiter).await;
+    let started = tokio::time::Instant::now();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = Vec::new();
+
+    for connection_number in 0_u64..3 {
+        let limiter = Arc::clone(&limiter);
+        let sender = sender.clone();
+        tasks.push(tokio::spawn(async move {
+            wait_for_quic_diag_log_slot_with(&limiter).await;
+            sender
+                .send((connection_number, tokio::time::Instant::now()))
+                .expect("diagnostic test receiver stays open");
+        }));
+        tokio::task::yield_now().await;
+    }
+    drop(sender);
+
+    tokio::time::advance(Duration::from_millis(249)).await;
+    assert!(receiver.try_recv().is_err());
+
+    for expected_connection in 0_u64..3 {
+        let advance = if expected_connection == 0 {
+            Duration::from_millis(1)
+        } else {
+            QUIC_DIAG_MIN_LOG_INTERVAL
+        };
+        tokio::time::advance(advance).await;
+        let (connection_number, emitted_at) = receiver
+            .recv()
+            .await
+            .expect("queued diagnostic request gets a log slot");
+        assert_eq!(connection_number, expected_connection);
+        assert_eq!(
+            emitted_at.duration_since(started),
+            Duration::from_millis(250 * (expected_connection + 1)),
+        );
+    }
+
+    for task in tasks {
+        task.await.expect("diagnostic limiter task completes");
+    }
 }
 
 struct DropFlag(Arc<AtomicBool>);

@@ -23,6 +23,18 @@ cargo build --release --manifest-path bench/chimera_perf/Cargo.toml
 
 The ignored `user_domain::tests::policy_check_contention_probe` unit probe measures policy-decision throughput across thread counts. It is separate from this streaming TCP harness; see [the recorded results and limitations](USER_DOMAIN_POLICY_CONTENTION.md).
 
+## Hysteria2 QUIC runtime diagnostics
+
+Set `CHIMERA_HY2_QUIC_DIAG=1` in the Chimera Server process environment to enable per-connection QUIC throughput diagnostics during authenticated forwarding. The setting is opt-in; any other value leaves diagnostics disabled. For example:
+
+```bash
+CHIMERA_HY2_QUIC_DIAG=1 cargo run -p chimera_server_app -- --config /path/to/server-config.json
+```
+
+Each connection requests a sample every 5 seconds. A process-wide fair FIFO limiter spaces emitted records by at least 250 ms, for a maximum of four diagnostic records per second across all connections. When several connections request a sample together, their records wait in queue; rates cover the full elapsed interval through emission, and delayed records do not block forwarding. This keeps diagnostic log volume bounded during concurrent runs without changing congestion control or pacing behavior. The warning-level records include an opaque process-local diagnostic ID and transport counters, not authentication credentials or peer addresses.
+
+Use these logs to locate transport-level stalls and pacing changes. They are diagnostic observations, not a substitute for payload-integrity checks or repeatable throughput measurements.
+
 ## Raw TCP baseline
 
 Terminal 1:

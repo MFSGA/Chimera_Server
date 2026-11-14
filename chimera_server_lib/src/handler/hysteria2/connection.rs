@@ -6,11 +6,11 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc, RwLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -60,6 +60,12 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 // short window to complete the HTTP/3 authentication exchange.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const CLOSE_ERR_CODE_OK: u32 = 0x100;
+const QUIC_DIAG_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+const QUIC_DIAG_MIN_LOG_INTERVAL: Duration = Duration::from_millis(250);
+static LAST_QUIC_DIAG_LOG: OnceLock<
+    tokio::sync::Mutex<Option<tokio::time::Instant>>,
+> = OnceLock::new();
+static NEXT_QUIC_DIAG_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct AuthContext {
@@ -274,37 +280,121 @@ pub async fn process_hysteria2_connection(
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs);
     let peer_addr = connection.remote_address();
-
-    if auth_ctx.udp_enabled {
-        tokio::try_join!(
+    let diagnostics_connection = connection.clone();
+    let forwarding = async {
+        if auth_ctx.udp_enabled {
+            tokio::try_join!(
+                drive_tcp_streams(
+                    &mut h3_conn,
+                    resolver.clone(),
+                    &auth_ctx,
+                    inbound_tag.clone(),
+                    peer_addr,
+                    runtime.clone(),
+                ),
+                drive_udp_datagrams(
+                    connection,
+                    resolver,
+                    &auth_ctx,
+                    inbound_tag,
+                    runtime,
+                    udp_idle_timeout,
+                ),
+            )
+            .map(|_| ())
+        } else {
             drive_tcp_streams(
                 &mut h3_conn,
-                resolver.clone(),
-                &auth_ctx,
-                inbound_tag.clone(),
-                peer_addr,
-                runtime.clone(),
-            ),
-            drive_udp_datagrams(
-                connection,
                 resolver,
                 &auth_ctx,
                 inbound_tag,
+                peer_addr,
                 runtime,
-                udp_idle_timeout,
-            ),
-        )
-        .map(|_| ())
-    } else {
-        drive_tcp_streams(
-            &mut h3_conn,
-            resolver,
-            &auth_ctx,
-            inbound_tag,
-            peer_addr,
-            runtime,
-        )
-        .await
+            )
+            .await
+        }
+    };
+    run_with_optional_quic_stats(diagnostics_connection, forwarding).await
+}
+
+async fn wait_for_quic_diag_log_slot_with(
+    limiter: &tokio::sync::Mutex<Option<tokio::time::Instant>>,
+) {
+    // Tokio's mutex grants waiters in FIFO order, so aligned connection timers
+    // cannot repeatedly let the same task win the process-wide log budget.
+    let mut last_log_at = limiter.lock().await;
+    if let Some(last_log_at) = *last_log_at {
+        tokio::time::sleep_until(last_log_at + QUIC_DIAG_MIN_LOG_INTERVAL).await;
+    }
+    *last_log_at = Some(tokio::time::Instant::now());
+}
+
+async fn wait_for_quic_diag_log_slot() {
+    wait_for_quic_diag_log_slot_with(
+        LAST_QUIC_DIAG_LOG.get_or_init(|| tokio::sync::Mutex::new(None)),
+    )
+    .await;
+}
+
+/// Opt-in, scoped QUIC diagnostics for throughput investigation.
+/// The sampler is polled in the forwarding task; it cannot outlive cancellation.
+async fn run_with_optional_quic_stats<F>(
+    connection: quinn::Connection,
+    work: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    if std::env::var("CHIMERA_HY2_QUIC_DIAG").ok().as_deref() != Some("1") {
+        return work.await;
+    }
+
+    let mut ticker = tokio::time::interval(QUIC_DIAG_SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // Consume the immediate first tick.
+    let started = Instant::now();
+    let mut previous_at = started;
+    let mut previous = connection.stats();
+    let diagnostic_id = NEXT_QUIC_DIAG_ID.fetch_add(1, Ordering::Relaxed);
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            _ = ticker.tick() => {
+                tokio::select! {
+                    result = &mut work => return result,
+                    _ = wait_for_quic_diag_log_slot() => {}
+                }
+
+                let now = Instant::now();
+                let current = connection.stats();
+                let seconds = now.duration_since(previous_at).as_secs_f64().max(f64::EPSILON);
+                let tx_bytes = current.udp_tx.bytes.saturating_sub(previous.udp_tx.bytes);
+                let rx_bytes = current.udp_rx.bytes.saturating_sub(previous.udp_rx.bytes);
+                let lost_bytes = current.path.lost_bytes.saturating_sub(previous.path.lost_bytes);
+                let cc = connection.congestion_state().metrics();
+                warn!(
+                    hy2_quic_diag = true,
+                    diagnostic_id,
+                    elapsed_s = started.elapsed().as_secs(),
+                    tx_mbps = tx_bytes as f64 * 8.0 / seconds / 1_000_000.0,
+                    rx_mbps = rx_bytes as f64 * 8.0 / seconds / 1_000_000.0,
+                    cwnd_bytes = current.path.cwnd,
+                    pacing_bps = cc.pacing_rate.unwrap_or(0),
+                    rtt_us = current.path.rtt.as_micros(),
+                    loss_bytes = lost_bytes,
+                    loss_packets = current.path.lost_packets.saturating_sub(previous.path.lost_packets),
+                    stream_data_blocked = current.frame_tx.stream_data_blocked.saturating_sub(previous.frame_tx.stream_data_blocked),
+                    data_blocked = current.frame_tx.data_blocked.saturating_sub(previous.frame_tx.data_blocked),
+                    tx_packets = current.path.sent_packets.saturating_sub(previous.path.sent_packets),
+                    tx_ios = current.udp_tx.ios.saturating_sub(previous.udp_tx.ios),
+                    mtu = current.path.current_mtu,
+                    "hysteria2 QUIC throughput diagnostic"
+                );
+                previous = current;
+                previous_at = now;
+            }
+        }
     }
 }
 
