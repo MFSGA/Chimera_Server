@@ -190,14 +190,14 @@ impl Pacer {
             // discards the tokens earned during that oversleep, lowering the
             // effective rate. Keep 25% of capacity as jitter headroom while
             // retaining the same bounded burst size and refill rate.
-            let wake_budget = bytes_to_send.max(self.capacity - self.capacity / 4);
-            let wake_budget = if self.capacity == MIN_BURST_SIZE * u64::from(mtu) {
-                let rate_budget = ((rate as u128 * FIXED_RATE_BURST_INTERVAL_NANOS * 3 / 4)
-                    / 1_000_000_000)
-                    .min(u64::MAX as u128) as u64;
-                wake_budget.min(bytes_to_send.max(rate_budget))
+            let minimum_capacity = MIN_BURST_SIZE * u64::from(mtu);
+            let (wake_budget, min_delay_nanos) = if self.capacity == minimum_capacity {
+                // Xray's fixed-rate pacer wakes for the next datagram, with a
+                // 1ms minimum delay. Keep the same low-rate behavior instead
+                // of batching most of the minimum 10-packet bucket.
+                (bytes_to_send, FIXED_RATE_MIN_PACING_DELAY_NANOS)
             } else {
-                wake_budget
+                (bytes_to_send.max(self.capacity - self.capacity / 4), 1)
             };
             let needed = wake_budget - self.tokens;
             // The fractional bytes were already earned and carried forward
@@ -208,7 +208,7 @@ impl Pacer {
             let nanos = remaining_nanobytes
                 .div_ceil(u128::from(rate))
                 .min(u128::from(u64::MAX)) as u64;
-            return Some(self.prev + Duration::from_nanos(nanos.max(1)));
+            return Some(self.prev + Duration::from_nanos(nanos.max(min_delay_nanos)));
         }
 
         let window = window as u32;
@@ -267,6 +267,10 @@ const BURST_INTERVAL_NANOS: u128 = 2_000_000; // 2ms
 /// Fixed-rate senders retain up to 4ms of earned send budget to absorb timer
 /// wake-up jitter without increasing the long-run token refill rate.
 const FIXED_RATE_BURST_INTERVAL_NANOS: u128 = 4_000_000;
+
+/// Xray's quic-go Brutal pacer does not schedule packet sends more frequently
+/// than once per millisecond.
+const FIXED_RATE_MIN_PACING_DELAY_NANOS: u64 = 1_000_000;
 
 /// Allows some usage of GSO, and doesn't slow down the handshake.
 const MIN_BURST_SIZE: u64 = 10;
@@ -752,36 +756,37 @@ mod tests {
     }
 
     #[test]
-    fn fixed_rate_minimum_does_not_sleep_for_most_of_a_burst() {
-        // Xray Brutal's TimeUntilSend waits for the next datagram budget,
-        // not an almost-full 10-datagram minimum burst. At 64KiB/s, the
-        // next 1200B packet needs about 18.3ms, not ~137ms.
-        let start = Instant::now();
+    fn fixed_rate_minimum_capacity_wake_matches_xray_packet_delay() {
         let mtu = 1200;
-        let rate = 65_536;
         let rtt = Duration::from_micros(100);
         let window = 3 * mtu as u64;
-        let mut pacer = Pacer::new(rtt, window, mtu, start);
-        assert!(pacer
-            .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
-            .is_none());
-        while pacer.tokens >= mtu as u64 {
-            pacer.on_transmit(mtu);
+        for rate in [65_536, 2_000_000] {
+            let start = Instant::now();
+            let mut pacer = Pacer::new(rtt, window, mtu, start);
+            assert!(pacer
+                .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
+                .is_none());
+            while pacer.tokens >= mtu as u64 {
+                pacer.on_transmit(mtu);
+            }
+            assert_eq!(pacer.tokens, 0);
+            let resume = pacer
+                .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
+                .expect("out of tokens");
+            let packet_interval_ns = ((u128::from(mtu) * 1_000_000_000)
+                .div_ceil(u128::from(rate)))
+                as u64;
+            let expected_ns =
+                packet_interval_ns.max(FIXED_RATE_MIN_PACING_DELAY_NANOS);
+            assert_eq!(
+                resume.duration_since(start),
+                Duration::from_nanos(expected_ns),
+                "at {rate} B/s, wake at Xray's next-packet deadline and 1ms minimum",
+            );
+            assert!(pacer
+                .delay(rtt, mtu as u64, mtu, window, Some(rate), resume)
+                .is_none());
         }
-        assert_eq!(pacer.tokens, 0);
-        let resume = pacer
-            .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
-            .expect("out of tokens");
-        let exact_packet_interval_ns =
-            ((u128::from(mtu) * 1_000_000_000).div_ceil(u128::from(rate))) as u64;
-        assert_eq!(
-            resume.duration_since(start),
-            Duration::from_nanos(exact_packet_interval_ns),
-            "low-rate pacing should wake as soon as the next packet is budgeted",
-        );
-        assert!(pacer
-            .delay(rtt, mtu as u64, mtu, window, Some(rate), resume)
-            .is_none());
     }
 
     #[test]
