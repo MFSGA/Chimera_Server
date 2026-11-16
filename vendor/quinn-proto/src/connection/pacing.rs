@@ -155,17 +155,29 @@ impl Pacer {
             self.last_rate_override = pacing_rate_override;
         }
 
+        // Xray's minimum-capacity pacer recomputes its budget from the last
+        // send using the current bandwidth estimate. ACK-rate compensation
+        // can therefore change the calculated budget for the whole interval
+        // since that send. Keep the fixed-rate minimum bucket on the same
+        // accounting model; incremental old-rate credit here can schedule a
+        // second wake after Xray's packet deadline.
+        let minimum_capacity_budget_from_last_sent = pacing_rate_override
+            .filter(|_| self.capacity == MIN_BURST_SIZE * u64::from(mtu))
+            .is_some_and(|rate| self.refresh_minimum_capacity_budget(rate, mtu, now));
+
         if self.tokens >= bytes_to_send {
             if let Some(rate) = pacing_rate_override {
                 // Even when the next datagram fits the bucket, settle the
                 // previous interval before permitting a send. Otherwise an
                 // idle, initially full bucket can send a whole burst and
                 // then refill a *second* burst from the same idle interval.
-                let elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
-                    warn!("received a timestamp early than a previous recorded time, ignoring");
-                    Default::default()
-                });
-                self.credit_fixed_rate(rate, elapsed);
+                if !minimum_capacity_budget_from_last_sent {
+                    let elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
+                        warn!("received a timestamp early than a previous recorded time, ignoring");
+                        Default::default()
+                    });
+                    self.credit_fixed_rate(rate, elapsed);
+                }
                 self.prev = self.prev.max(now);
                 if self.capacity == MIN_BURST_SIZE * u64::from(mtu) {
                     if let Some(deadline) = self.minimum_capacity_deadline(rate, mtu) {
@@ -195,7 +207,10 @@ impl Pacer {
         }
 
         match pacing_rate_override {
-            Some(rate) => self.credit_fixed_rate(rate, time_elapsed),
+            Some(rate) if !minimum_capacity_budget_from_last_sent => {
+                self.credit_fixed_rate(rate, time_elapsed)
+            }
+            Some(_) => {}
             None => {
                 let new_tokens = (window as f64
                     * 1.25
@@ -258,6 +273,28 @@ impl Pacer {
         // Keep legacy Quinn pacing unchanged for congestion controllers that
         // do not request an explicit rate.
         Some(self.prev + (unscaled_delay / 5) * 4)
+    }
+
+    /// Recompute the minimum fixed-rate bucket from the last packet send, as
+    /// Xray does when ACK-rate compensation changes the current bandwidth.
+    /// Returns false until a fixed-rate packet has established a send anchor.
+    fn refresh_minimum_capacity_budget(&mut self, rate: u64, mtu: u16, now: Instant) -> bool {
+        let Some(last_sent) = self.last_sent else {
+            return false;
+        };
+        let elapsed = now.checked_duration_since(last_sent).unwrap_or_else(|| {
+            warn!("received a timestamp early than a previous recorded time, ignoring");
+            Default::default()
+        });
+        let earned = (u128::from(rate).saturating_mul(elapsed.as_nanos()) / 1_000_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        self.tokens = self
+            .tokens_at_last_sent
+            .saturating_add(earned)
+            .min(MIN_BURST_SIZE * u64::from(mtu));
+        // Xray recalculates the whole interval with integer byte arithmetic.
+        self.fractional_tokens = 0;
+        true
     }
 
     /// Return Xray's minimum-capacity deadline, anchored to the last send.
@@ -859,6 +896,66 @@ mod tests {
                 "at {rate} B/s, the next deadline must again be anchored to the send",
             );
         }
+    }
+
+    #[test]
+    fn minimum_capacity_ack_rate_increase_uses_xray_current_rate_deadline() {
+        let mtu = 1200;
+        let rtt = Duration::from_micros(100);
+        let window = 3 * u64::from(mtu);
+        let old_rate = 125_000;
+        let new_rate = 156_250;
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+
+        assert!(pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(old_rate), start)
+            .is_none());
+        for _ in 0..MIN_BURST_SIZE {
+            pacer.on_transmit(mtu, start);
+        }
+        assert_eq!(pacer.tokens, 0);
+
+        let rate_change = start + Duration::from_millis(5);
+        let expected_deadline = start + Duration::from_micros(7_680);
+        let first_wake = pacer
+            .delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                Some(new_rate),
+                rate_change,
+            )
+            .expect("rate change must preserve Xray's packet deadline");
+        assert_eq!(first_wake, expected_deadline);
+        assert_eq!(pacer.tokens, 781);
+
+        let ack_callback = start + Duration::from_micros(6_000);
+        assert_eq!(
+            pacer.delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                Some(new_rate),
+                ack_callback,
+            ),
+            Some(expected_deadline),
+            "ACK callbacks must not postpone the deadline or retain old-rate credit",
+        );
+
+        assert!(pacer
+            .delay(
+                rtt,
+                u64::from(mtu),
+                mtu,
+                window,
+                Some(new_rate),
+                expected_deadline,
+            )
+            .is_none());
+        assert_eq!(pacer.tokens, u64::from(mtu));
     }
 
     #[test]
