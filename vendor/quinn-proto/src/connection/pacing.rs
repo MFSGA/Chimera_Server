@@ -48,12 +48,70 @@ impl Pacer {
     }
 
     /// Record that a packet has been transmitted.
-    pub(super) fn on_transmit(&mut self, packet_length: u16, now: Instant) {
-        self.tokens = self.tokens.saturating_sub(packet_length.into());
-        if self.last_rate_override.is_some() {
-            self.last_sent = Some(now);
-            self.tokens_at_last_sent = self.tokens;
+    pub(super) fn on_transmit(
+        &mut self,
+        packet_length: u16,
+        now: Instant,
+        pacing_rate_override: Option<u64>,
+        mtu: u16,
+    ) {
+        let pacing_rate_override = pacing_rate_override.filter(|rate| *rate > 0);
+        let effective_now = self
+            .last_sent
+            .map_or(now, |last_sent| now.max(last_sent))
+            .max(self.prev);
+
+        let Some(rate) = pacing_rate_override else {
+            self.tokens = self.tokens.saturating_sub(packet_length.into());
+            if self.last_rate_override.is_some() {
+                self.last_sent = Some(effective_now);
+                self.tokens_at_last_sent = self.tokens;
+            }
+            return;
+        };
+
+        let policy_changed = self.last_rate_override != Some(rate) || self.last_mtu != mtu;
+        if policy_changed {
+            let elapsed = effective_now
+                .checked_duration_since(self.prev)
+                .unwrap_or_else(|| {
+                    warn!("received a timestamp early than a previous recorded time, ignoring");
+                    Default::default()
+                });
+            if let Some(previous_rate) = self.last_rate_override {
+                self.credit_fixed_rate(previous_rate, elapsed);
+            }
+            self.prev = self.prev.max(effective_now);
+            if self.last_rate_override.is_none() {
+                self.last_sent = None;
+                self.tokens_at_last_sent = 0;
+            }
+
+            self.capacity = optimal_capacity_for_rate(rate, mtu);
+            self.tokens = self.capacity.min(self.tokens);
+            if self.tokens == self.capacity {
+                self.fractional_tokens = 0;
+            }
+            self.last_mtu = mtu;
+            self.last_rate_override = Some(rate);
         }
+
+        if self.capacity == MIN_BURST_SIZE * u64::from(mtu) {
+            self.refresh_minimum_capacity_budget(rate, mtu, effective_now);
+        } else if !policy_changed {
+            let elapsed = effective_now
+                .checked_duration_since(self.prev)
+                .unwrap_or_else(|| {
+                    warn!("received a timestamp early than a previous recorded time, ignoring");
+                    Default::default()
+                });
+            self.credit_fixed_rate(rate, elapsed);
+        }
+        self.prev = self.prev.max(effective_now);
+
+        self.tokens = self.tokens.saturating_sub(packet_length.into());
+        self.last_sent = Some(effective_now);
+        self.tokens_at_last_sent = self.tokens;
     }
 
     /// Credit a fixed byte-per-second rate without losing sub-byte accrual
@@ -164,6 +222,11 @@ impl Pacer {
         let minimum_capacity_budget_from_last_sent = pacing_rate_override
             .filter(|_| self.capacity == MIN_BURST_SIZE * u64::from(mtu))
             .is_some_and(|rate| self.refresh_minimum_capacity_budget(rate, mtu, now));
+        let bytes_to_send = if minimum_capacity_budget_from_last_sent {
+            bytes_to_send.max(u64::from(mtu))
+        } else {
+            bytes_to_send
+        };
 
         if self.tokens >= bytes_to_send {
             if let Some(rate) = pacing_rate_override {
@@ -179,13 +242,6 @@ impl Pacer {
                     self.credit_fixed_rate(rate, elapsed);
                 }
                 self.prev = self.prev.max(now);
-                if self.capacity == MIN_BURST_SIZE * u64::from(mtu) {
-                    if let Some(deadline) = self.minimum_capacity_deadline(rate, mtu) {
-                        if now < deadline {
-                            return Some(deadline);
-                        }
-                    }
-                }
             }
             return None;
         }
@@ -476,7 +532,7 @@ mod tests {
                 "When capacity is available packets should be sent immediately"
             );
 
-            pacer.on_transmit(mtu, old_instant);
+            pacer.on_transmit(mtu, old_instant, None, mtu);
         }
 
         let pace_duration = Duration::from_nanos((BURST_INTERVAL_NANOS * 4 / 5) as u64);
@@ -510,7 +566,7 @@ mod tests {
                 "When capacity is available packets should be sent immediately"
             );
 
-            pacer.on_transmit(mtu, old_instant);
+            pacer.on_transmit(mtu, old_instant, None, mtu);
         }
 
         // Refill all capacity by waiting more than the expected duration
@@ -649,7 +705,7 @@ mod tests {
                     .delay(rtt, u64::from(mtu), mtu, window, Some(rate), after_idle)
                     .is_none(),
             );
-            pacer.on_transmit(mtu, after_idle);
+            pacer.on_transmit(mtu, after_idle, Some(rate), mtu);
         }
         assert_eq!(pacer.tokens, 0);
         assert_eq!(pacer.prev, after_idle);
@@ -766,7 +822,12 @@ mod tests {
             start + Duration::from_micros(20),
         );
         assert_eq!(pacer.tokens, pacer.capacity);
-        pacer.on_transmit(mtu, start + Duration::from_micros(20));
+        pacer.on_transmit(
+            mtu,
+            start + Duration::from_micros(20),
+            Some(rate),
+            mtu,
+        );
         let remaining = pacer.tokens;
         // New 15us interval earns less than one whole byte, and surplus
         // fractional credit at full capacity must have been discarded.
@@ -859,7 +920,7 @@ mod tests {
                 .delay(rtt, mtu as u64, mtu, window, Some(rate), start)
                 .is_none());
             while pacer.tokens >= mtu as u64 {
-                pacer.on_transmit(mtu, start);
+                pacer.on_transmit(mtu, start, Some(rate), mtu);
             }
             assert_eq!(pacer.tokens, 0);
             let resume = pacer
@@ -886,7 +947,7 @@ mod tests {
             assert!(pacer
                 .delay(rtt, mtu as u64, mtu, window, Some(rate), resume)
                 .is_none());
-            pacer.on_transmit(mtu, resume);
+            pacer.on_transmit(mtu, resume, Some(rate), mtu);
             let next = pacer
                 .delay(rtt, mtu as u64, mtu, window, Some(rate), resume)
                 .expect("the next datagram after a depleted budget must be paced");
@@ -912,7 +973,7 @@ mod tests {
             .delay(rtt, u64::from(mtu), mtu, window, Some(old_rate), start)
             .is_none());
         for _ in 0..MIN_BURST_SIZE {
-            pacer.on_transmit(mtu, start);
+            pacer.on_transmit(mtu, start, Some(old_rate), mtu);
         }
         assert_eq!(pacer.tokens, 0);
 
@@ -959,6 +1020,108 @@ mod tests {
     }
 
     #[test]
+    fn minimum_capacity_budget_allows_send_before_one_millisecond_deadline_when_ready() {
+        let mtu = 1200;
+        let rate = 2_000_000;
+        let rtt = Duration::from_micros(100);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        for _ in 0..MIN_BURST_SIZE {
+            pacer.on_transmit(mtu, start, Some(rate), mtu);
+        }
+
+        let ack_time = start + Duration::from_micros(700);
+        assert!(pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(rate), ack_time)
+            .is_none());
+        assert_eq!(pacer.tokens, 1400);
+    }
+
+    #[test]
+    fn minimum_capacity_probe_send_rebases_budget_at_actual_send_time() {
+        let mtu = 1200;
+        let rate = 125_000;
+        let rtt = Duration::from_micros(100);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        for _ in 0..MIN_BURST_SIZE {
+            pacer.on_transmit(mtu, start, Some(rate), mtu);
+        }
+        assert_eq!(pacer.tokens, 0);
+
+        // A loss probe bypasses delay(). Xray accounts the current budget in
+        // SentPacket, so 20 ms at 125 kB/s earns 2500 bytes before this send.
+        let probe_time = start + Duration::from_millis(20);
+        pacer.on_transmit(mtu, probe_time, Some(rate), mtu);
+        assert_eq!(pacer.tokens, 1300);
+        assert_eq!(pacer.tokens_at_last_sent, 1300);
+        assert_eq!(pacer.last_sent, Some(probe_time));
+        assert!(pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(rate), probe_time)
+            .is_none());
+    }
+
+    #[test]
+    fn minimum_capacity_probe_send_uses_current_rate_after_rate_decrease() {
+        let mtu = 1200;
+        let old_rate = 125_000;
+        let new_rate = 50_000;
+        let rtt = Duration::from_micros(100);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(old_rate), start);
+        for _ in 0..MIN_BURST_SIZE {
+            pacer.on_transmit(mtu, start, Some(old_rate), mtu);
+        }
+        assert_eq!(pacer.tokens, 0);
+
+        let probe_time = start + Duration::from_millis(20);
+        pacer.on_transmit(mtu, probe_time, Some(new_rate), mtu);
+        assert_eq!(pacer.tokens, 0);
+        assert_eq!(pacer.tokens_at_last_sent, 0);
+        assert_eq!(pacer.last_rate_override, Some(new_rate));
+        assert_eq!(pacer.last_sent, Some(probe_time));
+        assert_eq!(
+            pacer.delay(rtt, u64::from(mtu), mtu, window, Some(new_rate), probe_time),
+            Some(probe_time + Duration::from_millis(24)),
+        );
+    }
+
+    #[test]
+    fn stale_minimum_capacity_transmit_does_not_rewind_send_anchor() {
+        let mtu = 1200;
+        let rate = 125_000;
+        let rtt = Duration::from_micros(100);
+        let window = 3 * u64::from(mtu);
+        let start = Instant::now();
+        let stale = start - Duration::from_millis(10);
+        let mut pacer = Pacer::new(rtt, window, mtu, start);
+
+        pacer.delay(rtt, u64::from(mtu), mtu, window, Some(rate), start);
+        pacer.on_transmit(mtu, start, Some(rate), mtu);
+        assert_eq!(pacer.tokens, 9 * u64::from(mtu));
+
+        assert!(pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(rate), stale)
+            .is_none());
+        pacer.on_transmit(mtu, stale, Some(rate), mtu);
+        assert_eq!(pacer.last_sent, Some(start));
+        assert_eq!(pacer.tokens_at_last_sent, 8 * u64::from(mtu));
+        assert!(pacer
+            .delay(rtt, u64::from(mtu), mtu, window, Some(rate), start)
+            .is_none());
+        assert_eq!(pacer.tokens, 8 * u64::from(mtu));
+    }
+
+    #[test]
     fn fixed_rate_high_rate_preserves_existing_early_wake_policy() {
         let mtu = 1200;
         let rtt = Duration::from_millis(50);
@@ -1000,7 +1163,7 @@ mod tests {
         assert_eq!(pacer.last_rate_override, Some(rate_bytes_per_second));
 
         while pacer.tokens >= mtu as u64 {
-            pacer.on_transmit(mtu, now);
+            pacer.on_transmit(mtu, now, Some(rate_bytes_per_second), mtu);
         }
         let wake_budget = pacer.capacity - pacer.capacity / 4;
         let expected_ns = ((wake_budget - pacer.tokens) as u128 * 1_000_000_000)
@@ -1020,7 +1183,7 @@ mod tests {
         let mut late = Pacer::new(rtt, window, mtu, now);
         late.delay(rtt, mtu as u64, mtu, window, Some(rate_bytes_per_second), now);
         while late.tokens >= mtu as u64 {
-            late.on_transmit(mtu, now);
+            late.on_transmit(mtu, now, Some(rate_bytes_per_second), mtu);
         }
         let scheduled = late
             .delay(rtt, mtu as u64, mtu, window, Some(rate_bytes_per_second), now)

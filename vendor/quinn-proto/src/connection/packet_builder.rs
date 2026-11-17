@@ -225,7 +225,11 @@ impl PacketBuilder {
                 conn.permit_idle_reset = false;
             }
             conn.set_loss_detection_timer(now);
-            conn.path.pacing.on_transmit(size, now);
+            let pacing_rate_override = conn.path.congestion.pacing_rate_override();
+            let mtu = conn.path.current_mtu();
+            conn.path
+                .pacing
+                .on_transmit(size, now, pacing_rate_override, mtu);
         }
     }
 
