@@ -1,10 +1,20 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use tokio::{io::AsyncWriteExt, time::timeout};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::time::timeout;
 
 use crate::{
     address::NetLocation,
-    async_stream::AsyncStream,
+    async_stream::{AsyncPing, AsyncStream, RawTcpRelayState},
     config::server_config::InboundSniffingConfig,
     handler::{
         http::relay_plain_http_response,
@@ -34,6 +44,102 @@ use crate::{
 };
 
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum TcpRelayShutdownPolicy {
+    #[default]
+    Propagate,
+    PreserveDestinationWriteAfterUplinkEof,
+}
+
+#[derive(Default)]
+pub(crate) struct TcpRelayOptions {
+    pub(crate) sniffing: Option<InboundSniffingConfig>,
+    pub(crate) shutdown_policy: TcpRelayShutdownPolicy,
+}
+
+// Xray's stream-one TCP relay keeps reading the destination after its request
+// body ends, and does not send that EOF as a TCP FIN to the destination.
+// The final dispatcher shutdown flips `force_shutdown` so every exit still
+// closes the actual outbound stream. This wrapper also disables raw relay
+// paths, which would bypass the deferred shutdown behavior.
+struct XrayStreamOneTarget {
+    inner: Box<dyn AsyncStream>,
+    force_shutdown: Arc<AtomicBool>,
+    deferred_shutdown: bool,
+}
+
+impl XrayStreamOneTarget {
+    fn new(inner: Box<dyn AsyncStream>, force_shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            force_shutdown,
+            deferred_shutdown: false,
+        }
+    }
+}
+
+impl AsyncRead for XrayStreamOneTarget {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for XrayStreamOneTarget {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.force_shutdown.load(Ordering::Acquire) && !self.deferred_shutdown {
+            self.deferred_shutdown = true;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl AsyncPing for XrayStreamOneTarget {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.inner).poll_write_ping(cx)
+    }
+}
+
+impl AsyncStream for XrayStreamOneTarget {
+    fn raw_tcp_relay_state(&self) -> RawTcpRelayState {
+        RawTcpRelayState::Unavailable
+    }
+
+    #[cfg(unix)]
+    fn raw_tcp_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+}
 
 fn normalize_tcp_fallback(
     setup_outcome: TcpServerSetupOutcome,
@@ -177,6 +283,37 @@ pub(crate) async fn process_stream_with_context<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    process_stream_with_context_and_options(
+        stream,
+        server_handler,
+        resolver,
+        peer_addr,
+        runtime,
+        connection_context,
+        TcpRelayOptions {
+            sniffing,
+            ..TcpRelayOptions::default()
+        },
+    )
+    .await
+}
+
+pub(crate) async fn process_stream_with_context_and_options<AS>(
+    stream: AS,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    resolver: Arc<dyn Resolver>,
+    peer_addr: SocketAddr,
+    runtime: DataPlaneRuntime,
+    connection_context: TcpServerConnectionContext,
+    options: TcpRelayOptions,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
+    let TcpRelayOptions {
+        sniffing,
+        shutdown_policy: relay_shutdown_policy,
+    } = options;
     let local_addr = connection_context.local_addr;
     let handler_manages_handshake_timeout =
         server_handler.manages_handshake_timeout();
@@ -401,7 +538,7 @@ where
                 ),
             );
 
-            let (client_stream, outbound_tag) =
+            let (mut client_stream, outbound_tag) =
                 match setup_client_stream_future.await {
                     Ok(Ok(Some(result))) => result,
                     Ok(Ok(None)) => {
@@ -429,6 +566,17 @@ where
                         ));
                     }
                 };
+            let force_target_shutdown = match relay_shutdown_policy {
+                TcpRelayShutdownPolicy::Propagate => None,
+                TcpRelayShutdownPolicy::PreserveDestinationWriteAfterUplinkEof => {
+                    let force_shutdown = Arc::new(AtomicBool::new(false));
+                    client_stream = Box::new(XrayStreamOneTarget::new(
+                        client_stream,
+                        force_shutdown.clone(),
+                    ));
+                    Some(force_shutdown)
+                }
+            };
             if let Some(tag) = outbound_tag {
                 traffic_context =
                     traffic_context.map(|context| context.with_outbound_tag(tag));
@@ -472,6 +620,9 @@ where
                 .await
             };
 
+            if let Some(force_shutdown) = force_target_shutdown {
+                force_shutdown.store(true, Ordering::Release);
+            }
             let (_, _) =
                 futures::join!(server_stream.shutdown(), client_stream.shutdown());
             let copy_result = match copy_result {
@@ -631,5 +782,57 @@ where
             lease.run().await
         }
         TcpServerSetupOutcome::Completed => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod xray_stream_one_target_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::time::timeout;
+
+    use super::XrayStreamOneTarget;
+
+    #[tokio::test]
+    async fn defers_uplink_shutdown_and_forces_close_at_session_end() {
+        let (inner, mut peer) = duplex(64);
+        let force_shutdown = Arc::new(AtomicBool::new(false));
+        let mut target =
+            XrayStreamOneTarget::new(Box::new(inner), force_shutdown.clone());
+
+        target.write_all(b"request").await.expect("write request");
+        let mut request = [0_u8; 7];
+        peer.read_exact(&mut request).await.expect("read request");
+        assert_eq!(&request, b"request");
+
+        target.shutdown().await.expect("defer request EOF");
+        let mut byte = [0_u8; 1];
+        assert!(
+            timeout(Duration::from_millis(20), peer.read(&mut byte))
+                .await
+                .is_err(),
+            "deferred request EOF must keep destination readable"
+        );
+
+        peer.write_all(b"response")
+            .await
+            .expect("write response after request EOF");
+        let mut response = [0_u8; 8];
+        target
+            .read_exact(&mut response)
+            .await
+            .expect("read response after request EOF");
+        assert_eq!(&response, b"response");
+
+        force_shutdown.store(true, Ordering::Release);
+        target.shutdown().await.expect("force final shutdown");
+        assert_eq!(peer.read(&mut byte).await.expect("read final EOF"), 0);
     }
 }

@@ -72,7 +72,7 @@ Config validation is necessary but is not protocol interoperability evidence. Te
 | `vless-tcp-tls-vision.json5` | vless | tcp | tls + vision | config-validated; Xray-verified TCP stream + inner TLS Vision with repository fixture |
 | `vless-xhttp-none.json5` | vless | xhttp | none | config-validated; runtime-covered |
 | `vless-xhttp-tls.json5` | vless | xhttp | tls | config-validated; Xray 26.9.9-verified TLS/H2 packet-up (including xPadding obfuscation, multi-request session reassembly and out-of-order sequence delivery), error-status parity, and stream-up profiles |
-| `vless-xhttp-tls-h2-stream-one.json5` | vless | xhttp | tls + h2 + stream-one | config-validated; Xray 26.9.9-verified 1 MiB bidirectional echo, client-cancellation liveness, and raw HTTP/2 half-close parity |
+| `vless-xhttp-tls-h2-stream-one.json5` | vless | xhttp | tls + h2 + stream-one | config-validated; Xray 26.9.9-verified 1 MiB bidirectional echo, client-cancellation liveness, and raw HTTP/2 half-close parity; Xray 26.11.9-verified 128 KiB active TCP downlink continues after clean HTTP/2 END_STREAM both before and during target response, including a 1.2 s active-stream gap, and HTTP/2 CANCEL after END_STREAM closes the target connection; the idle-target no-data case is retained |
 | `vmess-tcp-none.json5` | vmess | tcp | none | config-validated; runtime-covered |
 | `vmess-ws-none.json5` | vmess | websocket | none | config-validated; runtime-covered |
 | `vmess-ws-tls.json5` | vmess | websocket | tls | config-validated; runtime-covered |

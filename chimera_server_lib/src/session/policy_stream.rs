@@ -155,6 +155,26 @@ async fn wait_for_activity(
     receiver.changed().await
 }
 
+fn take_grace_tick_activity(
+    receiver: &mut watch::Receiver<RelayProgress>,
+    direction: RelayDirection,
+    last_bytes: &mut u64,
+    activity_seen: &mut bool,
+) -> (RelayProgress, bool) {
+    let progress = *receiver.borrow_and_update();
+    let current_bytes = match direction {
+        RelayDirection::LeftToRight => progress.left_to_right_bytes,
+        RelayDirection::RightToLeft => progress.right_to_left_bytes,
+    };
+    if current_bytes > *last_bytes {
+        *last_bytes = current_bytes;
+        *activity_seen = true;
+    }
+    let activity = *activity_seen;
+    *activity_seen = false;
+    (progress, activity)
+}
+
 #[cfg(test)]
 pub(crate) async fn copy_bidirectional_with_timeouts<A, B>(
     left: &mut A,
@@ -272,9 +292,16 @@ where
     };
     tokio::pin!(relay);
 
+    // Xray's ActivityTimer checks at fixed intervals and extends the timeout
+    // when activity was observed during that interval. Keep that cadence
+    // instead of restarting the timer on every byte.
     let mut last_activity_generation = 0;
+    let mut last_left_to_right_bytes = 0;
+    let mut last_right_to_left_bytes = 0;
     let mut uplink_done = false;
     let mut downlink_done = false;
+    let mut uplink_grace_activity = false;
+    let mut downlink_grace_activity = false;
     let mut idle_timer = timeouts
         .connection_idle
         .map(|duration| Box::pin(sleep(duration)));
@@ -301,24 +328,43 @@ where
                     });
                 }
                 let progress = *activity_receiver.borrow_and_update();
+                let uplink_activity =
+                    progress.left_to_right_bytes > last_left_to_right_bytes;
+                let downlink_activity =
+                    progress.right_to_left_bytes > last_right_to_left_bytes;
+                last_left_to_right_bytes = progress.left_to_right_bytes;
+                last_right_to_left_bytes = progress.right_to_left_bytes;
+                if uplink_done && !downlink_done && downlink_activity {
+                    downlink_grace_activity = true;
+                }
+                if downlink_done && !uplink_done && uplink_activity {
+                    uplink_grace_activity = true;
+                }
                 if progress.activity_generation != last_activity_generation {
                     last_activity_generation = progress.activity_generation;
-                    if let (Some(duration), Some(timer)) = (
-                        timeouts.connection_idle,
-                        idle_timer.as_mut(),
-                    ) {
+                    if !uplink_done
+                        && !downlink_done
+                        && let (Some(duration), Some(timer)) = (
+                            timeouts.connection_idle,
+                            idle_timer.as_mut(),
+                        )
+                    {
                         timer.as_mut().reset(Instant::now() + duration);
                     }
                 }
                 if !uplink_done && progress.left_to_right_done {
                     uplink_done = true;
-                    uplink_grace = timeouts
+                    idle_timer = None;
+                    downlink_grace_activity = false;
+                    downlink_grace = timeouts
                         .downlink_only
                         .map(|duration| Box::pin(sleep(duration)));
                 }
                 if !downlink_done && progress.right_to_left_done {
                     downlink_done = true;
-                    downlink_grace = timeouts
+                    idle_timer = None;
+                    uplink_grace_activity = false;
+                    uplink_grace = timeouts
                         .uplink_only
                         .map(|duration| Box::pin(sleep(duration)));
                 }
@@ -345,10 +391,48 @@ where
                 ));
             }
             _ = wait_optional_sleep(&mut uplink_grace) => {
-                return Ok(TcpRelayResult::partial(*activity_receiver.borrow()));
+                let duration = timeouts.uplink_only.unwrap_or_default();
+                let (progress, activity) = take_grace_tick_activity(
+                    &mut activity_receiver,
+                    RelayDirection::LeftToRight,
+                    &mut last_left_to_right_bytes,
+                    &mut uplink_grace_activity,
+                );
+                if progress.left_to_right_done && progress.right_to_left_done {
+                    return relay.await.map_err(|error| {
+                        tcp_relay::error_with_partial_result(
+                            error,
+                            progress,
+                        )
+                    });
+                }
+                if activity && !duration.is_zero() {
+                    uplink_grace = Some(Box::pin(sleep(duration)));
+                } else {
+                    return Ok(TcpRelayResult::partial(progress));
+                }
             }
             _ = wait_optional_sleep(&mut downlink_grace) => {
-                return Ok(TcpRelayResult::partial(*activity_receiver.borrow()));
+                let duration = timeouts.downlink_only.unwrap_or_default();
+                let (progress, activity) = take_grace_tick_activity(
+                    &mut activity_receiver,
+                    RelayDirection::RightToLeft,
+                    &mut last_right_to_left_bytes,
+                    &mut downlink_grace_activity,
+                );
+                if progress.left_to_right_done && progress.right_to_left_done {
+                    return relay.await.map_err(|error| {
+                        tcp_relay::error_with_partial_result(
+                            error,
+                            progress,
+                        )
+                    });
+                }
+                if activity && !duration.is_zero() {
+                    downlink_grace = Some(Box::pin(sleep(duration)));
+                } else {
+                    return Ok(TcpRelayResult::partial(progress));
+                }
             }
         }
     }
@@ -389,7 +473,7 @@ mod tests {
 
     use tokio::{
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, duplex},
-        sync::Notify,
+        sync::{Notify, watch},
         time::{advance, sleep, timeout},
     };
 
@@ -400,7 +484,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::copy_bidirectional_with_downlink_splice_and_timeouts;
-    use super::copy_bidirectional_with_timeouts;
+    use super::{
+        RelayDirection, copy_bidirectional_with_timeouts, take_grace_tick_activity,
+    };
+    use crate::session::tcp_relay::RelayProgress;
 
     struct WriteObservedStream {
         inner: tokio::io::DuplexStream,
@@ -647,6 +734,196 @@ mod tests {
             .expect("relay task should not panic")
             .expect("relay should close cleanly");
         assert_eq!(result.left_to_right, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn downlink_activity_ready_at_grace_deadline_is_observed() {
+        let (sender, mut receiver) = watch::channel(RelayProgress::default());
+        let mut timer = Box::pin(sleep(Duration::from_secs(1)));
+        assert!(futures::poll!(timer.as_mut()).is_pending());
+        advance(Duration::from_secs(1)).await;
+        sender.send_modify(|progress| {
+            progress.right_to_left_bytes = 1;
+        });
+
+        assert!(timer.is_elapsed(), "grace timer must be ready");
+        assert!(receiver.has_changed().expect("watch remains open"));
+
+        let mut last_bytes = 0;
+        let mut activity_seen = false;
+        let (progress, should_extend) = take_grace_tick_activity(
+            &mut receiver,
+            RelayDirection::RightToLeft,
+            &mut last_bytes,
+            &mut activity_seen,
+        );
+
+        assert!(should_extend, "deadline must observe queued downlink data");
+        assert_eq!(last_bytes, 1);
+        assert_eq!(progress.right_to_left_bytes, 1);
+        assert!(!receiver.has_changed().expect("watch remains open"));
+    }
+
+    #[tokio::test]
+    async fn downlink_activity_resets_grace_and_replaces_connection_idle() {
+        let (mut left, mut left_peer) = duplex(64);
+        let (mut right, mut right_peer) = duplex(64);
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_timeouts(
+                &mut left,
+                &mut right,
+                PolicyRelayTimeouts {
+                    connection_idle: Some(Duration::from_millis(10)),
+                    downlink_only: Some(Duration::from_millis(100)),
+                    ..PolicyRelayTimeouts::default()
+                },
+            )
+            .await
+        });
+
+        left_peer.write_all(b"up").await.expect("write uplink");
+        left_peer.shutdown().await.expect("close uplink");
+        let mut uplink = [0_u8; 2];
+        right_peer
+            .read_exact(&mut uplink)
+            .await
+            .expect("read uplink");
+        assert_eq!(&uplink, b"up");
+
+        sleep(Duration::from_millis(20)).await;
+        right_peer
+            .write_all(b"a")
+            .await
+            .expect("write first downlink byte");
+        let mut first = [0_u8; 1];
+        left_peer
+            .read_exact(&mut first)
+            .await
+            .expect("read first downlink byte");
+        assert_eq!(&first, b"a");
+
+        // The fixed Xray timeout check at 100 ms observes the first byte and
+        // starts another interval. A second byte at 150 ms must still pass.
+        sleep(Duration::from_millis(130)).await;
+        right_peer
+            .write_all(b"b")
+            .await
+            .expect("write second downlink byte");
+        let mut second = [0_u8; 1];
+        left_peer
+            .read_exact(&mut second)
+            .await
+            .expect("read second downlink byte");
+        assert_eq!(&second, b"b");
+        assert!(
+            !relay.is_finished(),
+            "downlink-only grace must track activity at its fixed check intervals"
+        );
+
+        let result = timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("downlink-only grace should expire after activity stops")
+            .expect("relay task should not panic")
+            .expect("relay should close cleanly");
+        assert_eq!(result.left_to_right, 2);
+        assert_eq!(result.right_to_left, 2);
+    }
+
+    #[tokio::test]
+    async fn uplink_activity_resets_grace_at_fixed_timeout_checks() {
+        let (mut left, mut left_peer) = duplex(64);
+        let (mut right, mut right_peer) = duplex(64);
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_timeouts(
+                &mut left,
+                &mut right,
+                PolicyRelayTimeouts {
+                    connection_idle: Some(Duration::from_millis(10)),
+                    uplink_only: Some(Duration::from_millis(100)),
+                    ..PolicyRelayTimeouts::default()
+                },
+            )
+            .await
+        });
+
+        right_peer
+            .write_all(b"response")
+            .await
+            .expect("write downlink");
+        right_peer.shutdown().await.expect("close downlink");
+        let mut response = [0_u8; 8];
+        left_peer
+            .read_exact(&mut response)
+            .await
+            .expect("read downlink");
+        assert_eq!(&response, b"response");
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            left_peer.read(&mut eof).await.expect("read downlink EOF"),
+            0
+        );
+
+        sleep(Duration::from_millis(20)).await;
+        left_peer
+            .write_all(b"a")
+            .await
+            .expect("write first uplink byte");
+        let mut first = [0_u8; 1];
+        right_peer
+            .read_exact(&mut first)
+            .await
+            .expect("read first uplink byte");
+        assert_eq!(&first, b"a");
+
+        sleep(Duration::from_millis(130)).await;
+        left_peer
+            .write_all(b"b")
+            .await
+            .expect("write second uplink byte");
+        let mut second = [0_u8; 1];
+        right_peer
+            .read_exact(&mut second)
+            .await
+            .expect("read second uplink byte");
+        assert_eq!(&second, b"b");
+        assert!(
+            !relay.is_finished(),
+            "uplink-only grace must track activity at its fixed check intervals"
+        );
+
+        let result = timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("uplink-only grace should expire after activity stops")
+            .expect("relay task should not panic")
+            .expect("relay should close cleanly");
+        assert_eq!(result.left_to_right, 2);
+        assert_eq!(result.right_to_left, 8);
+    }
+
+    #[tokio::test]
+    async fn zero_downlink_only_timeout_expires_immediately_after_uplink_eof() {
+        let (mut left, mut left_peer) = duplex(64);
+        let (mut right, mut _right_peer) = duplex(64);
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_timeouts(
+                &mut left,
+                &mut right,
+                PolicyRelayTimeouts {
+                    downlink_only: Some(Duration::ZERO),
+                    ..PolicyRelayTimeouts::default()
+                },
+            )
+            .await
+        });
+
+        left_peer.shutdown().await.expect("close uplink");
+        let result = timeout(Duration::from_millis(100), relay)
+            .await
+            .expect("zero downlink-only timeout did not expire")
+            .expect("relay task should not panic")
+            .expect("relay should close cleanly");
+        assert_eq!(result.left_to_right, 0);
+        assert_eq!(result.right_to_left, 0);
     }
 
     #[tokio::test]

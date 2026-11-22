@@ -90,25 +90,22 @@ pub(super) fn reader_response_until_cancel(
     reader: DuplexStream,
     no_sse_header: bool,
     cancel: CancellationToken,
+    response_finished: CancellationToken,
 ) -> Response<ResponseBody> {
-    // Keep the first logical response chunk (the VLESS response header) even
-    // when the request body already reached EOF, then mirror Xray's
-    // stream-one response shutdown boundary.
+    let response_finished_guard = response_finished.clone().drop_guard();
     let body_stream = futures::stream::unfold(
-        (ReaderStream::new(reader), cancel, false),
-        |(mut reader, cancel, started)| async move {
-            let next = if started {
-                tokio::select! {
-                    _ = cancel.cancelled() => return None,
-                    next = reader.next() => next,
-                }
-            } else {
-                reader.next().await
+        (ReaderStream::new(reader), cancel, response_finished_guard),
+        |(mut reader, cancel, response_finished_guard)| async move {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return None,
+                next = reader.next() => next,
             };
             match next {
-                Some(Ok(bytes)) => {
-                    Some((Ok(Frame::data(bytes)), (reader, cancel, true)))
-                }
+                Some(Ok(bytes)) => Some((
+                    Ok(Frame::data(bytes)),
+                    (reader, cancel, response_finished_guard),
+                )),
                 Some(Err(err)) => {
                     error!("xhttp response read failed: {}", err);
                     None

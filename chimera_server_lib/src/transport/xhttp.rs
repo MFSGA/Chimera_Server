@@ -41,7 +41,10 @@ use crate::{
     },
     resolver::Resolver,
     runtime::DataPlaneRuntime,
-    session::dispatcher::process_stream_with_sniffing_and_local_addr,
+    session::dispatcher::{
+        TcpRelayOptions, TcpRelayShutdownPolicy,
+        process_stream_with_context_and_options, stream_connection_context,
+    },
     transport::tcp::{
         TcpAcceptHealth, accept_tcp_with_health, apply_tcp_socket_policy,
         create_tcp_listener,
@@ -763,45 +766,59 @@ where
 {
     let (client_upload, server_read) = duplex(XHTTP_PIPE_CAPACITY);
     let (server_write, client_download) = duplex(XHTTP_PIPE_CAPACITY);
-    let request_done = CancellationToken::new();
-    let request_done_for_body = request_done.clone();
+    let request_body_aborted = CancellationToken::new();
+    let request_body_aborted_for_task = request_body_aborted.clone();
+    let response_finished = CancellationToken::new();
+    let response_finished_for_upload = response_finished.clone();
     let logical_stream = XhttpLogicalStream::new(server_read, server_write);
 
-    spawn_handler_stream(logical_stream, state.clone(), peer_addr, local_addr);
+    spawn_handler_stream(
+        logical_stream,
+        state.clone(),
+        peer_addr,
+        local_addr,
+        TcpRelayShutdownPolicy::PreserveDestinationWriteAfterUplinkEof,
+        response_finished.clone(),
+    );
 
     let mut upload_writer = client_upload;
     let shutdown = state.shutdown.clone();
     let runtime = state.runtime.clone();
     let _ = runtime.spawn_inbound_connection(async move {
-        tokio::select! {
-            _ = shutdown.cancelled() => {}
-            _ = async {
-                while let Some(frame_result) = body.frame().await {
-                    match frame_result {
-                        Ok(frame) => {
+        let abort_on_drop = request_body_aborted_for_task.clone().drop_guard();
+        let request_body_completed = tokio::select! {
+            _ = shutdown.cancelled() => false,
+            _ = response_finished_for_upload.cancelled() => false,
+            completed = async {
+                loop {
+                    match body.frame().await {
+                        Some(Ok(frame)) => {
                             if let Some(chunk) = frame.data_ref()
                                 && upload_writer.write_all(chunk).await.is_err()
                             {
-                                break;
+                                return false;
                             }
                         }
-                        Err(_) => break,
+                        Some(Err(_)) => return false,
+                        None => return true,
                     }
                 }
-            } => {}
+            } => completed,
+        };
+        if request_body_completed {
+            let _ = abort_on_drop.disarm();
+        } else {
+            request_body_aborted_for_task.cancel();
         }
         let _ = upload_writer.shutdown().await;
-        // Xray stream-one closes the logical response when the HTTP request
-        // body reaches EOF. The response helper preserves the initial VLESS
-        // response bytes before applying that cancellation boundary.
-        request_done_for_body.cancel();
     });
 
     reader_response_until_cancel(
         StatusCode::OK,
         client_download,
         state.no_sse_header,
-        request_done,
+        request_body_aborted,
+        response_finished,
     )
 }
 
@@ -858,7 +875,14 @@ async fn handle_stream_down(
     session.fully_connected.store(true, Ordering::Release);
 
     let (stream, reader) = session.new_downlink_connection();
-    spawn_handler_stream(stream, state.clone(), peer_addr, local_addr);
+    spawn_handler_stream(
+        stream,
+        state.clone(),
+        peer_addr,
+        local_addr,
+        TcpRelayShutdownPolicy::Propagate,
+        CancellationToken::new(),
+    );
 
     let cleanup = SessionCleanupGuard {
         sessions: state.sessions.clone(),
@@ -971,20 +995,32 @@ fn spawn_handler_stream(
     state: Arc<AppState>,
     peer_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
+    relay_shutdown_policy: TcpRelayShutdownPolicy,
+    response_finished: CancellationToken,
 ) {
     let shutdown = state.shutdown.clone();
     let runtime = state.runtime.clone();
+    let task_runtime = runtime.clone();
     let _ = runtime.spawn_inbound_connection(async move {
+        let connection_context =
+            stream_connection_context(&task_runtime, Some(local_addr));
+        let sniffing = state.sniffing.clone();
+        let server_handler = state.server_handler.clone();
+        let resolver = state.resolver.clone();
         tokio::select! {
             _ = shutdown.cancelled() => {}
-            result = process_stream_with_sniffing_and_local_addr(
+            _ = response_finished.cancelled() => {}
+            result = process_stream_with_context_and_options(
                 stream,
-                state.server_handler.clone(),
-                state.resolver.clone(),
+                server_handler,
+                resolver,
                 peer_addr,
-                Some(local_addr),
-                state.runtime.clone(),
-                state.sniffing.clone(),
+                task_runtime.clone(),
+                connection_context,
+                TcpRelayOptions {
+                    sniffing,
+                    shutdown_policy: relay_shutdown_policy,
+                },
             ) => {
                 if let Err(err) = result {
                     error!("xhttp logical stream {} failed: {}", peer_addr, err);

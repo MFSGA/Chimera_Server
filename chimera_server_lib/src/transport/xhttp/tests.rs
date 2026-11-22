@@ -109,6 +109,72 @@ async fn stream_one_background_tasks_use_server_owner() {
 }
 
 #[tokio::test]
+async fn stream_one_clean_upload_eof_keeps_response_alive() {
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    let state = pending_xhttp_state(runtime.clone(), CancellationToken::new());
+    let body = http_body_util::Full::new(Bytes::from_static(b"request"));
+
+    let response = handle_stream_one(
+        body,
+        state,
+        "127.0.0.1:12345".parse().unwrap(),
+        "127.0.0.1:443".parse().unwrap(),
+    )
+    .await;
+
+    wait_for_tracked_xhttp_tasks(&runtime, 1).await;
+    drop(response);
+    wait_for_tracked_xhttp_tasks(&runtime, 0).await;
+}
+
+#[tokio::test]
+async fn stream_one_response_drop_cancels_pending_upload_and_handler() {
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    let state = pending_xhttp_state(runtime.clone(), CancellationToken::new());
+    let body = StreamBody::new(futures::stream::pending::<
+        Result<Frame<Bytes>, Infallible>,
+    >());
+
+    let response = handle_stream_one(
+        body,
+        state,
+        "127.0.0.1:12345".parse().unwrap(),
+        "127.0.0.1:443".parse().unwrap(),
+    )
+    .await;
+
+    wait_for_tracked_xhttp_tasks(&runtime, 2).await;
+    drop(response);
+    wait_for_tracked_xhttp_tasks(&runtime, 0).await;
+}
+
+#[tokio::test]
+async fn stream_one_request_body_error_closes_response_and_handler() {
+    let runtime = RuntimeState::new(Vec::new(), Vec::new());
+    let state = pending_xhttp_state(runtime.clone(), CancellationToken::new());
+    let body = StreamBody::new(futures::stream::iter([Err(std::io::Error::other(
+        "request body reset",
+    ))]));
+
+    let response = handle_stream_one(
+        body,
+        state,
+        "127.0.0.1:12345".parse().unwrap(),
+        "127.0.0.1:443".parse().unwrap(),
+    )
+    .await;
+    let mut response_body = response.into_body();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), response_body.frame())
+            .await
+            .expect("aborted response timeout")
+            .is_none(),
+        "request body errors must cancel the response body"
+    );
+    wait_for_tracked_xhttp_tasks(&runtime, 0).await;
+}
+
+#[tokio::test]
 async fn split_session_handler_and_ttl_use_server_owner() {
     let runtime = RuntimeState::new(Vec::new(), Vec::new());
     let shutdown = CancellationToken::new();
