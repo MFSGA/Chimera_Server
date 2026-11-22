@@ -25,5 +25,16 @@
       }
     }
   }],
-  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+  "outbounds": [{
+    "protocol": "freedom",
+    "tag": "direct",
+    "settings": {
+      "finalRules": [{
+        "action": "allow",
+        "network": "tcp",
+        "port": 52080,
+        "ip": ["127.0.0.1/32"]
+      }]
+    }
+  }]
 }

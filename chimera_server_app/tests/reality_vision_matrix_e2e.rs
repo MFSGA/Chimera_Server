@@ -1,6 +1,6 @@
 mod reality_vision_support;
 
-use std::{sync::Arc, thread};
+use std::{sync::Arc, thread, time::Duration};
 
 use reality_vision_support::{
     REALITY_SERVER_NAME, REALITY_SHORT_ID, VisionClientOptions, VisionServerOptions,
@@ -227,7 +227,7 @@ async fn reality_vision_half_close_matches_xray_server_baseline() {
     let _serial = serial_guard().await;
     let payload = deterministic_payload(128 * 1024);
 
-    let chimera_target = start_half_close_server();
+    let (chimera_target, chimera_observations) = start_half_close_server();
     let mut chimera = start_vision_harness(
         "half-close-chimera",
         VisionServerOptions::default(),
@@ -238,21 +238,62 @@ async fn reality_vision_half_close_matches_xray_server_baseline() {
     let chimera_result =
         probe_half_close(chimera.socks_addr, chimera_target, &payload);
 
-    let xray_target = start_half_close_server();
+    let (xray_target, xray_observations) = start_half_close_server();
     let mut reference = start_xray_reference_harness("half-close").await;
     reference.server.assert_running();
     reference.client.assert_running();
     let xray_result = probe_half_close(reference.socks_addr, xray_target, &payload);
+    let chimera_observation = chimera_observations
+        .recv_timeout(Duration::from_secs(8))
+        .expect("Chimera half-close target must report the request");
+    let xray_observation = xray_observations
+        .recv_timeout(Duration::from_secs(8))
+        .expect("Xray half-close target must report the request");
 
     eprintln!(
-        "half-close parity: chimera={:?}, xray={:?}",
-        chimera_result.as_ref().map(Vec::len),
-        xray_result.as_ref().map(Vec::len),
+        "half-close: chimera={chimera_result:?} target_upload_bytes={} target_end={:?} target_reply_write={}; xray={xray_result:?} target_upload_bytes={} target_end={:?} target_reply_write={}",
+        chimera_observation.received_payload.len(),
+        chimera_observation.read_termination,
+        chimera_observation.response_written,
+        xray_observation.received_payload.len(),
+        xray_observation.read_termination,
+        xray_observation.response_written,
+    );
+    for (name, observation) in
+        [("Chimera", chimera_observation), ("Xray", xray_observation)]
+    {
+        assert_eq!(
+            observation.read_termination,
+            reality_vision_support::HalfCloseTermination::Eof,
+            "{name} target must observe EOF"
+        );
+        assert!(
+            observation.received_payload == payload,
+            "{name} target upload differs: received {} bytes, expected {}",
+            observation.received_payload.len(),
+            payload.len(),
+        );
+        assert!(
+            observation.response_written,
+            "{name} target must write its reply"
+        );
+    }
+    let chimera_result =
+        chimera_result.expect("Chimera half-close request must connect");
+    let xray_result = xray_result.expect("Xray half-close request must connect");
+    assert_ne!(
+        chimera_result.read_termination,
+        reality_vision_support::HalfCloseTermination::SizeLimitExceeded,
+        "Chimera half-close response exceeded the comparison bound"
+    );
+    assert_ne!(
+        xray_result.read_termination,
+        reality_vision_support::HalfCloseTermination::SizeLimitExceeded,
+        "Xray half-close response exceeded the comparison bound"
     );
     assert_eq!(
-        chimera_result.is_ok(),
-        xray_result.is_ok(),
-        "Chimera and Xray server differ in TCP half-close behavior"
+        chimera_result, xray_result,
+        "Chimera and Xray half-close response bytes and termination must match"
     );
 }
 

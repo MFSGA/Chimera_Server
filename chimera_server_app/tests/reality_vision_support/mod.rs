@@ -7,6 +7,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver},
     sync::{
         Arc, Once,
         atomic::{AtomicUsize, Ordering},
@@ -41,7 +42,8 @@ pub const WRONG_REALITY_PUBLIC_KEY: &str =
     "YMN7dhY3BslQZ0LY8Fzb65vVgV6MY_QgVjQ9JOxV8gI";
 pub const REALITY_SHORT_ID: &str = "4ac97aaf8b9b0356";
 pub const REALITY_SERVER_NAME: &str = "www.apple.com";
-pub const CHIMERA_CLIENT_REALITY_VERSION: &str = "1.8.0";
+// Keep this aligned with clash-lib's REALITY ClientHello metadata version.
+pub const CHIMERA_CLIENT_REALITY_VERSION: &str = "1.8.2";
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
@@ -198,6 +200,14 @@ pub async fn serial_guard() -> MutexGuard<'static, ()> {
     XRAY_TEST_LOCK.lock().await
 }
 
+fn loopback_tcp_final_rules() -> Value {
+    json!([{
+        "action": "allow",
+        "network": "tcp",
+        "ip": ["127.0.0.1/32", "::1/128"]
+    }])
+}
+
 pub async fn start_vision_harness(
     name: &str,
     server: VisionServerOptions,
@@ -264,7 +274,16 @@ pub async fn start_vision_harness(
                     "realitySettings": Value::Object(reality_settings)
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {
+                    // Vision integration targets bind to loopback. VLESS
+                    // follows Xray's private-address default, so the fixture
+                    // must explicitly allow its local TCP targets.
+                    "finalRules": loopback_tcp_final_rules()
+                }
+            }]
         }),
     );
 
@@ -394,7 +413,11 @@ pub async fn start_chimera_client_harness(
                     "realitySettings": Value::Object(reality_settings)
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": loopback_tcp_final_rules()}
+            }]
         }),
     );
 
@@ -495,7 +518,11 @@ pub async fn start_xray_reference_harness(name: &str) -> XrayReferenceHarness {
                     }
                 }
             }],
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            "outbounds": [{
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {"finalRules": loopback_tcp_final_rules()}
+            }]
         }),
     );
     write_json(
@@ -798,28 +825,64 @@ fn start_tcp_echo_server_on(bind_addr: SocketAddr) -> io::Result<SocketAddr> {
     Ok(addr)
 }
 
-pub fn start_half_close_server() -> SocketAddr {
+#[derive(Debug)]
+pub struct HalfCloseObservation {
+    pub received_payload: Vec<u8>,
+    pub read_termination: HalfCloseTermination,
+    pub response_written: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HalfCloseTermination {
+    Eof,
+    ReadError {
+        kind: io::ErrorKind,
+        message: String,
+    },
+    SizeLimitExceeded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct HalfCloseProbeResult {
+    pub response: Vec<u8>,
+    pub read_termination: HalfCloseTermination,
+}
+
+const HALF_CLOSE_MAX_BYTES: usize = 1024 * 1024;
+
+pub fn start_half_close_server() -> (SocketAddr, Receiver<HalfCloseObservation>) {
     let listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind half-close server");
     let addr = listener.local_addr().expect("half-close address");
+    let (observation_tx, observation_rx) = mpsc::channel();
     thread::spawn(move || {
         for stream in listener.incoming().take(32) {
             let Ok(mut stream) = stream else {
                 continue;
             };
+            let observation_tx = observation_tx.clone();
             thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                let mut payload = Vec::new();
-                if stream.read_to_end(&mut payload).is_ok() {
-                    let response = format!("received:{}", payload.len());
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.shutdown(Shutdown::Write);
-                }
+                let (payload, read_termination) =
+                    read_bounded_to_eof(&mut stream, HALF_CLOSE_MAX_BYTES);
+                let response_written =
+                    if read_termination == HalfCloseTermination::Eof {
+                        let response = format!("received:{}", payload.len());
+                        stream.write_all(response.as_bytes()).is_ok()
+                    } else {
+                        false
+                    };
+                let _ = stream.shutdown(Shutdown::Write);
+                let _ = observation_tx.send(HalfCloseObservation {
+                    received_payload: payload,
+                    read_termination,
+                    response_written,
+                });
             });
         }
     });
-    addr
+    (addr, observation_rx)
 }
 
 pub async fn start_tls_echo_server() -> SocketAddr {
@@ -1005,20 +1068,17 @@ pub fn probe_half_close(
     socks_addr: SocketAddr,
     target: SocketAddr,
     payload: &[u8],
-) -> io::Result<Vec<u8>> {
+) -> io::Result<HalfCloseProbeResult> {
     let mut stream = connect_socks5(socks_addr, SocksTarget::Socket(target))?;
     stream.write_all(payload)?;
     stream.shutdown(Shutdown::Write)?;
     let expected = format!("received:{}", payload.len());
-    let mut response = vec![0u8; expected.len()];
-    read_exact_with_deadline(&mut stream, &mut response)?;
-    if response != expected.as_bytes() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected half-close response: {response:?}"),
-        ));
-    }
-    Ok(response)
+    let (response, read_termination) =
+        read_bounded_to_eof(&mut stream, expected.len().saturating_add(1));
+    Ok(HalfCloseProbeResult {
+        response,
+        read_termination,
+    })
 }
 
 pub fn assert_half_close(
@@ -1026,7 +1086,147 @@ pub fn assert_half_close(
     target: SocketAddr,
     payload: &[u8],
 ) {
-    probe_half_close(socks_addr, target, payload).expect("half-close roundtrip");
+    let result = probe_half_close(socks_addr, target, payload)
+        .expect("half-close connection and upload");
+    let expected = format!("received:{}", payload.len());
+    assert_eq!(result.response, expected.as_bytes());
+    assert_eq!(result.read_termination, HalfCloseTermination::Eof);
+}
+
+fn read_bounded_to_eof(
+    stream: &mut TcpStream,
+    maximum_bytes: usize,
+) -> (Vec<u8>, HalfCloseTermination) {
+    read_bounded_until(stream, maximum_bytes, Instant::now() + IO_TIMEOUT)
+}
+
+fn read_bounded_until(
+    stream: &mut TcpStream,
+    maximum_bytes: usize,
+    deadline: Instant,
+) -> (Vec<u8>, HalfCloseTermination) {
+    let mut bytes = Vec::with_capacity(maximum_bytes.min(4096));
+    let mut buffer = [0u8; 4096];
+    loop {
+        if bytes.len() > maximum_bytes {
+            return (bytes, HalfCloseTermination::SizeLimitExceeded);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (bytes, half_close_read_timeout());
+        }
+        if let Err(error) = stream.set_read_timeout(Some(remaining)) {
+            return (
+                bytes,
+                HalfCloseTermination::ReadError {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                },
+            );
+        }
+
+        let read_limit = if bytes.len() == maximum_bytes {
+            1
+        } else {
+            buffer.len().min(maximum_bytes - bytes.len())
+        };
+        match stream.read(&mut buffer[..read_limit]) {
+            Ok(0) => return (bytes, HalfCloseTermination::Eof),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return (bytes, half_close_read_timeout());
+                }
+                thread::sleep(RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return (
+                    bytes,
+                    HalfCloseTermination::ReadError {
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn half_close_read_timeout() -> HalfCloseTermination {
+    HalfCloseTermination::ReadError {
+        kind: io::ErrorKind::TimedOut,
+        message: "half-close read deadline elapsed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod half_close_read_tests {
+    use super::*;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TCP test pair");
+        let address = listener.local_addr().expect("TCP test pair address");
+        let writer = TcpStream::connect(address).expect("connect TCP test pair");
+        let (reader, _) = listener.accept().expect("accept TCP test pair");
+        (reader, writer)
+    }
+
+    #[test]
+    fn bounded_reader_accepts_eof_at_exact_limit() {
+        let (mut reader, mut writer) = tcp_pair();
+        writer
+            .write_all(b"1234")
+            .expect("write exact-limit payload");
+        writer
+            .shutdown(Shutdown::Write)
+            .expect("half-close exact-limit writer");
+
+        let (bytes, termination) = read_bounded_to_eof(&mut reader, 4);
+
+        assert_eq!(bytes, b"1234");
+        assert_eq!(termination, HalfCloseTermination::Eof);
+    }
+
+    #[test]
+    fn bounded_reader_preserves_one_byte_past_limit() {
+        let (mut reader, mut writer) = tcp_pair();
+        writer
+            .write_all(b"12345")
+            .expect("write over-limit payload");
+        writer
+            .shutdown(Shutdown::Write)
+            .expect("half-close over-limit writer");
+
+        let (bytes, termination) = read_bounded_to_eof(&mut reader, 4);
+
+        assert_eq!(bytes, b"12345");
+        assert_eq!(termination, HalfCloseTermination::SizeLimitExceeded);
+    }
+
+    #[test]
+    fn bounded_reader_keeps_partial_bytes_on_deadline() {
+        let (mut reader, mut writer) = tcp_pair();
+        writer
+            .write_all(b"partial")
+            .expect("write partial response before timeout");
+
+        let (bytes, termination) = read_bounded_until(
+            &mut reader,
+            32,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        assert_eq!(bytes, b"partial");
+        assert_eq!(termination, half_close_read_timeout());
+    }
 }
 
 pub fn assert_socks5_proxy_fails(socks_addr: SocketAddr, target: SocketAddr) {

@@ -54,7 +54,7 @@ async fn chimera_client_is_accepted_without_server_version_floor() {
 async fn chimera_client_below_explicit_minimum_is_rejected() {
     let _serial = serial_guard().await;
     let server = VisionServerOptions {
-        min_client_ver: Some("1.8.1".to_string()),
+        min_client_ver: Some("1.8.3".to_string()),
         ..VisionServerOptions::default()
     };
     let harness = run_rejected_case(
@@ -64,6 +64,25 @@ async fn chimera_client_below_explicit_minimum_is_rejected() {
     )
     .await;
     wait_for_log(&harness.server, "Client version is below minimum");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts Chimera Server and Chimera Client with matching REALITY version metadata"]
+async fn chimera_client_is_accepted_with_explicit_minimum() {
+    let _serial = serial_guard().await;
+    let target = start_tcp_echo_server();
+    let mut harness = start_chimera_client_harness(
+        "explicit-version-minimum-positive-control",
+        compatible_server_options(),
+        VisionClientOptions::default(),
+    )
+    .await;
+    harness.assert_running();
+    assert_socks5_echo(
+        harness.socks_addr,
+        target,
+        b"matching REALITY version and valid credentials are accepted",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -138,6 +157,7 @@ async fn chimera_client_wrong_vless_uuid_is_rejected() {
     let _harness =
         run_rejected_case("wrong-vless-uuid", compatible_server_options(), client)
             .await;
+    wait_for_log(&_harness.server, "VLESS authentication rejected request");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
