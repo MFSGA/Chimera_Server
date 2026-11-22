@@ -260,6 +260,10 @@ impl Default for RelayProgress {
 #[derive(Clone)]
 pub(super) struct RelayProgressReporter {
     sender: Option<watch::Sender<RelayProgress>>,
+    // These counts let relay writes skip a duplicate watch wake while a read
+    // activity update is still queued for the timeout observer.
+    published_activity_generation: Arc<AtomicU64>,
+    observed_activity_generation: Arc<AtomicU64>,
     accounting: Arc<RelayTrafficAccounting>,
 }
 
@@ -270,6 +274,8 @@ impl RelayProgressReporter {
     ) -> Self {
         Self {
             sender: Some(sender),
+            published_activity_generation: Arc::new(AtomicU64::new(0)),
+            observed_activity_generation: Arc::new(AtomicU64::new(0)),
             accounting,
         }
     }
@@ -277,41 +283,60 @@ impl RelayProgressReporter {
     fn without_activity_watch(accounting: Arc<RelayTrafficAccounting>) -> Self {
         Self {
             sender: None,
+            published_activity_generation: Arc::new(AtomicU64::new(0)),
+            observed_activity_generation: Arc::new(AtomicU64::new(0)),
             accounting,
         }
     }
 
-    pub(super) fn activity(&self) {
+    fn publish_activity(&self, update: impl FnOnce(&mut RelayProgress)) {
         if let Some(sender) = &self.sender {
+            let _ = self.published_activity_generation.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |generation| Some(generation.saturating_add(1)),
+            );
             sender.send_modify(|progress| {
                 progress.activity_generation =
                     progress.activity_generation.saturating_add(1);
+                update(progress);
             });
         }
+    }
+
+    pub(super) fn activity(&self) {
+        self.publish_activity(|_| {});
+    }
+
+    pub(super) fn activity_if_unobserved(&self) {
+        if self.sender.is_some()
+            && self.published_activity_generation.load(Ordering::Acquire)
+                == self.observed_activity_generation.load(Ordering::Acquire)
+        {
+            self.activity();
+        }
+    }
+
+    pub(super) fn acknowledge_activity(&self) {
+        let published = self.published_activity_generation.load(Ordering::Acquire);
+        self.observed_activity_generation
+            .store(published, Ordering::Release);
     }
 
     pub(super) fn bytes(&self, direction: RelayDirection, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        if let Some(sender) = &self.sender {
-            sender.send_modify(|progress| {
-                progress.activity_generation =
-                    progress.activity_generation.saturating_add(1);
-                match direction {
-                    RelayDirection::LeftToRight => {
-                        progress.left_to_right_bytes = progress
-                            .left_to_right_bytes
-                            .saturating_add(bytes as u64);
-                    }
-                    RelayDirection::RightToLeft => {
-                        progress.right_to_left_bytes = progress
-                            .right_to_left_bytes
-                            .saturating_add(bytes as u64);
-                    }
-                }
-            });
-        }
+        self.publish_activity(|progress| match direction {
+            RelayDirection::LeftToRight => {
+                progress.left_to_right_bytes =
+                    progress.left_to_right_bytes.saturating_add(bytes as u64);
+            }
+            RelayDirection::RightToLeft => {
+                progress.right_to_left_bytes =
+                    progress.right_to_left_bytes.saturating_add(bytes as u64);
+            }
+        });
     }
 
     fn bypassed_bytes(&self, direction: RelayDirection, bytes: usize) {
@@ -319,30 +344,20 @@ impl RelayProgressReporter {
             return;
         }
         self.accounting.record_bypassed(direction, bytes);
-        if let Some(sender) = &self.sender {
-            sender.send_modify(|progress| {
-                progress.activity_generation =
-                    progress.activity_generation.saturating_add(1);
-                match direction {
-                    RelayDirection::LeftToRight => {
-                        progress.left_to_right_bytes = progress
-                            .left_to_right_bytes
-                            .saturating_add(bytes as u64);
-                        progress.bypassed_left_to_right = progress
-                            .bypassed_left_to_right
-                            .saturating_add(bytes as u64);
-                    }
-                    RelayDirection::RightToLeft => {
-                        progress.right_to_left_bytes = progress
-                            .right_to_left_bytes
-                            .saturating_add(bytes as u64);
-                        progress.bypassed_right_to_left = progress
-                            .bypassed_right_to_left
-                            .saturating_add(bytes as u64);
-                    }
-                }
-            });
-        }
+        self.publish_activity(|progress| match direction {
+            RelayDirection::LeftToRight => {
+                progress.left_to_right_bytes =
+                    progress.left_to_right_bytes.saturating_add(bytes as u64);
+                progress.bypassed_left_to_right =
+                    progress.bypassed_left_to_right.saturating_add(bytes as u64);
+            }
+            RelayDirection::RightToLeft => {
+                progress.right_to_left_bytes =
+                    progress.right_to_left_bytes.saturating_add(bytes as u64);
+                progress.bypassed_right_to_left =
+                    progress.bypassed_right_to_left.saturating_add(bytes as u64);
+            }
+        });
     }
 
     pub(super) fn direction_done(&self, direction: RelayDirection) {

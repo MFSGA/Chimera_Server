@@ -78,7 +78,7 @@ where
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut *self.inner).poll_write(cx, buffer);
         if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
-            self.notify_activity();
+            self.progress.activity_if_unobserved();
         }
         result
     }
@@ -157,10 +157,12 @@ async fn wait_for_activity(
 
 fn take_grace_tick_activity(
     receiver: &mut watch::Receiver<RelayProgress>,
+    progress_reporter: &RelayProgressReporter,
     direction: RelayDirection,
     last_bytes: &mut u64,
     activity_seen: &mut bool,
 ) -> (RelayProgress, bool) {
+    progress_reporter.acknowledge_activity();
     let progress = *receiver.borrow_and_update();
     let current_bytes = match direction {
         RelayDirection::LeftToRight => progress.left_to_right_bytes,
@@ -242,6 +244,7 @@ where
     let (progress_sender, mut activity_receiver) =
         watch::channel(RelayProgress::default());
     let progress = RelayProgressReporter::new(progress_sender, accounting);
+    let activity_reporter = progress.clone();
     let mut left =
         ActivityStream::new(left, progress.clone(), RelayDirection::LeftToRight);
     let mut right =
@@ -327,6 +330,7 @@ where
                         )
                     });
                 }
+                activity_reporter.acknowledge_activity();
                 let progress = *activity_receiver.borrow_and_update();
                 let uplink_activity =
                     progress.left_to_right_bytes > last_left_to_right_bytes;
@@ -394,6 +398,7 @@ where
                 let duration = timeouts.uplink_only.unwrap_or_default();
                 let (progress, activity) = take_grace_tick_activity(
                     &mut activity_receiver,
+                    &activity_reporter,
                     RelayDirection::LeftToRight,
                     &mut last_left_to_right_bytes,
                     &mut uplink_grace_activity,
@@ -416,6 +421,7 @@ where
                 let duration = timeouts.downlink_only.unwrap_or_default();
                 let (progress, activity) = take_grace_tick_activity(
                     &mut activity_receiver,
+                    &activity_reporter,
                     RelayDirection::RightToLeft,
                     &mut last_right_to_left_bytes,
                     &mut downlink_grace_activity,
@@ -485,7 +491,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::copy_bidirectional_with_downlink_splice_and_timeouts;
     use super::{
-        RelayDirection, copy_bidirectional_with_timeouts, take_grace_tick_activity,
+        RelayDirection, RelayProgressReporter, RelayTrafficAccounting,
+        copy_bidirectional_with_timeouts, take_grace_tick_activity,
     };
     use crate::session::tcp_relay::RelayProgress;
 
@@ -739,12 +746,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn downlink_activity_ready_at_grace_deadline_is_observed() {
         let (sender, mut receiver) = watch::channel(RelayProgress::default());
+        let progress_reporter =
+            RelayProgressReporter::new(sender, RelayTrafficAccounting::new(None));
         let mut timer = Box::pin(sleep(Duration::from_secs(1)));
         assert!(futures::poll!(timer.as_mut()).is_pending());
         advance(Duration::from_secs(1)).await;
-        sender.send_modify(|progress| {
-            progress.right_to_left_bytes = 1;
-        });
+        progress_reporter.bytes(RelayDirection::RightToLeft, 1);
 
         assert!(timer.is_elapsed(), "grace timer must be ready");
         assert!(receiver.has_changed().expect("watch remains open"));
@@ -753,6 +760,7 @@ mod tests {
         let mut activity_seen = false;
         let (progress, should_extend) = take_grace_tick_activity(
             &mut receiver,
+            &progress_reporter,
             RelayDirection::RightToLeft,
             &mut last_bytes,
             &mut activity_seen,
@@ -762,6 +770,27 @@ mod tests {
         assert_eq!(last_bytes, 1);
         assert_eq!(progress.right_to_left_bytes, 1);
         assert!(!receiver.has_changed().expect("watch remains open"));
+    }
+
+    #[test]
+    fn write_activity_coalesces_without_losing_activity_during_observation() {
+        let (sender, mut receiver) = watch::channel(RelayProgress::default());
+        let progress =
+            RelayProgressReporter::new(sender, RelayTrafficAccounting::new(None));
+
+        progress.bytes(RelayDirection::LeftToRight, 7);
+        progress.activity_if_unobserved();
+        progress.acknowledge_activity();
+        progress.activity_if_unobserved();
+        let observed = *receiver.borrow_and_update();
+        assert_eq!(observed.activity_generation, 2);
+        assert_eq!(observed.left_to_right_bytes, 7);
+
+        progress.acknowledge_activity();
+        progress.activity_if_unobserved();
+        let observed = *receiver.borrow_and_update();
+        assert_eq!(observed.activity_generation, 3);
+        assert_eq!(observed.left_to_right_bytes, 7);
     }
 
     #[tokio::test]
