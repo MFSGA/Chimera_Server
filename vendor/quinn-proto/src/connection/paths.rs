@@ -113,7 +113,8 @@ impl PathData {
         generation: u64,
         now: Instant,
     ) -> Self {
-        let congestion = prev.congestion.clone_box();
+        let mut congestion = prev.congestion.clone_box();
+        congestion.on_path_migration();
         let smoothed_rtt = prev.rtt.get();
         Self {
             remote,
@@ -303,6 +304,11 @@ impl RttEstimator {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(initial_rtt: Duration) -> Self {
+        Self::new(initial_rtt)
+    }
+
     /// The current best RTT estimation.
     pub fn get(&self) -> Duration {
         self.smoothed.unwrap_or(self.latest)
@@ -452,5 +458,183 @@ impl InFlight {
     fn remove(&mut self, packet: &SentPacket) {
         self.bytes -= u64::from(packet.size);
         self.ack_eliciting -= u64::from(packet.ack_eliciting);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        any::Any,
+        sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
+    };
+
+    use super::*;
+    use crate::{congestion::{Bbr, BbrConfig, Controller}, packet::SpaceId};
+
+    #[derive(Clone)]
+    struct LegacyController {
+        acked_bytes: Arc<AtomicU64>,
+        migrations: Arc<AtomicU64>,
+        ack_batches: Arc<Mutex<Vec<(u64, bool, Option<u64>)>>>,
+    }
+
+    impl Controller for LegacyController {
+        fn on_path_migration(&mut self) {
+            self.migrations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_ack(
+            &mut self,
+            _now: Instant,
+            _sent: Instant,
+            bytes: u64,
+            _app_limited: bool,
+            _rtt: &RttEstimator,
+        ) {
+            self.acked_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        fn on_end_acks(
+            &mut self,
+            _now: Instant,
+            in_flight: u64,
+            app_limited: bool,
+            largest_packet_num_acked: Option<u64>,
+        ) {
+            self.ack_batches.lock().unwrap().push((
+                in_flight,
+                app_limited,
+                largest_packet_num_acked,
+            ));
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            _now: Instant,
+            _sent: Instant,
+            _is_persistent_congestion: bool,
+            _lost_bytes: u64,
+        ) {
+        }
+
+        fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+        fn window(&self) -> u64 {
+            1_200
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(self.clone())
+        }
+
+        fn initial_window(&self) -> u64 {
+            1_200
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    #[test]
+    fn packet_state_ack_callback_forwards_to_legacy_controller() {
+        let now = Instant::now();
+        let acked_bytes = Arc::new(AtomicU64::new(0));
+        let mut controller = LegacyController {
+            acked_bytes: Arc::clone(&acked_bytes),
+            migrations: Arc::new(AtomicU64::new(0)),
+            ack_batches: Arc::new(Mutex::new(Vec::new())),
+        };
+        let rtt = RttEstimator::new(Duration::from_millis(10));
+
+        controller.on_ack_with_packet_state(
+            now,
+            now,
+            137,
+            SpaceId::Data,
+            7,
+            false,
+            &rtt,
+        );
+
+        assert_eq!(acked_bytes.load(Ordering::Relaxed), 137);
+    }
+
+    #[test]
+    fn ack_batch_callback_forwards_to_legacy_end_acks() {
+        let now = Instant::now();
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = LegacyController {
+            acked_bytes: Arc::new(AtomicU64::new(0)),
+            migrations: Arc::new(AtomicU64::new(0)),
+            ack_batches: Arc::clone(&batches),
+        };
+
+        controller.on_ack_batch(now, 4_800, 2_400, true, Some(19));
+
+        assert_eq!(*batches.lock().unwrap(), vec![(2_400, true, Some(19))]);
+    }
+
+    #[test]
+    fn cloned_controller_is_notified_when_a_new_path_is_created() {
+        let now = Instant::now();
+        let migrations = Arc::new(AtomicU64::new(0));
+        let mut previous = PathData::new(
+            "127.0.0.1:443".parse().unwrap(),
+            false,
+            None,
+            1,
+            now,
+            &TransportConfig::default(),
+        );
+        previous.congestion = Box::new(LegacyController {
+            acked_bytes: Arc::new(AtomicU64::new(0)),
+            migrations: Arc::clone(&migrations),
+            ack_batches: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let _next = PathData::from_previous("127.0.0.2:443".parse().unwrap(), &previous, 2, now);
+
+        assert_eq!(migrations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn public_bbr_legacy_callbacks_still_update_pacing_bandwidth() {
+        let mut bbr = Bbr::new(Arc::new(BbrConfig::default()), 1_200);
+        let start = Instant::now();
+        let rtt = RttEstimator::new(Duration::from_millis(10));
+
+        bbr.on_sent(start, 1_200, 0);
+        bbr.on_ack(
+            start + Duration::from_micros(100),
+            start,
+            1_200,
+            false,
+            &rtt,
+        );
+        bbr.on_end_acks(
+            start + Duration::from_micros(100),
+            1_200,
+            false,
+            Some(0),
+        );
+
+        let second_send = start + Duration::from_micros(200);
+        bbr.on_sent(second_send, 1_200, 1);
+        bbr.on_ack(
+            start + Duration::from_micros(300),
+            second_send,
+            1_200,
+            false,
+            &rtt,
+        );
+        bbr.on_end_acks(
+            start + Duration::from_micros(300),
+            0,
+            false,
+            Some(1),
+        );
+
+        assert!(bbr.metrics().pacing_rate.unwrap_or_default() > 0);
     }
 }

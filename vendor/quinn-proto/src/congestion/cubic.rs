@@ -2,7 +2,7 @@ use std::any::Any;
 use std::cmp;
 use std::sync::Arc;
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use super::{Controller, ControllerFactory, BASE_DATAGRAM_SIZE};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
 
@@ -51,7 +51,8 @@ impl State {
     fn w_est(&self, t: Duration, rtt: Duration, max_datagram_size: u64) -> f64 {
         let w_max = self.w_max / max_datagram_size as f64;
         (w_max * BETA_CUBIC
-            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64() / rtt.as_secs_f64())
+            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64()
+                / rtt.as_secs_f64())
             * max_datagram_size as f64
     }
 }
@@ -143,8 +144,8 @@ impl Controller for Cubic {
                 cubic_cwnd = cmp::max(cubic_cwnd, w_est as u64);
             } else if cubic_cwnd < w_cubic as u64 {
                 // Concave region or convex region use same increment.
-                let cubic_inc =
-                    (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.current_mtu as f64;
+                let cubic_inc = (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64
+                    * self.current_mtu as f64;
 
                 cubic_cwnd += cubic_inc as u64;
             }
@@ -193,7 +194,8 @@ impl Controller for Cubic {
         self.window = self.ssthresh;
         self.cubic_state.k = self.cubic_state.cubic_k(self.current_mtu);
 
-        self.cubic_state.cwnd_inc = (self.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+        self.cubic_state.cwnd_inc =
+            (self.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as u64;
 
         if is_persistent_congestion {
             self.recovery_start_time = None;
@@ -225,6 +227,10 @@ impl Controller for Cubic {
             congestion_window: self.window(),
             ssthresh: Some(self.ssthresh),
             pacing_rate: None,
+            bbr_bandwidth_bytes_per_second: None,
+            bbr_mode: None,
+            bbr_round_count: None,
+            bbr_app_limited: None,
         }
     }
 
@@ -260,13 +266,18 @@ impl CubicConfig {
 impl Default for CubicConfig {
     fn default() -> Self {
         Self {
-            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            initial_window: 14720
+                .clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
         }
     }
 }
 
 impl ControllerFactory for CubicConfig {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn Controller> {
         Box::new(Cubic::new(self, now, current_mtu))
     }
 }
