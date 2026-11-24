@@ -206,7 +206,7 @@ def quic_params(mode: str, bandwidth_mbps: int) -> dict:
 
 
 def build_chimera_config(
-    *, server_ip: str, server_port: int, cert_path: str, key_path: str, mode: str, bandwidth_mbps: int
+    *, server_ip: str, server_port: int, echo_port: int, cert_path: str, key_path: str, mode: str, bandwidth_mbps: int
 ) -> dict:
     return {
         "inbounds": [
@@ -234,7 +234,9 @@ def build_chimera_config(
                 },
             }
         ],
-        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+        "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {
+            "finalRules": [{"action": "allow", "network": "tcp", "ip": "127.0.0.1/32", "port": echo_port}]
+        }}],
     }
 
 
@@ -498,6 +500,7 @@ def run_case(
         chimera_config = build_chimera_config(
             server_ip=ns.server_ip,
             server_port=server_port,
+            echo_port=echo_port,
             cert_path=str(cert),
             key_path=str(key),
             mode=mode,
@@ -638,12 +641,16 @@ def self_test() -> int:
     chimera = build_chimera_config(
         server_ip="10.203.150.2",
         server_port=24443,
+        echo_port=29000,
         cert_path="/tmp/cert.pem",
         key_path="/tmp/key.pem",
         mode="reno",
         bandwidth_mbps=200,
     )
     assert chimera["inbounds"][0]["streamSettings"]["finalmask"]["quicParams"]["congestion"] == "reno"
+    assert chimera["outbounds"][0]["settings"]["finalRules"] == [{
+        "action": "allow", "network": "tcp", "ip": "127.0.0.1/32", "port": 29000
+    }]
     xray = build_xray_config(
         server_ip="10.203.150.2",
         server_port=24443,

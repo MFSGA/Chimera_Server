@@ -14,6 +14,7 @@
   }],
   "outbounds": [{
     "protocol": "freedom",
-    "tag": "direct"
+    "tag": "direct",
+    "settings": { "finalRules": [{ "action": "allow", "network": "tcp", "ip": "127.0.0.1/32", "port": "PLACEHOLDER_ECHO_PORT" }] }
   }]
 }

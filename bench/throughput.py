@@ -542,6 +542,7 @@ def run_vless_test(
         config_text = f.read()
     config_text = config_text.replace('"port": 0', f'"port": {vless_port}')
     config_text = config_text.replace("PLACEHOLDER_UUID", UUID)
+    config_text = config_text.replace("PLACEHOLDER_ECHO_PORT", str(echo_port))
 
     temp_dir = pm.mktemp()
     config_path = os.path.join(temp_dir, "config.json5")
@@ -681,6 +682,7 @@ def run_vless_reality_test(
         config_text = f.read()
     config_text = config_text.replace('"port": 0', f'"port": {vless_port}')
     config_text = config_text.replace("PLACEHOLDER_UUID", UUID)
+    config_text = config_text.replace("PLACEHOLDER_ECHO_PORT", str(echo_port))
 
     temp_dir = pm.mktemp()
     config_path = os.path.join(temp_dir, "config.json5")
