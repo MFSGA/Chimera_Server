@@ -1,9 +1,9 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
-use crate::Instant;
+use super::{Controller, ControllerFactory, BASE_DATAGRAM_SIZE};
 use crate::connection::RttEstimator;
+use crate::Instant;
 
 /// A simple, standard congestion controller
 #[derive(Debug, Clone)]
@@ -94,7 +94,8 @@ impl Controller for NewReno {
         }
 
         self.recovery_start_time = now;
-        self.window = (self.window as f32 * self.config.loss_reduction_factor) as u64;
+        self.window =
+            (self.window as f32 * self.config.loss_reduction_factor) as u64;
         self.window = self.window.max(self.minimum_window());
         self.ssthresh = self.window;
 
@@ -117,6 +118,10 @@ impl Controller for NewReno {
             congestion_window: self.window(),
             ssthresh: Some(self.ssthresh),
             pacing_rate: None,
+            bbr_bandwidth_bytes_per_second: None,
+            bbr_mode: None,
+            bbr_round_count: None,
+            bbr_app_limited: None,
         }
     }
 
@@ -159,14 +164,19 @@ impl NewRenoConfig {
 impl Default for NewRenoConfig {
     fn default() -> Self {
         Self {
-            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            initial_window: 14720
+                .clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
             loss_reduction_factor: 0.5,
         }
     }
 }
 
 impl ControllerFactory for NewRenoConfig {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn Controller> {
         Box::new(NewReno::new(self, now, current_mtu))
     }
 }

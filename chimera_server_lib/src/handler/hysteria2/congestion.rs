@@ -9,7 +9,7 @@ use std::{
 use std::time::{Duration, Instant};
 
 use quinn_proto::{
-    RttEstimator,
+    RttEstimator, SpaceId,
     congestion::{Bbr, BbrConfig, Controller, ControllerFactory},
 };
 use tracing::debug;
@@ -363,6 +363,47 @@ impl BrutalController {
 }
 
 impl Controller for BrutalController {
+    fn on_packet_sent(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        packet_number: u64,
+        bytes: u64,
+        bytes_in_flight: u64,
+        app_limited: bool,
+        ack_eliciting: bool,
+    ) {
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_packet_sent(
+                now,
+                space,
+                packet_number,
+                bytes,
+                bytes_in_flight,
+                app_limited,
+                ack_eliciting,
+            );
+        }
+    }
+
+    fn on_path_migration(&mut self) {
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_path_migration();
+        }
+    }
+
+    fn on_packet_discarded(&mut self, space: SpaceId, packet_number: u64) {
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_packet_discarded(space, packet_number);
+        }
+    }
+
+    fn on_space_discarded(&mut self, space: SpaceId) {
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_space_discarded(space);
+        }
+    }
+
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         self.activate_brutal_if_configured(now);
         if let Some(bbr) = self.bbr.as_mut() {
@@ -381,6 +422,30 @@ impl Controller for BrutalController {
         self.activate_brutal_if_configured(now);
         if let Some(bbr) = self.bbr.as_mut() {
             bbr.on_ack(now, sent, bytes, app_limited, rtt);
+        }
+    }
+
+    fn on_ack_with_packet_state(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        space: SpaceId,
+        packet_number: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.activate_brutal_if_configured(now);
+        if let Some(bbr) = self.bbr.as_mut() {
+            bbr.on_ack_with_packet_state(
+                now,
+                sent,
+                bytes,
+                space,
+                packet_number,
+                app_limited,
+                rtt,
+            );
         }
         #[cfg(feature = "brutal-ack-batch-trace")]
         let previous_window_inputs =
