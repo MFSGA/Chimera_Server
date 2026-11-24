@@ -202,6 +202,16 @@ impl PacketBuilder {
             false => 0,
         };
 
+        conn.path.congestion.on_packet_sent(
+            now,
+            space_id,
+            exact_number,
+            size.into(),
+            conn.path.in_flight.bytes,
+            conn.app_limited,
+            ack_eliciting,
+        );
+
         let packet = SentPacket {
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
@@ -225,7 +235,11 @@ impl PacketBuilder {
                 conn.permit_idle_reset = false;
             }
             conn.set_loss_detection_timer(now);
-            conn.path.pacing.on_transmit(size);
+            let pacing_rate_override = conn.path.congestion.pacing_rate_override();
+            let mtu = conn.path.current_mtu();
+            conn.path
+                .pacing
+                .on_transmit(size, now, pacing_rate_override, mtu);
         }
     }
 

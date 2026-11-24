@@ -619,6 +619,7 @@ impl Connection {
                         bytes_to_send,
                         self.path.current_mtu(),
                         self.path.congestion.window(),
+                        self.path.congestion.pacing_rate_override(),
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);
@@ -1474,6 +1475,7 @@ impl Connection {
             return Ok(());
         }
 
+        let prior_in_flight = self.path.in_flight.bytes;
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
@@ -1498,12 +1500,13 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, info);
+                self.on_packet_acked(now, space, packet, info);
             }
         }
 
-        self.path.congestion.on_end_acks(
+        self.path.congestion.on_ack_batch(
             now,
+            prior_in_flight,
             self.path.in_flight.bytes,
             self.app_limited,
             self.spaces[space].largest_acked_packet,
@@ -1584,18 +1587,36 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+    fn on_packet_acked(&mut self, now: Instant, space: SpaceId, packet_number: u64, info: SentPacket) {
+        let packet_is_on_current_path = info.path_generation == self.path.generation();
         self.remove_in_flight(&info);
-        if info.ack_eliciting && self.path.challenge.is_none() {
+        if should_update_congestion_for_ack(
+            info.ack_eliciting,
+            packet_is_on_current_path,
+            self.path.challenge,
+        ) {
             // Only pass ACKs to the congestion controller if we are not validating the current
-            // path, so as to ignore any ACKs from older paths still coming in.
-            self.path.congestion.on_ack(
+            // path and the packet was sent on this path. The generation check also excludes late
+            // ACKs from an old path after migration validation has completed.
+            self.path.congestion.on_ack_with_packet_state(
                 now,
                 info.time_sent,
                 info.size.into(),
+                space,
+                packet_number,
                 self.app_limited,
                 &self.path.rtt,
             );
+        } else if packet_is_on_current_path {
+            self.path
+                .congestion
+                .on_packet_discarded(space, packet_number);
+        } else if let Some((_, previous_path)) = self.prev_path.as_mut() {
+            if info.path_generation == previous_path.generation() {
+                previous_path
+                    .congestion
+                    .on_packet_discarded(space, packet_number);
+            }
         }
 
         // Update state for confirmed delivery of frames
@@ -1748,6 +1769,15 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                if info.path_generation == self.path.generation() {
+                    self.path.congestion.on_packet_discarded(pn_space, packet);
+                } else if let Some((_, previous_path)) = self.prev_path.as_mut() {
+                    if info.path_generation == previous_path.generation() {
+                        previous_path
+                            .congestion
+                            .on_packet_discarded(pn_space, packet);
+                    }
+                }
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
@@ -1791,6 +1821,17 @@ impl Connection {
         // Handle a lost MTU probe
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+            if info.path_generation == self.path.generation() {
+                self.path
+                    .congestion
+                    .on_packet_discarded(SpaceId::Data, packet);
+            } else if let Some((_, previous_path)) = self.prev_path.as_mut() {
+                if info.path_generation == previous_path.generation() {
+                    previous_path
+                        .congestion
+                        .on_packet_discarded(SpaceId::Data, packet);
+                }
+            }
             self.remove_in_flight(&info);
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
@@ -2183,6 +2224,10 @@ impl Connection {
     fn discard_space(&mut self, now: Instant, space_id: SpaceId) {
         debug_assert!(space_id != SpaceId::Data);
         trace!("discarding {:?} keys", space_id);
+        self.path.congestion.on_space_discarded(space_id);
+        if let Some((_, previous_path)) = self.prev_path.as_mut() {
+            previous_path.congestion.on_space_discarded(space_id);
+        }
         if space_id == SpaceId::Initial {
             // No longer needed
             if let ConnectionSide::Client { token, .. } = &mut self.side {
@@ -2479,7 +2524,7 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, info);
+                    self.on_packet_acked(now, SpaceId::Initial, 0, info);
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
@@ -2499,7 +2544,18 @@ impl Connection {
 
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                for info in zero_rtt.into_values() {
+                for (packet_number, info) in zero_rtt {
+                    if info.path_generation == self.path.generation() {
+                        self.path
+                            .congestion
+                            .on_packet_discarded(SpaceId::Data, packet_number);
+                    } else if let Some((_, previous_path)) = self.prev_path.as_mut() {
+                        if info.path_generation == previous_path.generation() {
+                            previous_path
+                                .congestion
+                                .on_packet_discarded(SpaceId::Data, packet_number);
+                        }
+                    }
                     self.remove_in_flight(&info);
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
                 }
@@ -4006,6 +4062,14 @@ fn instant_saturating_sub(x: Instant, y: Instant) -> Duration {
     if x > y { x - y } else { Duration::ZERO }
 }
 
+fn should_update_congestion_for_ack(
+    ack_eliciting: bool,
+    packet_is_on_current_path: bool,
+    path_challenge: Option<u64>,
+) -> bool {
+    ack_eliciting && packet_is_on_current_path && path_challenge.is_none()
+}
+
 fn get_max_ack_delay(params: &TransportParameters) -> Duration {
     Duration::from_micros(params.max_ack_delay.0 * 1000)
 }
@@ -4098,5 +4162,12 @@ mod tests {
             assert_eq!(negotiate_max_idle_timeout(left, right), result);
             assert_eq!(negotiate_max_idle_timeout(right, left), result);
         }
+    }
+
+    #[test]
+    fn stale_path_ack_after_validation_does_not_update_congestion_controller() {
+        assert!(!should_update_congestion_for_ack(true, false, None));
+        assert!(!should_update_congestion_for_ack(true, true, Some(1)));
+        assert!(should_update_congestion_for_ack(true, true, None));
     }
 }

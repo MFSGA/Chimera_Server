@@ -67,6 +67,17 @@ impl BandwidthEstimation {
         }
     }
 
+    /// Reset sampling intervals after the connection moves to a new network path.
+    /// Keep the learned maximum bandwidth while ensuring samples do not span two paths.
+    pub(crate) fn on_path_migration(&mut self) {
+        self.prev_total_sent = self.total_sent;
+        self.prev_sent_time = None;
+        self.sent_time = None;
+        self.prev_total_acked = self.total_acked;
+        self.prev_acked_time = None;
+        self.acked_time = None;
+    }
+
     pub(crate) fn bytes_acked_this_window(&self) -> u64 {
         self.total_acked - self.acked_at_last_window
     }

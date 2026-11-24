@@ -91,14 +91,18 @@ impl MinMax {
                 self.samples[1] = self.samples[2];
                 self.samples[2] = sample;
             }
-        } else if self.samples[1].time == self.samples[0].time && dt > self.window / 4 {
+        } else if self.samples[1].time == self.samples[0].time
+            && dt > self.window / 4
+        {
             /*
              * We've passed a quarter of the window without a new sample
              * so take a 2nd choice from the 2nd quarter of the window.
              */
             self.samples[2] = sample;
             self.samples[1] = sample;
-        } else if self.samples[2].time == self.samples[1].time && dt > self.window / 2 {
+        } else if self.samples[2].time == self.samples[1].time
+            && dt > self.window / 2
+        {
             /*
              * We've passed half the window without finding a new sample
              * so take a 3rd choice from the last half of the window
