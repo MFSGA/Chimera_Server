@@ -62,7 +62,7 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        if !app_limited || self.max_filter.get() < bandwidth {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -108,5 +108,45 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_non_app_limited_samples_expire_the_old_maximum() {
+        let mut estimate = BandwidthEstimation::default();
+        let start = Instant::now();
+        estimate.on_sent(start, 1_000);
+        estimate.on_sent(start + Duration::from_millis(1), 1_000);
+        estimate.on_ack(start + Duration::from_millis(1), start, 1_000, 1, false);
+        estimate.on_ack(start + Duration::from_millis(2), start, 1_000, 1, false);
+        assert_eq!(estimate.get_estimate(), 1_000_000);
+
+        for round in 2..=20 {
+            let now = start + Duration::from_millis(round * 10);
+            estimate.on_sent(now, 100);
+            estimate.on_ack(now, start, 100, round, false);
+        }
+        assert!(estimate.get_estimate() < 1_000_000);
+    }
+
+    #[test]
+    fn app_limited_samples_can_raise_but_do_not_lower_the_maximum() {
+        let mut estimate = BandwidthEstimation::default();
+        let start = Instant::now();
+        estimate.on_sent(start, 1_000);
+        estimate.on_sent(start + Duration::from_millis(1), 1_000);
+        estimate.on_ack(start + Duration::from_millis(1), start, 1_000, 1, true);
+        estimate.on_ack(start + Duration::from_millis(2), start, 1_000, 1, true);
+        assert_eq!(estimate.get_estimate(), 1_000_000);
+        for round in 2..=20 {
+            let now = start + Duration::from_millis(round * 10);
+            estimate.on_sent(now, 100);
+            estimate.on_ack(now, start, 100, round, true);
+        }
+        assert_eq!(estimate.get_estimate(), 1_000_000);
     }
 }
