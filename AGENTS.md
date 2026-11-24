@@ -54,8 +54,15 @@ report any necessary deviation from the project conventions.
   whether human approval is required. Use the PR template for submitted changes.
 - Treat governance, workflow, release, secrets, `ref/`, and `vendor/` changes
   as protected high-risk work (L3). Protocol, cryptography, policy, runtime,
-  platform and feature changes are at least L2. Neither class is eligible for
-  AI-only auto-merge; policy changes require maintainer review.
+  platform and feature changes are at least L2. When the user authorizes a merge,
+  Codex may directly merge `vendor/` changes after applicable verification and
+  independent review, without a separate maintainer approval. Other L3 changes
+  and policy changes retain their existing review requirements.
+- When the user authorizes direct integration or pushing to `master`, Codex may
+  commit, merge and push directly to `master` after relevant local verification.
+  Do not change branch protections or CI gates to enable this. If an existing
+  authorized account bypasses a required check, report that fact and the actual
+  check status; never claim an unrun or pending check passed.
 - Automation is not permission. Codex must not auto-merge, push, release, deploy,
   edit branch protections, or change CI gates without explicit authorization and
   the applicable repository safeguards. The existing manually dispatched
