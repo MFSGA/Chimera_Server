@@ -16,7 +16,15 @@ fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 fn get_hysteria2_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static INSTANCE: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     INSTANCE
-        .get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
+        .get_or_init(|| {
+            let mut provider = rustls::crypto::ring::default_provider();
+            // Keep the AWS-LC hybrid group available for clients which only
+            // offer X25519MLKEM768 without changing Ring's default preference.
+            provider
+                .kx_groups
+                .push(rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768);
+            Arc::new(provider)
+        })
         .clone()
 }
 
@@ -285,6 +293,8 @@ mod tests {
     };
     use std::sync::Arc;
 
+    use rustls::pki_types::pem::PemObject;
+
     fn test_certificate() -> (Vec<u8>, Vec<u8>) {
         let generated =
             rcgen::generate_simple_self_signed(["localhost".to_string()])
@@ -326,6 +336,50 @@ mod tests {
             config.crypto_provider(),
             &get_hysteria2_crypto_provider()
         ));
+        assert!(
+            config
+                .crypto_provider()
+                .kx_groups
+                .iter()
+                .any(|group| group.name() == rustls::NamedGroup::X25519MLKEM768)
+        );
+    }
+
+    #[tokio::test]
+    async fn hysteria2_ring_server_accepts_pq_only_client() {
+        let (cert, key) = test_certificate();
+        let server_config = Arc::new(
+            create_hysteria2_server_config(&cert, &key, &["h3".into()], &[])
+                .expect("create Hysteria2 server config"),
+        );
+        let certificate = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
+            .next()
+            .expect("test certificate PEM")
+            .expect("parse test certificate PEM");
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(certificate).expect("trust test certificate");
+
+        let mut client_provider = rustls::crypto::aws_lc_rs::default_provider();
+        client_provider.kx_groups =
+            vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(client_provider))
+                .with_safe_default_protocol_versions()
+                .expect("select client protocol versions")
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = tokio_rustls::TlsConnector::from(client_config).connect(
+            "localhost".try_into().expect("valid server name"),
+            client_io,
+        );
+        let server =
+            tokio_rustls::TlsAcceptor::from(server_config).accept(server_io);
+        let (client_result, server_result) = tokio::join!(client, server);
+        assert!(client_result.is_ok(), "PQ-only client handshake failed");
+        assert!(server_result.is_ok(), "Hysteria2 server handshake failed");
     }
 
     #[test]
