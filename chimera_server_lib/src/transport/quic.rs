@@ -11,6 +11,10 @@ use tracing::info;
 use crate::handler::hysteria2::run_hysteria2_server;
 #[cfg(feature = "tuic")]
 use crate::handler::tuic::run_tuic_server;
+#[cfg(feature = "hysteria")]
+use crate::util::rustls_util::create_hysteria2_server_config;
+#[cfg(feature = "tuic")]
+use crate::util::rustls_util::create_server_config;
 #[cfg(any(feature = "hysteria", feature = "tuic"))]
 use crate::{
     address::BindLocation,
@@ -18,7 +22,6 @@ use crate::{
         ServerConfig, ServerProxyConfig, quic::ServerQuicConfig,
     },
     runtime::DataPlaneRuntime,
-    util::rustls_util::create_server_config,
 };
 #[cfg(not(any(feature = "hysteria", feature = "tuic")))]
 use crate::{config::server_config::ServerConfig, runtime::DataPlaneRuntime};
@@ -58,16 +61,17 @@ pub(crate) async fn start_quic_server(
         let mut key_bytes = vec![];
         key_file.read_to_end(&mut key_bytes).await?;
 
-        let server_config = Arc::new(create_server_config(
-            &cert_bytes,
-            &key_bytes,
-            &alpn_protocols.into_vec(),
-            &client_fingerprints.into_vec(),
-        )?);
-
         match protocol {
             #[cfg(feature = "hysteria")]
             ServerProxyConfig::Hysteria2 { config } => {
+                // Keep the measured Ring provider scoped to Hysteria2; TUIC
+                // continues using the shared AWS-LC provider below.
+                let server_config = Arc::new(create_hysteria2_server_config(
+                    &cert_bytes,
+                    &key_bytes,
+                    &alpn_protocols.into_vec(),
+                    &client_fingerprints.into_vec(),
+                )?);
                 Ok(Some(tokio::spawn(async move {
                     if let Err(err) = run_hysteria2_server(
                         bind_address,
@@ -94,6 +98,12 @@ pub(crate) async fn start_quic_server(
                         "streamSettings.sockopt is not implemented for TUIC QUIC listeners",
                     ));
                 }
+                let server_config = Arc::new(create_server_config(
+                    &cert_bytes,
+                    &key_bytes,
+                    &alpn_protocols.into_vec(),
+                    &client_fingerprints.into_vec(),
+                )?);
                 Ok(Some(tokio::spawn(async move {
                     if let Err(err) = run_tuic_server(
                         bind_address,

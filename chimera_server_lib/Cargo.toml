@@ -91,7 +91,7 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
 etherparse = "0.21.0"
 tokio = { workspace = true, features = ["test-util"] }
 
