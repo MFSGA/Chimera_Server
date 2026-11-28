@@ -404,11 +404,12 @@ WireGuard 和 TUN 可能复用包处理接口、网络栈适配代码或地址�
 
 ### 13.2 当前可用的构建入口
 
-以下名称已核对当前 Cargo manifest；这里只说明配置入口，本次文档维护没有执行这些构建。
+以下名称已核对当前 Cargo manifest。`minimal-hysteria` 已完成独立 release 构建和本机 HY2 吞吐验证；其他入口仍只说明 feature 转发，不代表已完成互通或性能测试。
 
 | 入口 | 当前意义 |
 | --- | --- |
 | app 默认 feature | 启用 `full`，转发到 library 的 `full` |
+| app `minimal-hysteria` | 编译 Hysteria2 与生产流量计量，不启用其他可选协议或 library gRPC `api` feature；MCP 是否运行仍由配置决定。本机结果见[精简 HY2 基线](bench/chimera_perf/MINIMAL_HYSTERIA_LOCAL_BASELINE_2026-11-28.md) |
 | app `minimal-vless` | 转发 library `vless` |
 | app `minimal-vless-tls` | 转发 library `vless`、`tls` |
 | library `grpc_transport` | gRPC 入站传输能力 |
@@ -417,7 +418,7 @@ WireGuard 和 TUN 可能复用包处理接口、网络栈适配代码或地址�
 
 不能据此推断所有依赖都被彻底裁掉。可选依赖、默认依赖 feature、workspace feature unification、构建目标和 dev-dependencies 均须实际检查。
 
-常见 app 构建入口包括 `minimal-vless`、`minimal-vless-tls`、`minimal-vless-reality`、
+常见 app 构建入口包括 `minimal-hysteria`、`minimal-vless`、`minimal-vless-tls`、`minimal-vless-reality`、
 `vless-reverse`、`vless-reverse-tls`、`vless-reverse-reality`、`wireguard`、`tun-gateway` 和
 `xray-tun`；app 默认 `full` 转发 library `full`，但不因此启用所有单独 opt-in 的 TUN feature。
 library 的 `grpc_transport` 与管理 API `api` 分开。该列表用于导航而非穷举；实际依赖和 feature
